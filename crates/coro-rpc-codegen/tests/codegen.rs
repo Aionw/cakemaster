@@ -85,6 +85,67 @@ fn generates_i32_backed_struct_pack_enums() {
 }
 
 #[test]
+fn generates_unsigned_u8_enums_and_expected_business_types() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("mooncake-types.thrift");
+    let output = directory.path().join("mooncake-types.rs");
+    fs::write(
+        &input,
+        r#"
+            enum ErrorCode {
+              OK = 0
+              INVALID_PARAMS = -600
+            }
+
+            enum ObjectDataType {
+              UNKNOWN = 0
+              KVCACHE = 1
+            } (coro_rpc.repr = "u8")
+
+            union ExpectedBool {
+              1: bool value
+              2: ErrorCode error
+            } (coro_rpc.expected)
+
+            union ExpectedVoid {
+              1: ErrorCode error
+            } (coro_rpc.expected = "true")
+
+            struct UUID {
+              1: required u64 high
+              2: required u64 low
+            } (coro_rpc.cpp_u64_pair)
+
+            struct WireValues {
+              1: required u8 tag
+              2: required u16 small
+              3: required u32 medium
+              4: required u64 large
+              5: required ObjectDataType data_type
+              6: required UUID client_id
+            }
+
+            service ExpectedService {
+              list<ExpectedBool> check(1: required WireValues values)
+              list<ExpectedVoid> finish(1: required list<u64> ids)
+            }
+        "#,
+    )
+    .unwrap();
+
+    Builder::new().compile(&input, &output).unwrap();
+    let generated = fs::read_to_string(output).unwrap();
+    assert!(generated.contains("#[repr(u8)]"));
+    assert!(generated.contains("pub tag: u8"));
+    assert!(generated.contains("pub small: u16"));
+    assert!(generated.contains("pub medium: u32"));
+    assert!(generated.contains("pub large: u64"));
+    assert!(generated.contains("pub type ExpectedBool = ::core::result::Result<bool, ErrorCode>"));
+    assert!(generated.contains("pub type ExpectedVoid = ::core::result::Result<(), ErrorCode>"));
+    assert!(generated.contains("output.extend_from_slice(&[137, 137])"));
+}
+
+#[test]
 fn generates_struct_pack_variants_from_thrift_unions() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("union.thrift");
@@ -230,6 +291,31 @@ fn rejects_union_field_modifiers() {
             .to_string()
             .contains("must not use required or optional modifiers")
     );
+}
+
+#[test]
+fn rejects_malformed_expected_unions() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("malformed-expected.thrift");
+    let output = directory.path().join("malformed-expected.rs");
+    fs::write(
+        &input,
+        r#"
+            enum ErrorCode { OK = 0 }
+            union BrokenExpected {
+              1: bool success
+              2: ErrorCode failure
+            } (coro_rpc.expected)
+            service BrokenService {
+              BrokenExpected get()
+            }
+        "#,
+    )
+    .unwrap();
+
+    let error = Builder::new().compile(&input, output).unwrap_err();
+    assert!(matches!(error, CodegenError::InvalidContract { .. }));
+    assert!(error.to_string().contains("expected union BrokenExpected"));
 }
 
 #[test]

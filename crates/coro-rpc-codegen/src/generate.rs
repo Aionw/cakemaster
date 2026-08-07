@@ -7,12 +7,18 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
 
 use crate::CodegenError;
-use crate::ast::{Document, Enum, Field, Function, Service, Struct, Type, Typedef, Union};
+use crate::ast::{
+    Document, Enum, EnumRepr, Field, Function, Service, Struct, Type, Typedef, Union,
+};
 
 const TYPE_INT32: u8 = 1;
+const TYPE_UINT32: u8 = 2;
 const TYPE_INT64: u8 = 3;
+const TYPE_UINT64: u8 = 4;
 const TYPE_INT8: u8 = 5;
+const TYPE_UINT8: u8 = 6;
 const TYPE_INT16: u8 = 7;
+const TYPE_UINT16: u8 = 8;
 const TYPE_BOOL: u8 = 11;
 const TYPE_CHAR8: u8 = 12;
 const TYPE_FLOAT32: u8 = 17;
@@ -23,6 +29,7 @@ const TYPE_SET: u8 = 131;
 const TYPE_CONTAINER: u8 = 132;
 const TYPE_OPTIONAL: u8 = 133;
 const TYPE_VARIANT: u8 = 134;
+const TYPE_EXPECTED: u8 = 135;
 const TYPE_MONOSTATE: u8 = 250;
 const TYPE_STRUCT: u8 = 253;
 const TYPE_END: u8 = 255;
@@ -31,7 +38,7 @@ struct TypeSchemas<'a> {
     typedefs: BTreeMap<&'a str, &'a Typedef>,
     structs: BTreeMap<&'a str, &'a Struct>,
     unions: BTreeMap<&'a str, &'a Union>,
-    enums: BTreeSet<&'a str>,
+    enums: BTreeMap<&'a str, &'a Enum>,
 }
 
 impl<'a> TypeSchemas<'a> {
@@ -55,7 +62,7 @@ impl<'a> TypeSchemas<'a> {
             enums: document
                 .enums
                 .iter()
-                .map(|item| item.name.as_str())
+                .map(|item| (item.name.as_str(), item))
                 .collect(),
         }
     }
@@ -141,6 +148,9 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
             &format!("struct {}", structure.name),
             path,
         )?;
+        if structure.cpp_u64_pair {
+            validate_cpp_u64_pair(structure, path)?;
+        }
     }
 
     let known_types = document
@@ -350,6 +360,15 @@ fn validate_enum(enumeration: &Enum, path: &Path) -> Result<(), CodegenError> {
     let mut names = BTreeSet::new();
     let mut values = BTreeMap::new();
     for variant in &enumeration.variants {
+        if enumeration.repr == EnumRepr::U8 && u8::try_from(variant.value).is_err() {
+            return Err(invalid(
+                path,
+                format!(
+                    "enum {} value {} does not fit coro_rpc.repr u8",
+                    enumeration.name, variant.value
+                ),
+            ));
+        }
         let name = variant.name.to_upper_camel_case();
         rust_ident(&name, "enum variant", path)?;
         if !names.insert(name.clone()) {
@@ -381,6 +400,12 @@ fn validate_union(union: &Union, path: &Path) -> Result<(), CodegenError> {
             format!("union {} must contain at least one alternative", union.name),
         ));
     }
+
+    validate_fields(&union.alternatives, &format!("union {}", union.name), path)?;
+    if union.expected {
+        expected_alternatives(union, path)?;
+        return Ok(());
+    }
     if union.alternatives.len() >= 256 {
         return Err(invalid(
             path,
@@ -391,7 +416,7 @@ fn validate_union(union: &Union, path: &Path) -> Result<(), CodegenError> {
         ));
     }
 
-    validate_fields(&union.alternatives, &format!("union {}", union.name), path)?;
+    let mut names = BTreeSet::new();
     for (index, alternative) in ordered_fields(&union.alternatives).into_iter().enumerate() {
         let expected_id = i64::try_from(index + 1).expect("union alternatives are limited to 255");
         if alternative.id != expected_id {
@@ -405,8 +430,64 @@ fn validate_union(union: &Union, path: &Path) -> Result<(), CodegenError> {
         }
         let name = alternative.name.to_upper_camel_case();
         rust_ident(&name, "union variant", path)?;
+        if !names.insert(name.clone()) {
+            return Err(invalid(
+                path,
+                format!(
+                    "union {} has duplicate generated variant name {name}",
+                    union.name
+                ),
+            ));
+        }
     }
     Ok(())
+}
+
+fn validate_cpp_u64_pair(structure: &Struct, path: &Path) -> Result<(), CodegenError> {
+    let fields = ordered_fields(&structure.fields);
+    let valid = matches!(
+        fields.as_slice(),
+        [first, second]
+            if first.id == 1
+                && second.id == 2
+                && !first.optional
+                && !second.optional
+                && first.type_ == Type::U64
+                && second.type_ == Type::U64
+    );
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid(
+            path,
+            format!(
+                "struct {} with coro_rpc.cpp_u64_pair must contain exactly two required u64 fields numbered 1 and 2",
+                structure.name
+            ),
+        ))
+    }
+}
+
+fn expected_alternatives<'a>(
+    union: &'a Union,
+    path: &Path,
+) -> Result<(Option<&'a Field>, &'a Field), CodegenError> {
+    let alternatives = ordered_fields(&union.alternatives);
+    match alternatives.as_slice() {
+        [error] if error.id == 1 && error.name == "error" => Ok((None, error)),
+        [value, error]
+            if value.id == 1 && value.name == "value" && error.id == 2 && error.name == "error" =>
+        {
+            Ok((Some(value), error))
+        }
+        _ => Err(invalid(
+            path,
+            format!(
+                "expected union {} must contain `1: <type> value, 2: <type> error`, or only `1: <type> error` for expected<void, E>",
+                union.name
+            ),
+        )),
+    }
 }
 
 fn register_rust_type(
@@ -447,7 +528,7 @@ fn validate_type_references(
 fn validate_ordered_containers(
     type_: &Type,
     typedefs: &BTreeMap<&str, &Typedef>,
-    enums: &BTreeSet<&str>,
+    enums: &BTreeMap<&str, &Enum>,
     path: &Path,
 ) -> Result<(), CodegenError> {
     match type_ {
@@ -479,19 +560,27 @@ fn validate_ordered_containers(
 fn is_rust_ord(
     type_: &Type,
     typedefs: &BTreeMap<&str, &Typedef>,
-    enums: &BTreeSet<&str>,
+    enums: &BTreeMap<&str, &Enum>,
     stack: &mut Vec<String>,
 ) -> bool {
     match type_ {
-        Type::Bool | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::String | Type::Binary => {
-            true
-        }
+        Type::Bool
+        | Type::I8
+        | Type::U8
+        | Type::I16
+        | Type::U16
+        | Type::I32
+        | Type::U32
+        | Type::I64
+        | Type::U64
+        | Type::String
+        | Type::Binary => true,
         Type::List(value) | Type::Set(value) => is_rust_ord(value, typedefs, enums, stack),
         Type::Map(key, value) => {
             is_rust_ord(key, typedefs, enums, stack) && is_rust_ord(value, typedefs, enums, stack)
         }
         Type::Named(name) => {
-            if enums.contains(name.as_str()) {
+            if enums.contains_key(name.as_str()) {
                 return true;
             }
             if stack.iter().any(|item| item == name) {
@@ -547,26 +636,44 @@ fn generate_enum(
     let values = enumeration
         .variants
         .iter()
-        .map(|variant| variant.value)
+        .map(|variant| match enumeration.repr {
+            EnumRepr::I32 => {
+                let value = variant.value;
+                quote! { #value }
+            }
+            EnumRepr::U8 => {
+                let value = u8::try_from(variant.value)
+                    .expect("u8 enum values are validated before generation");
+                quote! { #value }
+            }
+        })
         .collect::<Vec<_>>();
+    let repr = match enumeration.repr {
+        EnumRepr::I32 => quote! { i32 },
+        EnumRepr::U8 => quote! { u8 },
+    };
+    let invalid_value_field = match enumeration.repr {
+        EnumRepr::I32 => quote! { value },
+        EnumRepr::U8 => quote! { value: i32::from(value) },
+    };
 
     Ok(quote! {
-        #[repr(i32)]
+        #[repr(#repr)]
         #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
         pub enum #name {
             #(#variants = #values,)*
         }
 
-        impl ::core::convert::From<#name> for i32 {
+        impl ::core::convert::From<#name> for #repr {
             fn from(value: #name) -> Self {
-                value as i32
+                value as #repr
             }
         }
 
-        impl ::core::convert::TryFrom<i32> for #name {
-            type Error = i32;
+        impl ::core::convert::TryFrom<#repr> for #name {
+            type Error = #repr;
 
-            fn try_from(value: i32) -> ::core::result::Result<Self, Self::Error> {
+            fn try_from(value: #repr) -> ::core::result::Result<Self, Self::Error> {
                 match value {
                     #(#values => Ok(Self::#variants),)*
                     value => Err(value),
@@ -576,25 +683,25 @@ fn generate_enum(
 
         impl #runtime::StructPack for #name {
             fn append_type_literal(output: &mut ::std::vec::Vec<u8>) {
-                <i32 as #runtime::StructPack>::append_type_literal(output);
+                <#repr as #runtime::StructPack>::append_type_literal(output);
             }
 
             fn encode_payload(
                 &self,
                 encoder: &mut #runtime::struct_pack::Encoder<'_>,
             ) -> ::core::result::Result<(), #runtime::StructPackError> {
-                let value = i32::from(*self);
-                <i32 as #runtime::StructPack>::encode_payload(&value, encoder)
+                let value = <#repr>::from(*self);
+                <#repr as #runtime::StructPack>::encode_payload(&value, encoder)
             }
 
             fn decode_payload(
                 decoder: &mut #runtime::struct_pack::Decoder<'_>,
             ) -> ::core::result::Result<Self, #runtime::StructPackError> {
-                let value = <i32 as #runtime::StructPack>::decode_payload(decoder)?;
+                let value = <#repr as #runtime::StructPack>::decode_payload(decoder)?;
                 Self::try_from(value).map_err(|value| {
                     #runtime::StructPackError::InvalidEnumDiscriminant {
                         name: stringify!(#name),
-                        value,
+                        #invalid_value_field,
                     }
                 })
             }
@@ -608,6 +715,17 @@ fn generate_union(
     path: &Path,
 ) -> Result<TokenStream, CodegenError> {
     let name = rust_ident(&union.name.to_upper_camel_case(), "union", path)?;
+    if union.expected {
+        let (value, error) = expected_alternatives(union, path)?;
+        let value = value
+            .map(|value| rust_type(&value.type_, false, runtime, path))
+            .transpose()?
+            .unwrap_or_else(|| quote! { () });
+        let error = rust_type(&error.type_, false, runtime, path)?;
+        return Ok(quote! {
+            pub type #name = ::core::result::Result<#value, #error>;
+        });
+    }
     let alternatives = ordered_fields(&union.alternatives);
     let variant_names = alternatives
         .iter()
@@ -707,15 +825,70 @@ fn generate_struct(
         .iter()
         .map(|field| rust_type(&field.type_, field.optional, runtime, path))
         .collect::<Result<Vec<_>, _>>()?;
+    let struct_pack = if structure.cpp_u64_pair {
+        quote! {
+            impl #runtime::StructPack for #name {
+                fn append_type_literal(output: &mut ::std::vec::Vec<u8>) {
+                    output.push(#runtime::struct_pack::__private::TYPE_STRUCT);
+                    #(
+                        <#field_types as #runtime::StructPack>::append_type_literal(output);
+                    )*
+                    output.extend_from_slice(&[137, 137]);
+                    output.push(#runtime::struct_pack::__private::TYPE_END);
+                }
+
+                fn max_container_len(&self) -> usize {
+                    let mut maximum = 0;
+                    #(
+                        maximum = maximum.max(
+                            <#field_types as #runtime::StructPack>::max_container_len(
+                                &self.#field_names,
+                            ),
+                        );
+                    )*
+                    maximum
+                }
+
+                fn encode_payload(
+                    &self,
+                    encoder: &mut #runtime::struct_pack::Encoder<'_>,
+                ) -> ::core::result::Result<(), #runtime::StructPackError> {
+                    #(
+                        <#field_types as #runtime::StructPack>::encode_payload(
+                            &self.#field_names,
+                            encoder,
+                        )?;
+                    )*
+                    Ok(())
+                }
+
+                fn decode_payload(
+                    decoder: &mut #runtime::struct_pack::Decoder<'_>,
+                ) -> ::core::result::Result<Self, #runtime::StructPackError> {
+                    Ok(Self {
+                        #(
+                            #field_names: <#field_types as #runtime::StructPack>::decode_payload(
+                                decoder,
+                            )?,
+                        )*
+                    })
+                }
+            }
+        }
+    } else {
+        quote! {
+            #runtime::impl_struct_pack!(#name {
+                #(#field_names: #field_types,)*
+            });
+        }
+    };
     Ok(quote! {
         #[derive(Debug, Clone, PartialEq)]
         pub struct #name {
             #(pub #field_names: #field_types,)*
         }
 
-        #runtime::impl_struct_pack!(#name {
-            #(#field_names: #field_types,)*
-        });
+        #struct_pack
     })
 }
 
@@ -784,6 +957,7 @@ fn generate_service(
                 path,
             )?);
             descriptors.push(quote! {
+                #[allow(clippy::type_complexity)]
                 const #descriptor: #runtime::RpcMethod<#request_type, #return_type> =
                     #runtime::RpcMethod::from_generated_parts(
                         #wire_name_literal,
@@ -1014,9 +1188,13 @@ fn rust_type(
         Type::Void => quote! { () },
         Type::Bool => quote! { bool },
         Type::I8 => quote! { i8 },
+        Type::U8 => quote! { u8 },
         Type::I16 => quote! { i16 },
+        Type::U16 => quote! { u16 },
         Type::I32 => quote! { i32 },
+        Type::U32 => quote! { u32 },
         Type::I64 => quote! { i64 },
+        Type::U64 => quote! { u64 },
         Type::F32 => quote! { f32 },
         Type::F64 => quote! { f64 },
         Type::String => quote! { ::std::string::String },
@@ -1116,9 +1294,13 @@ fn type_literal(
         Type::Void => literal.push(TYPE_MONOSTATE),
         Type::Bool => literal.push(TYPE_BOOL),
         Type::I8 => literal.push(TYPE_INT8),
+        Type::U8 => literal.push(TYPE_UINT8),
         Type::I16 => literal.push(TYPE_INT16),
+        Type::U16 => literal.push(TYPE_UINT16),
         Type::I32 => literal.push(TYPE_INT32),
+        Type::U32 => literal.push(TYPE_UINT32),
         Type::I64 => literal.push(TYPE_INT64),
+        Type::U64 => literal.push(TYPE_UINT64),
         Type::F32 => literal.push(TYPE_FLOAT32),
         Type::F64 => literal.push(TYPE_FLOAT64),
         Type::String | Type::Binary => literal.extend([TYPE_STRING, TYPE_CHAR8]),
@@ -1136,8 +1318,11 @@ fn type_literal(
             literal.extend(type_literal(value, false, schemas, stack, path)?);
         }
         Type::Named(name) => {
-            if schemas.enums.contains(name.as_str()) {
-                literal.push(TYPE_INT32);
+            if let Some(enumeration) = schemas.enums.get(name.as_str()) {
+                literal.push(match enumeration.repr {
+                    EnumRepr::I32 => TYPE_INT32,
+                    EnumRepr::U8 => TYPE_UINT8,
+                });
                 return Ok(literal);
             }
             if stack.iter().any(|item| item == name) {
@@ -1160,19 +1345,33 @@ fn type_literal(
                         path,
                     )?);
                 }
-                literal.push(TYPE_END);
-            } else if let Some(union) = schemas.unions.get(name.as_str()) {
-                literal.push(TYPE_VARIANT);
-                for alternative in ordered_fields(&union.alternatives) {
-                    literal.extend(type_literal(
-                        &alternative.type_,
-                        false,
-                        schemas,
-                        stack,
-                        path,
-                    )?);
+                if structure.cpp_u64_pair {
+                    literal.extend([137, 137]);
                 }
                 literal.push(TYPE_END);
+            } else if let Some(union) = schemas.unions.get(name.as_str()) {
+                if union.expected {
+                    let (value, error) = expected_alternatives(union, path)?;
+                    literal.push(TYPE_EXPECTED);
+                    if let Some(value) = value {
+                        literal.extend(type_literal(&value.type_, false, schemas, stack, path)?);
+                    } else {
+                        literal.push(TYPE_MONOSTATE);
+                    }
+                    literal.extend(type_literal(&error.type_, false, schemas, stack, path)?);
+                } else {
+                    literal.push(TYPE_VARIANT);
+                    for alternative in ordered_fields(&union.alternatives) {
+                        literal.extend(type_literal(
+                            &alternative.type_,
+                            false,
+                            schemas,
+                            stack,
+                            path,
+                        )?);
+                    }
+                    literal.push(TYPE_END);
+                }
             } else {
                 return Err(invalid(path, format!("unknown type {name}")));
             }

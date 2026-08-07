@@ -26,6 +26,13 @@ pub(crate) struct Typedef {
 pub(crate) struct Enum {
     pub name: String,
     pub variants: Vec<EnumVariant>,
+    pub repr: EnumRepr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EnumRepr {
+    I32,
+    U8,
 }
 
 #[derive(Debug)]
@@ -38,12 +45,14 @@ pub(crate) struct EnumVariant {
 pub(crate) struct Union {
     pub name: String,
     pub alternatives: Vec<Field>,
+    pub expected: bool,
 }
 
 #[derive(Debug)]
 pub(crate) struct Struct {
     pub name: String,
     pub fields: Vec<Field>,
+    pub cpp_u64_pair: bool,
 }
 
 #[derive(Debug)]
@@ -75,9 +84,13 @@ pub(crate) enum Type {
     Void,
     Bool,
     I8,
+    U8,
     I16,
+    U16,
     I32,
+    U32,
     I64,
+    U64,
     F32,
     F64,
     String,
@@ -215,7 +228,13 @@ fn parse_union(node: Node<'_>, source: &str, path: &Path) -> Result<Union, Codeg
             parse_field(field, source, path, "union alternative")
         })
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Union { name, alternatives })
+    let annotations = parse_annotations(node, source, path)?;
+    let expected = annotation_bool(&annotations, "coro_rpc.expected", path)?;
+    Ok(Union {
+        name,
+        alternatives,
+        expected,
+    })
 }
 
 fn parse_enum(node: Node<'_>, source: &str, path: &Path) -> Result<Enum, CodegenError> {
@@ -266,7 +285,22 @@ fn parse_enum(node: Node<'_>, source: &str, path: &Path) -> Result<Enum, Codegen
         })
         .collect::<Result<Vec<_>, CodegenError>>()?;
 
-    Ok(Enum { name, variants })
+    let annotations = parse_annotations(node, source, path)?;
+    let repr = match annotation_string(&annotations, "coro_rpc.repr", path)?.as_deref() {
+        None | Some("i32") => EnumRepr::I32,
+        Some("u8") => EnumRepr::U8,
+        Some(repr) => {
+            return Err(invalid(
+                path,
+                format!("annotation coro_rpc.repr supports i32 or u8, got {repr:?}"),
+            ));
+        }
+    };
+    Ok(Enum {
+        name,
+        variants,
+        repr,
+    })
 }
 
 fn parse_enum_value(raw: &str, enum_name: &str, path: &Path) -> Result<i32, CodegenError> {
@@ -360,7 +394,13 @@ fn parse_struct(node: Node<'_>, source: &str, path: &Path) -> Result<Struct, Cod
         .filter(|child| child.kind() == "field")
         .map(|field| parse_field(field, source, path, "struct field"))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(Struct { name, fields })
+    let annotations = parse_annotations(node, source, path)?;
+    let cpp_u64_pair = annotation_bool(&annotations, "coro_rpc.cpp_u64_pair", path)?;
+    Ok(Struct {
+        name,
+        fields,
+        cpp_u64_pair,
+    })
 }
 
 fn parse_service(node: Node<'_>, source: &str, path: &Path) -> Result<Service, CodegenError> {
@@ -528,7 +568,13 @@ fn parse_type(node: Node<'_>, source: &str, path: &Path) -> Result<Type, Codegen
                 format!("Thrift primitive {unsupported:?} is not supported"),
             )),
         },
-        "identifier" => Ok(Type::Named(text(node, source).to_owned())),
+        "identifier" => Ok(match text(node, source) {
+            "u8" => Type::U8,
+            "u16" => Type::U16,
+            "u32" => Type::U32,
+            "u64" => Type::U64,
+            name => Type::Named(name.to_owned()),
+        }),
         "list" | "set" => {
             let value = named_children(node)
                 .into_iter()
