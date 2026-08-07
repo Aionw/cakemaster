@@ -10,6 +10,7 @@ pub(crate) struct Document {
     pub rust_namespace: Vec<String>,
     pub cpp_namespace: Option<String>,
     pub typedefs: Vec<Typedef>,
+    pub enums: Vec<Enum>,
     pub structs: Vec<Struct>,
     pub services: Vec<Service>,
 }
@@ -18,6 +19,18 @@ pub(crate) struct Document {
 pub(crate) struct Typedef {
     pub name: String,
     pub target: Type,
+}
+
+#[derive(Debug)]
+pub(crate) struct Enum {
+    pub name: String,
+    pub variants: Vec<EnumVariant>,
+}
+
+#[derive(Debug)]
+pub(crate) struct EnumVariant {
+    pub name: String,
+    pub value: i32,
 }
 
 #[derive(Debug)]
@@ -97,6 +110,7 @@ pub(crate) fn parse(source: &str, path: &Path) -> Result<Document, CodegenError>
     let mut rust_namespace = Vec::new();
     let mut cpp_namespace = None;
     let mut typedefs = Vec::new();
+    let mut enums = Vec::new();
     let mut structs = Vec::new();
     let mut services = Vec::new();
 
@@ -131,6 +145,7 @@ pub(crate) fn parse(source: &str, path: &Path) -> Result<Document, CodegenError>
                 ));
             }
             "typedef_definition" => typedefs.push(parse_typedef(item, source, path)?),
+            "enum_definition" => enums.push(parse_enum(item, source, path)?),
             "struct_definition" => structs.push(parse_struct(item, source, path)?),
             "service_definition" => services.push(parse_service(item, source, path)?),
             "const_definition" => {
@@ -139,8 +154,7 @@ pub(crate) fn parse(source: &str, path: &Path) -> Result<Document, CodegenError>
                     "const definitions are not used by coro_rpc code generation",
                 ));
             }
-            "enum_definition"
-            | "senum_definition"
+            "senum_definition"
             | "union_definition"
             | "exception_definition"
             | "interaction_definition" => {
@@ -165,8 +179,95 @@ pub(crate) fn parse(source: &str, path: &Path) -> Result<Document, CodegenError>
         rust_namespace,
         cpp_namespace,
         typedefs,
+        enums,
         structs,
         services,
+    })
+}
+
+fn parse_enum(node: Node<'_>, source: &str, path: &Path) -> Result<Enum, CodegenError> {
+    let name_node = node
+        .child_by_field_name("type")
+        .ok_or_else(|| invalid(path, "enum has no name"))?;
+    let name = text(name_node, source).to_owned();
+    let mut raw_variants = Vec::<(String, Option<i32>)>::new();
+
+    for child in named_children(node) {
+        match child.kind() {
+            "identifier" if child.start_byte() != name_node.start_byte() => {
+                raw_variants.push((text(child, source).to_owned(), None));
+            }
+            "number" => {
+                let (_, value) = raw_variants.last_mut().ok_or_else(|| {
+                    invalid(path, format!("enum {name} has a value without a variant"))
+                })?;
+                *value = Some(parse_enum_value(text(child, source), &name, path)?);
+            }
+            _ => {}
+        }
+    }
+
+    let mut previous: Option<i32> = None;
+    let variants = raw_variants
+        .into_iter()
+        .map(|(variant, explicit)| {
+            let value = match explicit {
+                Some(value) => value,
+                None => match previous {
+                    None => 0,
+                    Some(value) => value.checked_add(1).ok_or_else(|| {
+                        invalid(
+                            path,
+                            format!(
+                                "implicit value for enum variant {name}::{variant} exceeds i32"
+                            ),
+                        )
+                    })?,
+                },
+            };
+            previous = Some(value);
+            Ok(EnumVariant {
+                name: variant,
+                value,
+            })
+        })
+        .collect::<Result<Vec<_>, CodegenError>>()?;
+
+    Ok(Enum { name, variants })
+}
+
+fn parse_enum_value(raw: &str, enum_name: &str, path: &Path) -> Result<i32, CodegenError> {
+    let compact = raw.replace('_', "");
+    let (negative, unsigned) = match compact.as_bytes().first() {
+        Some(b'-') => (true, &compact[1..]),
+        Some(b'+') => (false, &compact[1..]),
+        _ => (false, compact.as_str()),
+    };
+    let (radix, digits) = if let Some(value) = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+    {
+        (16, value)
+    } else if let Some(value) = unsigned
+        .strip_prefix("0b")
+        .or_else(|| unsigned.strip_prefix("0B"))
+    {
+        (2, value)
+    } else {
+        (10, unsigned)
+    };
+    let magnitude = i64::from_str_radix(digits, radix).map_err(|_| {
+        invalid(
+            path,
+            format!("enum {enum_name} value {raw:?} is not a valid integer"),
+        )
+    })?;
+    let value = if negative { -magnitude } else { magnitude };
+    i32::try_from(value).map_err(|_| {
+        invalid(
+            path,
+            format!("enum {enum_name} value {raw:?} is outside the i32 range"),
+        )
     })
 }
 

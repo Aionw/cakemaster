@@ -14,7 +14,7 @@
 - 1–8 元 tuple/pair，以及通过宏声明的 `YLT_REFL` 风格结构体
 - 底层 typed `RpcMethod<Request, Response>` API，route ID 与请求/响应 schema hash 只计算一次
 - 基于 Thrift IDL 的 Rust-only codegen，route ID 与 schema hash 在构建时固化
-- 生成业务数据类型、typed client、server trait 与整组服务注册代码
+- 生成业务 struct、i32-backed enum、typed client、server trait 与整组服务注册代码
 - Tokio 多路复用客户端、流水线并发服务端、请求/响应 attachment
 - 基于 `tokio-util::codec` 的流式拆帧，以及 `Bytes` payload 零拷贝切分
 - 基于 `tower_service::Service` 的路由/执行边界
@@ -59,6 +59,7 @@ cargo run --release -- client 127.0.0.1:9000
 ```cpp
 std::string echo(std::string value);
 std::int32_t add(std::int32_t lhs, std::int32_t rhs);
+ErrorCode echo_error(ErrorCode error);            // int32_t-backed enum
 std::string ping();
 void fail(coro_rpc::context<void> context);  // 返回扩展错误码 1001
 void attachment_echo();                     // 回显 attachment
@@ -75,9 +76,16 @@ IDL 语法树由维护中的 [`arborium-thrift`](https://docs.rs/arborium-thrift
 ```thrift
 namespace rs api
 
+enum ErrorCode {
+  OK = 0
+  INTERNAL_ERROR = -1
+  OBJECT_NOT_FOUND = -704
+}
+
 service DemoService {
   string echo(1: required string value)
   i32 add(1: required i32 left, 2: required i32 right)
+  ErrorCode echo_error(1: required ErrorCode error)
   string ping()
   void fail()
   void attachment_echo() (coro_rpc.attachment = "true")
@@ -114,7 +122,7 @@ let sum = client.add(20, 22).await?;
 
 ```rust
 use coro_rpc::{RequestContext, RpcFailure, RpcResponse};
-use generated::api::{DemoService, DemoServiceServer};
+use generated::api::{DemoService, DemoServiceServer, ErrorCode};
 
 struct Service;
 
@@ -125,6 +133,10 @@ impl DemoService for Service {
 
     async fn add(&self, left: i32, right: i32) -> Result<i32, RpcFailure> {
         Ok(left + right)
+    }
+
+    async fn echo_error(&self, error: ErrorCode) -> Result<ErrorCode, RpcFailure> {
+        Ok(error)
     }
 
     async fn ping(&self) -> Result<String, RpcFailure> {
@@ -149,7 +161,7 @@ server.serve("127.0.0.1:9000").await?;
 
 默认 wire function name 是方法名；`namespace cpp demo` 会生成 `demo::method`。已有 C++ 名字不符合这个规则时，可在方法上使用 `(coro_rpc.name = "Service::method")`。需要请求/响应 attachment 的方法使用 `(coro_rpc.attachment = "true")`，只有这类生成接口会暴露 attachment 与 `RequestContext`。
 
-字段与参数必须提供正数且唯一的 Thrift field ID，生成器按 ID 升序确定 struct_pack wire 顺序。支持 `bool`、`byte/i8`、`i16`、`i32`、`i64`、`float`、`double`、`string`、`binary`、`list`、`set`、`map`、`optional`、typedef 和 struct。`set` 元素和 `map` key 还必须能映射为 Rust `Ord`；目前会拒绝浮点数和生成 struct。当前也会明确拒绝 include、enum、union、oneway、service inheritance、默认值和 typed `throws`，避免静默生成与 coro_rpc 不兼容的代码。
+字段与参数必须提供正数且唯一的 Thrift field ID，生成器按 ID 升序确定 struct_pack wire 顺序。支持 `bool`、`byte/i8`、`i16`、`i32`、`i64`、`float`、`double`、`string`、`binary`、`list`、`set`、`map`、`optional`、typedef、enum 和 struct。Thrift enum 会生成 `#[repr(i32)]` Rust enum，并按 C++ enum 的 `int32_t` 底层值参与 struct_pack 编解码及类型哈希；未知判别值会返回 `StructPackError::InvalidEnumDiscriminant`。`set` 元素和 `map` key 还必须能映射为 Rust `Ord`；目前会拒绝浮点数和生成 struct。当前也会明确拒绝 include、senum、union、oneway、service inheritance、默认值和 typed `throws`，避免静默生成与 coro_rpc 不兼容的代码。
 
 ## 运行结构
 

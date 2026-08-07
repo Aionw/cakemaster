@@ -57,6 +57,8 @@ pub enum StructPackError {
     InvalidBool(u8),
     #[error("invalid char32 value {0:#x}")]
     InvalidChar(u32),
+    #[error("invalid discriminant {value} for enum {name}")]
+    InvalidEnumDiscriminant { name: &'static str, value: i32 },
     #[error("container length {length} exceeds limit {limit}")]
     ContainerTooLarge { length: u64, limit: usize },
     #[error("container length cannot be represented")]

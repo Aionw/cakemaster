@@ -47,6 +47,44 @@ fn generates_typed_client_server_and_struct_pack_models() {
 }
 
 #[test]
+fn generates_i32_backed_struct_pack_enums() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("enum.thrift");
+    let output = directory.path().join("enum.rs");
+    fs::write(
+        &input,
+        r#"
+            enum ErrorCode {
+              OK,
+              INTERNAL_ERROR = -1,
+              OBJECT_NOT_FOUND = -0x2c0,
+              NEXT_ERROR,
+            }
+
+            struct Status {
+              1: required ErrorCode code
+              2: required set<ErrorCode> history
+            }
+
+            service ErrorService {
+              ErrorCode echo(1: required ErrorCode code)
+            }
+        "#,
+    )
+    .unwrap();
+
+    Builder::new().compile(&input, &output).unwrap();
+    let generated = fs::read_to_string(output).unwrap();
+    assert!(generated.contains("pub enum ErrorCode"));
+    assert!(generated.contains("Ok = 0"));
+    assert!(generated.contains("InternalError = -1"));
+    assert!(generated.contains("ObjectNotFound = -704"));
+    assert!(generated.contains("NextError = -703"));
+    assert!(generated.contains("impl ::coro_rpc::StructPack for ErrorCode"));
+    assert!(generated.contains("BTreeSet<ErrorCode>"));
+}
+
+#[test]
 fn rejects_contracts_that_struct_pack_cannot_represent() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("bad.thrift");
@@ -71,6 +109,30 @@ fn rejects_contracts_that_struct_pack_cannot_represent() {
         "unexpected error: {error}"
     );
     assert!(error.to_string().contains("duplicate field ID 1"));
+}
+
+#[test]
+fn rejects_duplicate_enum_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("duplicate-enum.thrift");
+    let output = directory.path().join("duplicate-enum.rs");
+    fs::write(
+        &input,
+        r#"
+            enum ErrorCode {
+              FIRST = -1,
+              SECOND = -1,
+            }
+            service ErrorService {
+              ErrorCode get()
+            }
+        "#,
+    )
+    .unwrap();
+
+    let error = Builder::new().compile(&input, output).unwrap_err();
+    assert!(matches!(error, CodegenError::InvalidContract { .. }));
+    assert!(error.to_string().contains("both use value -1"));
 }
 
 #[test]

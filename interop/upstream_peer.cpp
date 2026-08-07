@@ -13,6 +13,12 @@
 
 std::string echo(std::string value) { return value; }
 std::int32_t add(std::int32_t lhs, std::int32_t rhs) { return lhs + rhs; }
+enum class ErrorCode : std::int32_t {
+  OK = 0,
+  INTERNAL_ERROR = -1,
+  OBJECT_NOT_FOUND = -704,
+};
+ErrorCode echo_error(ErrorCode error) { return error; }
 std::string ping() { return "pong"; }
 void fail(coro_rpc::context<void> context) {
   context.response_error(coro_rpc::err_code{1001}, "expected interop error");
@@ -42,24 +48,31 @@ async_simple::coro::Lazy<int> run_client(std::string host, std::string port) {
     co_return 4;
   }
 
+  auto enum_result =
+      co_await client.call<echo_error>(ErrorCode::OBJECT_NOT_FOUND);
+  if (!enum_result || enum_result.value() != ErrorCode::OBJECT_NOT_FOUND) {
+    std::cerr << "enum call failed\n";
+    co_return 5;
+  }
+
   auto ping_result = co_await client.call<ping>();
   if (!ping_result || ping_result.value() != "pong") {
     std::cerr << "ping call failed\n";
-    co_return 5;
+    co_return 6;
   }
 
   auto fail_result = co_await client.call<fail>();
   if (fail_result || fail_result.error().code.val() != 1001 ||
       fail_result.error().msg != "expected interop error") {
     std::cerr << "extended error call failed\n";
-    co_return 6;
+    co_return 7;
   }
 
   client.set_req_attachment("C++ attachment");
   auto attachment_result = co_await client.call<attachment_echo>();
   if (!attachment_result || client.get_resp_attachment() != "C++ attachment") {
     std::cerr << "attachment call failed\n";
-    co_return 7;
+    co_return 8;
   }
 
   std::cout << "C++ client -> Rust server: OK\n";
@@ -76,7 +89,8 @@ int main(int argc, char **argv) {
   if (mode == "server" && argc == 3) {
     const auto port = static_cast<std::uint16_t>(std::stoi(argv[2]));
     coro_rpc::coro_rpc_server server(1, port);
-    server.register_handler<echo, add, ping, fail, attachment_echo>();
+    server
+        .register_handler<echo, add, echo_error, ping, fail, attachment_echo>();
     std::cout << "C++ coro_rpc server listening on " << port << std::endl;
     return !server.start();
   }

@@ -6,7 +6,7 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/cakemaster_rpc.rs"));
 }
 
-use generated::api::{DemoService, DemoServiceClient, DemoServiceServer};
+use generated::api::{DemoService, DemoServiceClient, DemoServiceServer, ErrorCode};
 
 struct DemoServiceImpl;
 
@@ -17,6 +17,10 @@ impl DemoService for DemoServiceImpl {
 
     async fn add(&self, left: i32, right: i32) -> Result<i32, RpcFailure> {
         Ok(left + right)
+    }
+
+    async fn echo_error(&self, error: ErrorCode) -> Result<ErrorCode, RpcFailure> {
+        Ok(error)
     }
 
     async fn ping(&self) -> Result<String, RpcFailure> {
@@ -77,6 +81,10 @@ async fn run_client(address: &str) -> Result<(), Box<dyn Error>> {
     let client = DemoServiceClient::connect(address).await?;
     let echo = client.echo("hello from Rust".to_owned()).await?;
     let sum = client.add(20, 22).await?;
+    let error = client.echo_error(ErrorCode::ObjectNotFound).await?;
+    if error != ErrorCode::ObjectNotFound {
+        return Err("enum mismatch".into());
+    }
     let pong = client.ping().await?;
     match client.fail().await {
         Err(RpcError::Remote(remote))
@@ -88,7 +96,7 @@ async fn run_client(address: &str) -> Result<(), Box<dyn Error>> {
     if attachment.attachment.as_ref() != b"Rust attachment" {
         return Err("attachment mismatch".into());
     }
-    println!("echo={echo:?}, add={sum}, ping={pong:?}, error=1001, attachment=OK");
+    println!("echo={echo:?}, add={sum}, enum={error:?}, ping={pong:?}, error=1001, attachment=OK");
     Ok(())
 }
 

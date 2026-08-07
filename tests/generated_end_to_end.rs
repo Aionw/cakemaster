@@ -5,7 +5,7 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/cakemaster_rpc.rs"));
 }
 
-use generated::api::{DemoService, DemoServiceClient, DemoServiceServer, User, UserId};
+use generated::api::{DemoService, DemoServiceClient, DemoServiceServer, ErrorCode, User, UserId};
 
 struct TestService;
 
@@ -16,6 +16,10 @@ impl DemoService for TestService {
 
     async fn add(&self, left: i32, right: i32) -> Result<i32, RpcFailure> {
         Ok(left + right)
+    }
+
+    async fn echo_error(&self, error: ErrorCode) -> Result<ErrorCode, RpcFailure> {
+        Ok(error)
     }
 
     async fn ping(&self) -> Result<String, RpcFailure> {
@@ -49,6 +53,10 @@ async fn generated_client_and_server_share_one_contract() {
     let client = DemoServiceClient::connect(address).await.unwrap();
     assert_eq!(client.echo("hello".to_owned()).await.unwrap(), "hello");
     assert_eq!(client.add(20, 22).await.unwrap(), 42);
+    assert_eq!(
+        client.echo_error(ErrorCode::ObjectNotFound).await.unwrap(),
+        ErrorCode::ObjectNotFound
+    );
     assert_eq!(client.ping().await.unwrap(), "pong");
     assert_eq!(
         client.fail().await.unwrap_err(),
@@ -80,4 +88,33 @@ fn generated_thrift_models_use_struct_pack_wire_types() {
     let encoded = coro_rpc::struct_pack::serialize(&user).unwrap();
     let decoded = coro_rpc::struct_pack::deserialize::<User>(&encoded).unwrap();
     assert_eq!(decoded, user);
+
+    let enum_encoded = coro_rpc::struct_pack::serialize(&ErrorCode::ObjectNotFound).unwrap();
+    assert_eq!(
+        enum_encoded,
+        coro_rpc::struct_pack::serialize(&-704_i32).unwrap()
+    );
+    assert_eq!(
+        coro_rpc::struct_pack::deserialize::<ErrorCode>(&enum_encoded).unwrap(),
+        ErrorCode::ObjectNotFound
+    );
+
+    let batch_expected = vec![Ok(true), Err(ErrorCode::ObjectNotFound)];
+    let batch_encoded = coro_rpc::struct_pack::serialize(&batch_expected).unwrap();
+    assert_eq!(
+        coro_rpc::struct_pack::deserialize::<Vec<Result<bool, ErrorCode>>>(&batch_encoded).unwrap(),
+        batch_expected
+    );
+}
+
+#[test]
+fn generated_enum_rejects_unknown_discriminants() {
+    let encoded = coro_rpc::struct_pack::serialize(&12345_i32).unwrap();
+    assert_eq!(
+        coro_rpc::struct_pack::deserialize::<ErrorCode>(&encoded).unwrap_err(),
+        coro_rpc::StructPackError::InvalidEnumDiscriminant {
+            name: "ErrorCode",
+            value: 12345,
+        }
+    );
 }

@@ -7,7 +7,7 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
 
 use crate::CodegenError;
-use crate::ast::{Document, Field, Function, Service, Struct, Type, Typedef};
+use crate::ast::{Document, Enum, Field, Function, Service, Struct, Type, Typedef};
 
 const TYPE_INT32: u8 = 1;
 const TYPE_INT64: u8 = 3;
@@ -37,6 +37,11 @@ pub(crate) fn generate(
         .iter()
         .map(|typedef| generate_typedef(typedef, runtime, path))
         .collect::<Result<Vec<_>, _>>()?;
+    let enums = document
+        .enums
+        .iter()
+        .map(|enumeration| generate_enum(enumeration, runtime, path))
+        .collect::<Result<Vec<_>, _>>()?;
     let structs = document
         .structs
         .iter()
@@ -50,6 +55,7 @@ pub(crate) fn generate(
 
     let mut output = quote! {
         #(#typedefs)*
+        #(#enums)*
         #(#structs)*
         #(#services)*
     };
@@ -73,6 +79,10 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
         register_rust_type(&mut rust_types, &typedef.name, path)?;
         ensure_non_void(&typedef.target, "typedef", path)?;
     }
+    for enumeration in &document.enums {
+        register_rust_type(&mut rust_types, &enumeration.name, path)?;
+        validate_enum(enumeration, path)?;
+    }
     for structure in &document.structs {
         register_rust_type(&mut rust_types, &structure.name, path)?;
         if structure.fields.is_empty() {
@@ -92,7 +102,13 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
         .typedefs
         .iter()
         .map(|item| item.name.as_str())
+        .chain(document.enums.iter().map(|item| item.name.as_str()))
         .chain(document.structs.iter().map(|item| item.name.as_str()))
+        .collect::<BTreeSet<_>>();
+    let enum_names = document
+        .enums
+        .iter()
+        .map(|item| item.name.as_str())
         .collect::<BTreeSet<_>>();
     let typedef_map = document
         .typedefs
@@ -106,12 +122,12 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
         .collect::<BTreeMap<_, _>>();
     for typedef in &document.typedefs {
         validate_type_references(&typedef.target, &known_types, path)?;
-        validate_ordered_containers(&typedef.target, &typedef_map, path)?;
+        validate_ordered_containers(&typedef.target, &typedef_map, &enum_names, path)?;
     }
     for structure in &document.structs {
         for field in &structure.fields {
             validate_type_references(&field.type_, &known_types, path)?;
-            validate_ordered_containers(&field.type_, &typedef_map, path)?;
+            validate_ordered_containers(&field.type_, &typedef_map, &enum_names, path)?;
         }
     }
 
@@ -166,10 +182,10 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
                 path,
             )?;
             validate_type_references(&function.returns, &known_types, path)?;
-            validate_ordered_containers(&function.returns, &typedef_map, path)?;
+            validate_ordered_containers(&function.returns, &typedef_map, &enum_names, path)?;
             for parameter in &function.parameters {
                 validate_type_references(&parameter.type_, &known_types, path)?;
-                validate_ordered_containers(&parameter.type_, &typedef_map, path)?;
+                validate_ordered_containers(&parameter.type_, &typedef_map, &enum_names, path)?;
             }
             if function.attachment
                 && function.parameters.iter().any(|parameter| {
@@ -211,6 +227,7 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
             false,
             &typedef_map,
             &struct_map,
+            &enum_names,
             &mut vec![typedef.name.clone()],
             path,
         )?;
@@ -222,6 +239,7 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
                 field.optional,
                 &typedef_map,
                 &struct_map,
+                &enum_names,
                 &mut vec![structure.name.clone()],
                 path,
             )?;
@@ -234,6 +252,7 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
                 &function.parameters,
                 &typedef_map,
                 &struct_map,
+                &enum_names,
                 &mut stack,
                 path,
             )?;
@@ -242,6 +261,7 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
                 false,
                 &typedef_map,
                 &struct_map,
+                &enum_names,
                 &mut stack,
                 path,
             )?;
@@ -269,6 +289,44 @@ fn validate_fields(fields: &[Field], owner: &str, path: &Path) -> Result<(), Cod
         }
         rust_ident(&name, "field", path)?;
         ensure_non_void(&field.type_, owner, path)?;
+    }
+    Ok(())
+}
+
+fn validate_enum(enumeration: &Enum, path: &Path) -> Result<(), CodegenError> {
+    if enumeration.variants.is_empty() {
+        return Err(invalid(
+            path,
+            format!(
+                "enum {} must contain at least one variant",
+                enumeration.name
+            ),
+        ));
+    }
+
+    let mut names = BTreeSet::new();
+    let mut values = BTreeMap::new();
+    for variant in &enumeration.variants {
+        let name = variant.name.to_upper_camel_case();
+        rust_ident(&name, "enum variant", path)?;
+        if !names.insert(name.clone()) {
+            return Err(invalid(
+                path,
+                format!(
+                    "enum {} has duplicate generated variant name {name}",
+                    enumeration.name
+                ),
+            ));
+        }
+        if let Some(existing) = values.insert(variant.value, variant.name.as_str()) {
+            return Err(invalid(
+                path,
+                format!(
+                    "enum {} variants {existing} and {} both use value {}",
+                    enumeration.name, variant.name, variant.value
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -311,44 +369,53 @@ fn validate_type_references(
 fn validate_ordered_containers(
     type_: &Type,
     typedefs: &BTreeMap<&str, &Typedef>,
+    enums: &BTreeSet<&str>,
     path: &Path,
 ) -> Result<(), CodegenError> {
     match type_ {
-        Type::List(value) => validate_ordered_containers(value, typedefs, path),
+        Type::List(value) => validate_ordered_containers(value, typedefs, enums, path),
         Type::Set(value) => {
-            if !is_rust_ord(value, typedefs, &mut Vec::new()) {
+            if !is_rust_ord(value, typedefs, enums, &mut Vec::new()) {
                 return Err(invalid(
                     path,
                     "Thrift set element type must implement Rust Ord; floating-point and generated struct elements are not supported",
                 ));
             }
-            validate_ordered_containers(value, typedefs, path)
+            validate_ordered_containers(value, typedefs, enums, path)
         }
         Type::Map(key, value) => {
-            if !is_rust_ord(key, typedefs, &mut Vec::new()) {
+            if !is_rust_ord(key, typedefs, enums, &mut Vec::new()) {
                 return Err(invalid(
                     path,
                     "Thrift map key type must implement Rust Ord; floating-point and generated struct keys are not supported",
                 ));
             }
-            validate_ordered_containers(key, typedefs, path)?;
-            validate_ordered_containers(value, typedefs, path)
+            validate_ordered_containers(key, typedefs, enums, path)?;
+            validate_ordered_containers(value, typedefs, enums, path)
         }
         Type::Named(_) => Ok(()),
         _ => Ok(()),
     }
 }
 
-fn is_rust_ord(type_: &Type, typedefs: &BTreeMap<&str, &Typedef>, stack: &mut Vec<String>) -> bool {
+fn is_rust_ord(
+    type_: &Type,
+    typedefs: &BTreeMap<&str, &Typedef>,
+    enums: &BTreeSet<&str>,
+    stack: &mut Vec<String>,
+) -> bool {
     match type_ {
         Type::Bool | Type::I8 | Type::I16 | Type::I32 | Type::I64 | Type::String | Type::Binary => {
             true
         }
-        Type::List(value) | Type::Set(value) => is_rust_ord(value, typedefs, stack),
+        Type::List(value) | Type::Set(value) => is_rust_ord(value, typedefs, enums, stack),
         Type::Map(key, value) => {
-            is_rust_ord(key, typedefs, stack) && is_rust_ord(value, typedefs, stack)
+            is_rust_ord(key, typedefs, enums, stack) && is_rust_ord(value, typedefs, enums, stack)
         }
         Type::Named(name) => {
+            if enums.contains(name.as_str()) {
+                return true;
+            }
             if stack.iter().any(|item| item == name) {
                 return false;
             }
@@ -356,7 +423,7 @@ fn is_rust_ord(type_: &Type, typedefs: &BTreeMap<&str, &Typedef>, stack: &mut Ve
                 return false;
             };
             stack.push(name.clone());
-            let ordered = is_rust_ord(&typedef.target, typedefs, stack);
+            let ordered = is_rust_ord(&typedef.target, typedefs, enums, stack);
             stack.pop();
             ordered
         }
@@ -385,6 +452,75 @@ fn generate_typedef(
     let target = rust_type(&typedef.target, false, runtime, path)?;
     Ok(quote! {
         pub type #name = #target;
+    })
+}
+
+fn generate_enum(
+    enumeration: &Enum,
+    runtime: &syn::Path,
+    path: &Path,
+) -> Result<TokenStream, CodegenError> {
+    let name = rust_ident(&enumeration.name.to_upper_camel_case(), "enum", path)?;
+    let variants = enumeration
+        .variants
+        .iter()
+        .map(|variant| rust_ident(&variant.name.to_upper_camel_case(), "enum variant", path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let values = enumeration
+        .variants
+        .iter()
+        .map(|variant| variant.value)
+        .collect::<Vec<_>>();
+
+    Ok(quote! {
+        #[repr(i32)]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+        pub enum #name {
+            #(#variants = #values,)*
+        }
+
+        impl ::core::convert::From<#name> for i32 {
+            fn from(value: #name) -> Self {
+                value as i32
+            }
+        }
+
+        impl ::core::convert::TryFrom<i32> for #name {
+            type Error = i32;
+
+            fn try_from(value: i32) -> ::core::result::Result<Self, Self::Error> {
+                match value {
+                    #(#values => Ok(Self::#variants),)*
+                    value => Err(value),
+                }
+            }
+        }
+
+        impl #runtime::StructPack for #name {
+            fn append_type_literal(output: &mut ::std::vec::Vec<u8>) {
+                <i32 as #runtime::StructPack>::append_type_literal(output);
+            }
+
+            fn encode_payload(
+                &self,
+                encoder: &mut #runtime::struct_pack::Encoder<'_>,
+            ) -> ::core::result::Result<(), #runtime::StructPackError> {
+                let value = i32::from(*self);
+                <i32 as #runtime::StructPack>::encode_payload(&value, encoder)
+            }
+
+            fn decode_payload(
+                decoder: &mut #runtime::struct_pack::Decoder<'_>,
+            ) -> ::core::result::Result<Self, #runtime::StructPackError> {
+                let value = <i32 as #runtime::StructPack>::decode_payload(decoder)?;
+                Self::try_from(value).map_err(|value| {
+                    #runtime::StructPackError::InvalidEnumDiscriminant {
+                        name: stringify!(#name),
+                        value,
+                    }
+                })
+            }
+        }
     })
 }
 
@@ -435,6 +571,11 @@ fn generate_service(
         .iter()
         .map(|item| (item.name.as_str(), item))
         .collect::<BTreeMap<_, _>>();
+    let enum_names = document
+        .enums
+        .iter()
+        .map(|item| item.name.as_str())
+        .collect::<BTreeSet<_>>();
 
     let mut descriptors = Vec::new();
     let mut client_methods = Vec::new();
@@ -458,6 +599,7 @@ fn generate_service(
             false,
             &typedef_map,
             &struct_map,
+            &enum_names,
             &mut stack,
             path,
         )?);
@@ -487,6 +629,7 @@ fn generate_service(
                 &function.parameters,
                 &typedef_map,
                 &struct_map,
+                &enum_names,
                 &mut stack,
                 path,
             )?);
@@ -787,12 +930,21 @@ fn request_type_literal(
     fields: &[Field],
     typedefs: &BTreeMap<&str, &Typedef>,
     structs: &BTreeMap<&str, &Struct>,
+    enums: &BTreeSet<&str>,
     stack: &mut Vec<String>,
     path: &Path,
 ) -> Result<Vec<u8>, CodegenError> {
     let fields = ordered_fields(fields);
     if let [field] = fields.as_slice() {
-        return type_literal(&field.type_, field.optional, typedefs, structs, stack, path);
+        return type_literal(
+            &field.type_,
+            field.optional,
+            typedefs,
+            structs,
+            enums,
+            stack,
+            path,
+        );
     }
     let mut literal = vec![TYPE_STRUCT];
     for field in fields {
@@ -801,6 +953,7 @@ fn request_type_literal(
             field.optional,
             typedefs,
             structs,
+            enums,
             stack,
             path,
         )?);
@@ -814,6 +967,7 @@ fn type_literal(
     optional: bool,
     typedefs: &BTreeMap<&str, &Typedef>,
     structs: &BTreeMap<&str, &Struct>,
+    enums: &BTreeSet<&str>,
     stack: &mut Vec<String>,
     path: &Path,
 ) -> Result<Vec<u8>, CodegenError> {
@@ -834,18 +988,30 @@ fn type_literal(
         Type::String | Type::Binary => literal.extend([TYPE_STRING, TYPE_CHAR8]),
         Type::List(value) => {
             literal.push(TYPE_CONTAINER);
-            literal.extend(type_literal(value, false, typedefs, structs, stack, path)?);
+            literal.extend(type_literal(
+                value, false, typedefs, structs, enums, stack, path,
+            )?);
         }
         Type::Set(value) => {
             literal.push(TYPE_SET);
-            literal.extend(type_literal(value, false, typedefs, structs, stack, path)?);
+            literal.extend(type_literal(
+                value, false, typedefs, structs, enums, stack, path,
+            )?);
         }
         Type::Map(key, value) => {
             literal.push(TYPE_MAP);
-            literal.extend(type_literal(key, false, typedefs, structs, stack, path)?);
-            literal.extend(type_literal(value, false, typedefs, structs, stack, path)?);
+            literal.extend(type_literal(
+                key, false, typedefs, structs, enums, stack, path,
+            )?);
+            literal.extend(type_literal(
+                value, false, typedefs, structs, enums, stack, path,
+            )?);
         }
         Type::Named(name) => {
+            if enums.contains(name.as_str()) {
+                literal.push(TYPE_INT32);
+                return Ok(literal);
+            }
             if stack.iter().any(|item| item == name) {
                 return Err(invalid(
                     path,
@@ -859,6 +1025,7 @@ fn type_literal(
                     false,
                     typedefs,
                     structs,
+                    enums,
                     stack,
                     path,
                 )?);
@@ -870,6 +1037,7 @@ fn type_literal(
                         field.optional,
                         typedefs,
                         structs,
+                        enums,
                         stack,
                         path,
                     )?);
