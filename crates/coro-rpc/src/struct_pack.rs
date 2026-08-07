@@ -1,9 +1,9 @@
 //! The portable subset of yalantinglibs `struct_pack` used by coro_rpc.
 //!
 //! The implementation covers fixed-width primitives, strings, byte strings,
-//! vectors, arrays, maps, sets, options, expected values (`Result`), tuples and
-//! reflected structs. C++ structs should use `YLT_REFL` so their representation
-//! is field-based rather than ABI/padding-based.
+//! vectors, arrays, maps, sets, options, variants, expected values (`Result`),
+//! tuples and reflected structs. C++ structs should use `YLT_REFL` so their
+//! representation is field-based rather than ABI/padding-based.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -30,6 +30,7 @@ const TYPE_MAP: u8 = 130;
 const TYPE_SET: u8 = 131;
 const TYPE_CONTAINER: u8 = 132;
 const TYPE_OPTIONAL: u8 = 133;
+const TYPE_VARIANT: u8 = 134;
 const TYPE_EXPECTED: u8 = 135;
 const TYPE_MONOSTATE: u8 = 250;
 const TYPE_STRUCT: u8 = 253;
@@ -59,6 +60,12 @@ pub enum StructPackError {
     InvalidChar(u32),
     #[error("invalid discriminant {value} for enum {name}")]
     InvalidEnumDiscriminant { name: &'static str, value: i32 },
+    #[error("invalid index {index} for variant {name} with {alternatives} alternatives")]
+    InvalidVariantIndex {
+        name: &'static str,
+        index: u8,
+        alternatives: usize,
+    },
     #[error("container length {length} exceeds limit {limit}")]
     ContainerTooLarge { length: u64, limit: usize },
     #[error("container length cannot be represented")]
@@ -754,10 +761,11 @@ impl_tuple!(
     (H, 7)
 );
 
-/// Internal constants used by [`crate::impl_struct_pack!`].
+/// Internal constants used by generated `StructPack` implementations.
 #[doc(hidden)]
 pub mod __private {
     pub const TYPE_STRUCT: u8 = super::TYPE_STRUCT;
+    pub const TYPE_VARIANT: u8 = super::TYPE_VARIANT;
     pub const TYPE_END: u8 = super::TYPE_END;
 }
 

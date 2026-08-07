@@ -11,6 +11,7 @@ pub(crate) struct Document {
     pub cpp_namespace: Option<String>,
     pub typedefs: Vec<Typedef>,
     pub enums: Vec<Enum>,
+    pub unions: Vec<Union>,
     pub structs: Vec<Struct>,
     pub services: Vec<Service>,
 }
@@ -31,6 +32,12 @@ pub(crate) struct Enum {
 pub(crate) struct EnumVariant {
     pub name: String,
     pub value: i32,
+}
+
+#[derive(Debug)]
+pub(crate) struct Union {
+    pub name: String,
+    pub alternatives: Vec<Field>,
 }
 
 #[derive(Debug)]
@@ -111,6 +118,7 @@ pub(crate) fn parse(source: &str, path: &Path) -> Result<Document, CodegenError>
     let mut cpp_namespace = None;
     let mut typedefs = Vec::new();
     let mut enums = Vec::new();
+    let mut unions = Vec::new();
     let mut structs = Vec::new();
     let mut services = Vec::new();
 
@@ -146,6 +154,7 @@ pub(crate) fn parse(source: &str, path: &Path) -> Result<Document, CodegenError>
             }
             "typedef_definition" => typedefs.push(parse_typedef(item, source, path)?),
             "enum_definition" => enums.push(parse_enum(item, source, path)?),
+            "union_definition" => unions.push(parse_union(item, source, path)?),
             "struct_definition" => structs.push(parse_struct(item, source, path)?),
             "service_definition" => services.push(parse_service(item, source, path)?),
             "const_definition" => {
@@ -154,10 +163,7 @@ pub(crate) fn parse(source: &str, path: &Path) -> Result<Document, CodegenError>
                     "const definitions are not used by coro_rpc code generation",
                 ));
             }
-            "senum_definition"
-            | "union_definition"
-            | "exception_definition"
-            | "interaction_definition" => {
+            "senum_definition" | "exception_definition" | "interaction_definition" => {
                 return Err(invalid(
                     path,
                     format!("{} is not supported by the struct_pack subset", item.kind()),
@@ -180,9 +186,36 @@ pub(crate) fn parse(source: &str, path: &Path) -> Result<Document, CodegenError>
         cpp_namespace,
         typedefs,
         enums,
+        unions,
         structs,
         services,
     })
+}
+
+fn parse_union(node: Node<'_>, source: &str, path: &Path) -> Result<Union, CodegenError> {
+    let name = node
+        .child_by_field_name("type")
+        .map(|node| text(node, source).to_owned())
+        .ok_or_else(|| invalid(path, "union has no name"))?;
+    let alternatives = named_children(node)
+        .into_iter()
+        .filter(|child| child.kind() == "field")
+        .map(|field| {
+            if named_children(field)
+                .iter()
+                .any(|child| child.kind() == "field_modifier")
+            {
+                return Err(invalid(
+                    path,
+                    format!(
+                        "union {name} alternatives must not use required or optional modifiers"
+                    ),
+                ));
+            }
+            parse_field(field, source, path, "union alternative")
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Union { name, alternatives })
 }
 
 fn parse_enum(node: Node<'_>, source: &str, path: &Path) -> Result<Enum, CodegenError> {

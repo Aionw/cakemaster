@@ -6,7 +6,10 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/cakemaster_rpc.rs"));
 }
 
-use generated::api::{DemoService, DemoServiceClient, DemoServiceServer, ErrorCode};
+use generated::api::{
+    DemoService, DemoServiceClient, DemoServiceServer, DescriptorVariant, DiskDescriptor,
+    ErrorCode, ReplicaDescriptor,
+};
 
 struct DemoServiceImpl;
 
@@ -21,6 +24,13 @@ impl DemoService for DemoServiceImpl {
 
     async fn echo_error(&self, error: ErrorCode) -> Result<ErrorCode, RpcFailure> {
         Ok(error)
+    }
+
+    async fn echo_descriptor(
+        &self,
+        descriptor: ReplicaDescriptor,
+    ) -> Result<ReplicaDescriptor, RpcFailure> {
+        Ok(descriptor)
     }
 
     async fn ping(&self) -> Result<String, RpcFailure> {
@@ -85,6 +95,18 @@ async fn run_client(address: &str) -> Result<(), Box<dyn Error>> {
     if error != ErrorCode::ObjectNotFound {
         return Err("enum mismatch".into());
     }
+    let descriptor = ReplicaDescriptor {
+        id: 7,
+        descriptor_variant: DescriptorVariant::Disk(DiskDescriptor {
+            path: "/tmp/cake".to_owned(),
+            object_size: 4096,
+        }),
+        status: 3,
+    };
+    let echoed_descriptor = client.echo_descriptor(descriptor.clone()).await?;
+    if echoed_descriptor != descriptor {
+        return Err("variant mismatch".into());
+    }
     let pong = client.ping().await?;
     match client.fail().await {
         Err(RpcError::Remote(remote))
@@ -96,7 +118,10 @@ async fn run_client(address: &str) -> Result<(), Box<dyn Error>> {
     if attachment.attachment.as_ref() != b"Rust attachment" {
         return Err("attachment mismatch".into());
     }
-    println!("echo={echo:?}, add={sum}, enum={error:?}, ping={pong:?}, error=1001, attachment=OK");
+    println!(
+        "echo={echo:?}, add={sum}, enum={error:?}, variant={echoed_descriptor:?}, \
+         ping={pong:?}, error=1001, attachment=OK"
+    );
     Ok(())
 }
 

@@ -7,7 +7,7 @@ use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
 
 use crate::CodegenError;
-use crate::ast::{Document, Enum, Field, Function, Service, Struct, Type, Typedef};
+use crate::ast::{Document, Enum, Field, Function, Service, Struct, Type, Typedef, Union};
 
 const TYPE_INT32: u8 = 1;
 const TYPE_INT64: u8 = 3;
@@ -22,9 +22,44 @@ const TYPE_MAP: u8 = 130;
 const TYPE_SET: u8 = 131;
 const TYPE_CONTAINER: u8 = 132;
 const TYPE_OPTIONAL: u8 = 133;
+const TYPE_VARIANT: u8 = 134;
 const TYPE_MONOSTATE: u8 = 250;
 const TYPE_STRUCT: u8 = 253;
 const TYPE_END: u8 = 255;
+
+struct TypeSchemas<'a> {
+    typedefs: BTreeMap<&'a str, &'a Typedef>,
+    structs: BTreeMap<&'a str, &'a Struct>,
+    unions: BTreeMap<&'a str, &'a Union>,
+    enums: BTreeSet<&'a str>,
+}
+
+impl<'a> TypeSchemas<'a> {
+    fn new(document: &'a Document) -> Self {
+        Self {
+            typedefs: document
+                .typedefs
+                .iter()
+                .map(|item| (item.name.as_str(), item))
+                .collect(),
+            structs: document
+                .structs
+                .iter()
+                .map(|item| (item.name.as_str(), item))
+                .collect(),
+            unions: document
+                .unions
+                .iter()
+                .map(|item| (item.name.as_str(), item))
+                .collect(),
+            enums: document
+                .enums
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect(),
+        }
+    }
+}
 
 pub(crate) fn generate(
     document: &Document,
@@ -42,6 +77,11 @@ pub(crate) fn generate(
         .iter()
         .map(|enumeration| generate_enum(enumeration, runtime, path))
         .collect::<Result<Vec<_>, _>>()?;
+    let unions = document
+        .unions
+        .iter()
+        .map(|union| generate_union(union, runtime, path))
+        .collect::<Result<Vec<_>, _>>()?;
     let structs = document
         .structs
         .iter()
@@ -56,6 +96,7 @@ pub(crate) fn generate(
     let mut output = quote! {
         #(#typedefs)*
         #(#enums)*
+        #(#unions)*
         #(#structs)*
         #(#services)*
     };
@@ -83,6 +124,10 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
         register_rust_type(&mut rust_types, &enumeration.name, path)?;
         validate_enum(enumeration, path)?;
     }
+    for union in &document.unions {
+        register_rust_type(&mut rust_types, &union.name, path)?;
+        validate_union(union, path)?;
+    }
     for structure in &document.structs {
         register_rust_type(&mut rust_types, &structure.name, path)?;
         if structure.fields.is_empty() {
@@ -103,31 +148,29 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
         .iter()
         .map(|item| item.name.as_str())
         .chain(document.enums.iter().map(|item| item.name.as_str()))
+        .chain(document.unions.iter().map(|item| item.name.as_str()))
         .chain(document.structs.iter().map(|item| item.name.as_str()))
         .collect::<BTreeSet<_>>();
-    let enum_names = document
-        .enums
-        .iter()
-        .map(|item| item.name.as_str())
-        .collect::<BTreeSet<_>>();
-    let typedef_map = document
-        .typedefs
-        .iter()
-        .map(|item| (item.name.as_str(), item))
-        .collect::<BTreeMap<_, _>>();
-    let struct_map = document
-        .structs
-        .iter()
-        .map(|item| (item.name.as_str(), item))
-        .collect::<BTreeMap<_, _>>();
+    let schemas = TypeSchemas::new(document);
     for typedef in &document.typedefs {
         validate_type_references(&typedef.target, &known_types, path)?;
-        validate_ordered_containers(&typedef.target, &typedef_map, &enum_names, path)?;
+        validate_ordered_containers(&typedef.target, &schemas.typedefs, &schemas.enums, path)?;
     }
     for structure in &document.structs {
         for field in &structure.fields {
             validate_type_references(&field.type_, &known_types, path)?;
-            validate_ordered_containers(&field.type_, &typedef_map, &enum_names, path)?;
+            validate_ordered_containers(&field.type_, &schemas.typedefs, &schemas.enums, path)?;
+        }
+    }
+    for union in &document.unions {
+        for alternative in &union.alternatives {
+            validate_type_references(&alternative.type_, &known_types, path)?;
+            validate_ordered_containers(
+                &alternative.type_,
+                &schemas.typedefs,
+                &schemas.enums,
+                path,
+            )?;
         }
     }
 
@@ -182,10 +225,20 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
                 path,
             )?;
             validate_type_references(&function.returns, &known_types, path)?;
-            validate_ordered_containers(&function.returns, &typedef_map, &enum_names, path)?;
+            validate_ordered_containers(
+                &function.returns,
+                &schemas.typedefs,
+                &schemas.enums,
+                path,
+            )?;
             for parameter in &function.parameters {
                 validate_type_references(&parameter.type_, &known_types, path)?;
-                validate_ordered_containers(&parameter.type_, &typedef_map, &enum_names, path)?;
+                validate_ordered_containers(
+                    &parameter.type_,
+                    &schemas.typedefs,
+                    &schemas.enums,
+                    path,
+                )?;
             }
             if function.attachment
                 && function.parameters.iter().any(|parameter| {
@@ -225,9 +278,7 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
         type_literal(
             &typedef.target,
             false,
-            &typedef_map,
-            &struct_map,
-            &enum_names,
+            &schemas,
             &mut vec![typedef.name.clone()],
             path,
         )?;
@@ -237,34 +288,26 @@ fn validate(document: &Document, path: &Path) -> Result<(), CodegenError> {
             type_literal(
                 &field.type_,
                 field.optional,
-                &typedef_map,
-                &struct_map,
-                &enum_names,
+                &schemas,
                 &mut vec![structure.name.clone()],
                 path,
             )?;
         }
     }
+    for union in &document.unions {
+        type_literal(
+            &Type::Named(union.name.clone()),
+            false,
+            &schemas,
+            &mut Vec::new(),
+            path,
+        )?;
+    }
     for service in &document.services {
         for function in &service.functions {
             let mut stack = Vec::new();
-            request_type_literal(
-                &function.parameters,
-                &typedef_map,
-                &struct_map,
-                &enum_names,
-                &mut stack,
-                path,
-            )?;
-            type_literal(
-                &function.returns,
-                false,
-                &typedef_map,
-                &struct_map,
-                &enum_names,
-                &mut stack,
-                path,
-            )?;
+            request_type_literal(&function.parameters, &schemas, &mut stack, path)?;
+            type_literal(&function.returns, false, &schemas, &mut stack, path)?;
         }
     }
     Ok(())
@@ -331,6 +374,41 @@ fn validate_enum(enumeration: &Enum, path: &Path) -> Result<(), CodegenError> {
     Ok(())
 }
 
+fn validate_union(union: &Union, path: &Path) -> Result<(), CodegenError> {
+    if union.alternatives.is_empty() {
+        return Err(invalid(
+            path,
+            format!("union {} must contain at least one alternative", union.name),
+        ));
+    }
+    if union.alternatives.len() >= 256 {
+        return Err(invalid(
+            path,
+            format!(
+                "union {} must contain fewer than 256 alternatives",
+                union.name
+            ),
+        ));
+    }
+
+    validate_fields(&union.alternatives, &format!("union {}", union.name), path)?;
+    for (index, alternative) in ordered_fields(&union.alternatives).into_iter().enumerate() {
+        let expected_id = i64::try_from(index + 1).expect("union alternatives are limited to 255");
+        if alternative.id != expected_id {
+            return Err(invalid(
+                path,
+                format!(
+                    "union {} field IDs must be contiguous from 1; expected {expected_id}, got {}",
+                    union.name, alternative.id
+                ),
+            ));
+        }
+        let name = alternative.name.to_upper_camel_case();
+        rust_ident(&name, "union variant", path)?;
+    }
+    Ok(())
+}
+
 fn register_rust_type(
     names: &mut BTreeSet<String>,
     name: &str,
@@ -378,7 +456,7 @@ fn validate_ordered_containers(
             if !is_rust_ord(value, typedefs, enums, &mut Vec::new()) {
                 return Err(invalid(
                     path,
-                    "Thrift set element type must implement Rust Ord; floating-point and generated struct elements are not supported",
+                    "Thrift set element type must implement Rust Ord; floating-point and generated struct/union elements are not supported",
                 ));
             }
             validate_ordered_containers(value, typedefs, enums, path)
@@ -387,7 +465,7 @@ fn validate_ordered_containers(
             if !is_rust_ord(key, typedefs, enums, &mut Vec::new()) {
                 return Err(invalid(
                     path,
-                    "Thrift map key type must implement Rust Ord; floating-point and generated struct keys are not supported",
+                    "Thrift map key type must implement Rust Ord; floating-point and generated struct/union keys are not supported",
                 ));
             }
             validate_ordered_containers(key, typedefs, enums, path)?;
@@ -524,6 +602,96 @@ fn generate_enum(
     })
 }
 
+fn generate_union(
+    union: &Union,
+    runtime: &syn::Path,
+    path: &Path,
+) -> Result<TokenStream, CodegenError> {
+    let name = rust_ident(&union.name.to_upper_camel_case(), "union", path)?;
+    let alternatives = ordered_fields(&union.alternatives);
+    let variant_names = alternatives
+        .iter()
+        .map(|alternative| {
+            rust_ident(
+                &alternative.name.to_upper_camel_case(),
+                "union variant",
+                path,
+            )
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let variant_types = alternatives
+        .iter()
+        .map(|alternative| rust_type(&alternative.type_, false, runtime, path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let variant_indices = (0..alternatives.len())
+        .map(|index| {
+            u8::try_from(index).expect("unions are validated to have fewer than 256 fields")
+        })
+        .collect::<Vec<_>>();
+    let alternative_count = alternatives.len();
+
+    Ok(quote! {
+        #[derive(Debug, Clone, PartialEq)]
+        pub enum #name {
+            #(#variant_names(#variant_types),)*
+        }
+
+        impl #runtime::StructPack for #name {
+            fn append_type_literal(output: &mut ::std::vec::Vec<u8>) {
+                output.push(#runtime::struct_pack::__private::TYPE_VARIANT);
+                #(
+                    <#variant_types as #runtime::StructPack>::append_type_literal(output);
+                )*
+                output.push(#runtime::struct_pack::__private::TYPE_END);
+            }
+
+            fn max_container_len(&self) -> usize {
+                match self {
+                    #(
+                        Self::#variant_names(value) =>
+                            <#variant_types as #runtime::StructPack>::max_container_len(value),
+                    )*
+                }
+            }
+
+            fn encode_payload(
+                &self,
+                encoder: &mut #runtime::struct_pack::Encoder<'_>,
+            ) -> ::core::result::Result<(), #runtime::StructPackError> {
+                match self {
+                    #(
+                        Self::#variant_names(value) => {
+                            <u8 as #runtime::StructPack>::encode_payload(
+                                &#variant_indices,
+                                encoder,
+                            )?;
+                            <#variant_types as #runtime::StructPack>::encode_payload(value, encoder)
+                        }
+                    )*
+                }
+            }
+
+            fn decode_payload(
+                decoder: &mut #runtime::struct_pack::Decoder<'_>,
+            ) -> ::core::result::Result<Self, #runtime::StructPackError> {
+                let index = <u8 as #runtime::StructPack>::decode_payload(decoder)?;
+                match index {
+                    #(
+                        #variant_indices => Ok(Self::#variant_names(
+                            <#variant_types as #runtime::StructPack>::decode_payload(decoder)?,
+                        )),
+                    )*
+                    index => Err(#runtime::StructPackError::InvalidVariantIndex {
+                        name: stringify!(#name),
+                        index,
+                        alternatives: #alternative_count,
+                    }),
+                }
+            }
+        }
+    })
+}
+
 fn generate_struct(
     structure: &Struct,
     runtime: &syn::Path,
@@ -561,21 +729,7 @@ fn generate_service(
     let client_name = format_ident!("{}Client", trait_name);
     let server_name = format_ident!("{}Server", trait_name);
 
-    let typedef_map = document
-        .typedefs
-        .iter()
-        .map(|item| (item.name.as_str(), item))
-        .collect::<BTreeMap<_, _>>();
-    let struct_map = document
-        .structs
-        .iter()
-        .map(|item| (item.name.as_str(), item))
-        .collect::<BTreeMap<_, _>>();
-    let enum_names = document
-        .enums
-        .iter()
-        .map(|item| item.name.as_str())
-        .collect::<BTreeSet<_>>();
+    let schemas = TypeSchemas::new(document);
 
     let mut descriptors = Vec::new();
     let mut client_methods = Vec::new();
@@ -597,9 +751,7 @@ fn generate_service(
         let response_hash = hash_type_literal(&type_literal(
             &function.returns,
             false,
-            &typedef_map,
-            &struct_map,
-            &enum_names,
+            &schemas,
             &mut stack,
             path,
         )?);
@@ -627,9 +779,7 @@ fn generate_service(
         } else {
             let request_hash = hash_type_literal(&request_type_literal(
                 &function.parameters,
-                &typedef_map,
-                &struct_map,
-                &enum_names,
+                &schemas,
                 &mut stack,
                 path,
             )?);
@@ -928,32 +1078,20 @@ fn wire_name(document: &Document, service: &Service, function: &Function) -> Str
 
 fn request_type_literal(
     fields: &[Field],
-    typedefs: &BTreeMap<&str, &Typedef>,
-    structs: &BTreeMap<&str, &Struct>,
-    enums: &BTreeSet<&str>,
+    schemas: &TypeSchemas<'_>,
     stack: &mut Vec<String>,
     path: &Path,
 ) -> Result<Vec<u8>, CodegenError> {
     let fields = ordered_fields(fields);
     if let [field] = fields.as_slice() {
-        return type_literal(
-            &field.type_,
-            field.optional,
-            typedefs,
-            structs,
-            enums,
-            stack,
-            path,
-        );
+        return type_literal(&field.type_, field.optional, schemas, stack, path);
     }
     let mut literal = vec![TYPE_STRUCT];
     for field in fields {
         literal.extend(type_literal(
             &field.type_,
             field.optional,
-            typedefs,
-            structs,
-            enums,
+            schemas,
             stack,
             path,
         )?);
@@ -965,9 +1103,7 @@ fn request_type_literal(
 fn type_literal(
     type_: &Type,
     optional: bool,
-    typedefs: &BTreeMap<&str, &Typedef>,
-    structs: &BTreeMap<&str, &Struct>,
-    enums: &BTreeSet<&str>,
+    schemas: &TypeSchemas<'_>,
     stack: &mut Vec<String>,
     path: &Path,
 ) -> Result<Vec<u8>, CodegenError> {
@@ -988,27 +1124,19 @@ fn type_literal(
         Type::String | Type::Binary => literal.extend([TYPE_STRING, TYPE_CHAR8]),
         Type::List(value) => {
             literal.push(TYPE_CONTAINER);
-            literal.extend(type_literal(
-                value, false, typedefs, structs, enums, stack, path,
-            )?);
+            literal.extend(type_literal(value, false, schemas, stack, path)?);
         }
         Type::Set(value) => {
             literal.push(TYPE_SET);
-            literal.extend(type_literal(
-                value, false, typedefs, structs, enums, stack, path,
-            )?);
+            literal.extend(type_literal(value, false, schemas, stack, path)?);
         }
         Type::Map(key, value) => {
             literal.push(TYPE_MAP);
-            literal.extend(type_literal(
-                key, false, typedefs, structs, enums, stack, path,
-            )?);
-            literal.extend(type_literal(
-                value, false, typedefs, structs, enums, stack, path,
-            )?);
+            literal.extend(type_literal(key, false, schemas, stack, path)?);
+            literal.extend(type_literal(value, false, schemas, stack, path)?);
         }
         Type::Named(name) => {
-            if enums.contains(name.as_str()) {
+            if schemas.enums.contains(name.as_str()) {
                 literal.push(TYPE_INT32);
                 return Ok(literal);
             }
@@ -1019,25 +1147,27 @@ fn type_literal(
                 ));
             }
             stack.push(name.clone());
-            if let Some(typedef) = typedefs.get(name.as_str()) {
-                literal.extend(type_literal(
-                    &typedef.target,
-                    false,
-                    typedefs,
-                    structs,
-                    enums,
-                    stack,
-                    path,
-                )?);
-            } else if let Some(structure) = structs.get(name.as_str()) {
+            if let Some(typedef) = schemas.typedefs.get(name.as_str()) {
+                literal.extend(type_literal(&typedef.target, false, schemas, stack, path)?);
+            } else if let Some(structure) = schemas.structs.get(name.as_str()) {
                 literal.push(TYPE_STRUCT);
                 for field in ordered_fields(&structure.fields) {
                     literal.extend(type_literal(
                         &field.type_,
                         field.optional,
-                        typedefs,
-                        structs,
-                        enums,
+                        schemas,
+                        stack,
+                        path,
+                    )?);
+                }
+                literal.push(TYPE_END);
+            } else if let Some(union) = schemas.unions.get(name.as_str()) {
+                literal.push(TYPE_VARIANT);
+                for alternative in ordered_fields(&union.alternatives) {
+                    literal.extend(type_literal(
+                        &alternative.type_,
+                        false,
+                        schemas,
                         stack,
                         path,
                     )?);

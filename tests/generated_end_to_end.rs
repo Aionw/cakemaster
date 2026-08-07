@@ -5,7 +5,11 @@ pub mod generated {
     include!(concat!(env!("OUT_DIR"), "/cakemaster_rpc.rs"));
 }
 
-use generated::api::{DemoService, DemoServiceClient, DemoServiceServer, ErrorCode, User, UserId};
+use generated::api::{
+    DemoService, DemoServiceClient, DemoServiceServer, DescriptorVariant, DiskDescriptor,
+    ErrorCode, LocalDiskDescriptor, MemoryDescriptor, NoFDescriptor, ReplicaDescriptor, User,
+    UserId,
+};
 
 struct TestService;
 
@@ -20,6 +24,13 @@ impl DemoService for TestService {
 
     async fn echo_error(&self, error: ErrorCode) -> Result<ErrorCode, RpcFailure> {
         Ok(error)
+    }
+
+    async fn echo_descriptor(
+        &self,
+        descriptor: ReplicaDescriptor,
+    ) -> Result<ReplicaDescriptor, RpcFailure> {
+        Ok(descriptor)
     }
 
     async fn ping(&self) -> Result<String, RpcFailure> {
@@ -56,6 +67,18 @@ async fn generated_client_and_server_share_one_contract() {
     assert_eq!(
         client.echo_error(ErrorCode::ObjectNotFound).await.unwrap(),
         ErrorCode::ObjectNotFound
+    );
+    let descriptor = ReplicaDescriptor {
+        id: 7,
+        descriptor_variant: DescriptorVariant::Disk(DiskDescriptor {
+            path: "/tmp/cake".to_owned(),
+            object_size: 4096,
+        }),
+        status: 3,
+    };
+    assert_eq!(
+        client.echo_descriptor(descriptor.clone()).await.unwrap(),
+        descriptor
     );
     assert_eq!(client.ping().await.unwrap(), "pong");
     assert_eq!(
@@ -105,6 +128,28 @@ fn generated_thrift_models_use_struct_pack_wire_types() {
         coro_rpc::struct_pack::deserialize::<Vec<Result<bool, ErrorCode>>>(&batch_encoded).unwrap(),
         batch_expected
     );
+
+    let variants = [
+        DescriptorVariant::Memory(MemoryDescriptor { address: 11 }),
+        DescriptorVariant::NofSsd(NoFDescriptor { address: 22 }),
+        DescriptorVariant::Disk(DiskDescriptor {
+            path: "/disk/cake".to_owned(),
+            object_size: 33,
+        }),
+        DescriptorVariant::LocalDisk(LocalDiskDescriptor {
+            client_id_high: 44,
+            client_id_low: 55,
+            transport_endpoint: "tcp://host:1234".to_owned(),
+        }),
+    ];
+    for (expected_index, variant) in variants.into_iter().enumerate() {
+        let encoded = coro_rpc::struct_pack::serialize(&variant).unwrap();
+        assert_eq!(encoded[4], expected_index as u8);
+        assert_eq!(
+            coro_rpc::struct_pack::deserialize::<DescriptorVariant>(&encoded).unwrap(),
+            variant
+        );
+    }
 }
 
 #[test]
@@ -115,6 +160,25 @@ fn generated_enum_rejects_unknown_discriminants() {
         coro_rpc::StructPackError::InvalidEnumDiscriminant {
             name: "ErrorCode",
             value: 12345,
+        }
+    );
+}
+
+#[test]
+fn generated_union_rejects_unknown_variant_indices() {
+    let mut encoded =
+        coro_rpc::struct_pack::serialize(&DescriptorVariant::Memory(MemoryDescriptor {
+            address: 11,
+        }))
+        .unwrap();
+    assert_eq!(encoded[4], 0);
+    encoded[4] = 4;
+    assert_eq!(
+        coro_rpc::struct_pack::deserialize::<DescriptorVariant>(&encoded).unwrap_err(),
+        coro_rpc::StructPackError::InvalidVariantIndex {
+            name: "DescriptorVariant",
+            index: 4,
+            alternatives: 4,
         }
     );
 }

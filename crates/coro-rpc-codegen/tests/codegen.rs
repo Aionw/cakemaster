@@ -85,6 +85,52 @@ fn generates_i32_backed_struct_pack_enums() {
 }
 
 #[test]
+fn generates_struct_pack_variants_from_thrift_unions() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("union.thrift");
+    let output = directory.path().join("union.rs");
+    fs::write(
+        &input,
+        r#"
+            struct MemoryDescriptor {
+              1: required i64 address
+            }
+
+            struct DiskDescriptor {
+              1: required string path
+            }
+
+            union DescriptorVariant {
+              2: DiskDescriptor disk
+              1: MemoryDescriptor memory
+            }
+
+            struct ReplicaDescriptor {
+              1: required DescriptorVariant descriptor
+            }
+
+            service DescriptorService {
+              ReplicaDescriptor echo(1: required ReplicaDescriptor descriptor)
+            }
+        "#,
+    )
+    .unwrap();
+
+    Builder::new().compile(&input, &output).unwrap();
+    let generated = fs::read_to_string(output).unwrap();
+    assert!(generated.contains("pub enum DescriptorVariant"));
+    assert!(generated.contains("Memory(MemoryDescriptor)"));
+    assert!(generated.contains("Disk(DiskDescriptor)"));
+    assert!(generated.contains("TYPE_VARIANT"));
+    let memory_position = generated.find("Memory(MemoryDescriptor)").unwrap();
+    let disk_position = generated.find("Disk(DiskDescriptor)").unwrap();
+    assert!(
+        memory_position < disk_position,
+        "field IDs define std::variant index order"
+    );
+}
+
+#[test]
 fn rejects_contracts_that_struct_pack_cannot_represent() {
     let directory = tempfile::tempdir().unwrap();
     let input = directory.path().join("bad.thrift");
@@ -133,6 +179,57 @@ fn rejects_duplicate_enum_values() {
     let error = Builder::new().compile(&input, output).unwrap_err();
     assert!(matches!(error, CodegenError::InvalidContract { .. }));
     assert!(error.to_string().contains("both use value -1"));
+}
+
+#[test]
+fn rejects_non_contiguous_union_field_ids() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("gapped-union.thrift");
+    let output = directory.path().join("gapped-union.rs");
+    fs::write(
+        &input,
+        r#"
+            union BrokenVariant {
+              1: i32 first
+              3: string third
+            }
+            service BrokenService {
+              BrokenVariant get()
+            }
+        "#,
+    )
+    .unwrap();
+
+    let error = Builder::new().compile(&input, output).unwrap_err();
+    assert!(matches!(error, CodegenError::InvalidContract { .. }));
+    assert!(error.to_string().contains("must be contiguous from 1"));
+}
+
+#[test]
+fn rejects_union_field_modifiers() {
+    let directory = tempfile::tempdir().unwrap();
+    let input = directory.path().join("modified-union.thrift");
+    let output = directory.path().join("modified-union.rs");
+    fs::write(
+        &input,
+        r#"
+            union BrokenVariant {
+              1: optional i32 value
+            }
+            service BrokenService {
+              BrokenVariant get()
+            }
+        "#,
+    )
+    .unwrap();
+
+    let error = Builder::new().compile(&input, output).unwrap_err();
+    assert!(matches!(error, CodegenError::InvalidContract { .. }));
+    assert!(
+        error
+            .to_string()
+            .contains("must not use required or optional modifiers")
+    );
 }
 
 #[test]
