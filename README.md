@@ -14,7 +14,7 @@
 - 1–8 元 tuple/pair，以及通过宏声明的 `YLT_REFL` 风格结构体
 - 底层 typed `RpcMethod<Request, Response>` API，route ID 与请求/响应 schema hash 只计算一次
 - 基于 Thrift IDL 的 Rust-only codegen，route ID 与 schema hash 在构建时固化
-- 生成业务 struct、i32-backed enum、union-backed data enum、typed client、server trait 与整组服务注册代码
+- 生成业务 struct、i32/u8-backed enum、union-backed data enum、`tl::expected` 语义 union、typed client、server trait 与整组服务注册代码
 - Tokio 多路复用客户端、流水线并发服务端、请求/响应 attachment
 - 基于 `tokio-util::codec` 的流式拆帧，以及 `Bytes` payload 零拷贝切分
 - 基于 `tower_service::Service` 的路由/执行边界
@@ -190,7 +190,9 @@ server.serve("127.0.0.1:9000").await?;
 
 默认 wire function name 是方法名；`namespace cpp demo` 会生成 `demo::method`。已有 C++ 名字不符合这个规则时，可在方法上使用 `(coro_rpc.name = "Service::method")`。需要请求/响应 attachment 的方法使用 `(coro_rpc.attachment = "true")`，只有这类生成接口会暴露 attachment 与 `RequestContext`。
 
-字段与参数必须提供正数且唯一的 Thrift field ID，生成器按 ID 升序确定 struct_pack wire 顺序。支持 `bool`、`byte/i8`、`i16`、`i32`、`i64`、`float`、`double`、`string`、`binary`、`list`、`set`、`map`、`optional`、typedef、enum、union 和 struct。Thrift enum 会生成 `#[repr(i32)]` Rust enum，并按 C++ enum 的 `int32_t` 底层值参与 struct_pack 编解码及类型哈希；未知判别值会返回 `StructPackError::InvalidEnumDiscriminant`。Thrift union 会生成带 payload 的 Rust enum，对应 C++ `std::variant`；其 field ID 必须从 1 连续编号，`field ID - 1` 即 variant index，且 alternative 不允许 `required`/`optional` 修饰。Mooncake 当前固定的 yalantinglibs 版本中，C++ client 对裸的顶层 `std::variant` RPC 返回值存在模板限制，因此跨语言接口应将 union 放进 `YLT_REFL` 结构体；Mooncake 的 `Replica::Descriptor` 已经是这种形态。`set` 元素和 `map` key 还必须能映射为 Rust `Ord`；目前会拒绝浮点数、生成 struct 和 union。当前也会明确拒绝 include、senum、oneway、service inheritance、默认值和 typed `throws`，避免静默生成与 coro_rpc 不兼容的代码。
+字段与参数必须提供正数且唯一的 Thrift field ID，生成器按 ID 升序确定 struct_pack wire 顺序。支持 `bool`、`byte/i8`、`i16`、`i32`、`i64`、`float`、`double`、`string`、`binary`、`list`、`set`、`map`、`optional`、typedef、enum、union 和 struct；为匹配 C++ wire 还提供 `u8`、`u16`、`u32`、`u64` 扩展类型。Thrift enum 默认生成 `#[repr(i32)]` Rust enum；`(coro_rpc.repr = "u8")` 用于底层类型为 `std::uint8_t` 的 C++ enum。未知判别值会返回 `StructPackError::InvalidEnumDiscriminant`。
+
+普通 Thrift union 会生成带 payload 的 Rust enum，对应 C++ `std::variant`；其 field ID 必须从 1 连续编号，`field ID - 1` 即 variant index，且 alternative 不允许 `required`/`optional` 修饰。`(coro_rpc.expected)` 则把 `value/error` union 生成为 Rust `Result<T, E>`；只有 `error` 字段时对应 `Result<(), E>` 和 `tl::expected<void, E>`。Mooncake 的 `UUID` 是 `std::pair<uint64_t, uint64_t>`，其 struct_pack type literal 带 pair 的对齐信息，不能按普通反射 struct 处理；精确的两个 required `u64` 字段可用 `(coro_rpc.cpp_u64_pair)` 声明。Mooncake 当前固定的 yalantinglibs 版本中，C++ client 对裸的顶层 `std::variant` RPC 返回值存在模板限制，因此跨语言接口应将 union 放进 `YLT_REFL` 结构体；Mooncake 的 `Replica::Descriptor` 已经是这种形态。`set` 元素和 `map` key 还必须能映射为 Rust `Ord`；目前会拒绝浮点数、生成 struct 和 union。当前也会明确拒绝 include、senum、oneway、service inheritance、默认值和 typed `throws`，避免静默生成与 coro_rpc 不兼容的代码。
 
 ## 运行结构
 
@@ -239,6 +241,62 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 [`crates/coro-rpc/tests/upstream_golden.rs`](crates/coro-rpc/tests/upstream_golden.rs) 使用 C++ 上游生成的固定字节序列验证类型哈希和编码；[`crates/coro-rpc/tests/end_to_end.rs`](crates/coro-rpc/tests/end_to_end.rs) 验证流水线、错误与 attachment；[`crates/coro-rpc-codegen/tests/codegen.rs`](crates/coro-rpc-codegen/tests/codegen.rs) 验证 Thrift 解析、校验和 stub 生成；[`tests/generated_end_to_end.rs`](tests/generated_end_to_end.rs) 使用同一份生成契约验证 client/server 与业务 struct。`interop/` 中还包含直接编译 yalantinglibs 的向量生成器和双向 C++ peer。
+
+## Mooncake Master RPC 性能对比
+
+[`idl/mooncake_master.thrift`](idl/mooncake_master.thrift) 和 [`src/bin/mooncake_benchmark.rs`](src/bin/mooncake_benchmark.rs) 提供与 Mooncake `WrappedMasterService` 相同 wire 的 Rust peer，[`interop/mooncake_benchmark.cpp`](interop/mooncake_benchmark.cpp) 是使用 Mooncake 自带 yalantinglibs 的 C++ peer。两端只实现最小合法返回值，不维护 segment、replica、lease 或 object 状态，适合单独比较 RPC framing、struct_pack 编解码、调度和网络开销。
+
+推理框架的三个操作会落到以下五个 Master RPC：
+
+| 基准参数 | Mooncake RPC | 用途 |
+| --- | --- | --- |
+| `exists` | `BatchExistKey` | `BatchExists` |
+| `get` | `BatchGetReplicaList` | `BatchGet` |
+| `put-start` | `BatchPutStart` | `BatchPut` 分配 replica |
+| `put-end` | `BatchPutEnd` | `BatchPut` 写入成功提交 |
+| `put-revoke` | `BatchPutRevoke` | `BatchPut` 失败回滚 |
+
+构建 Rust 与 C++ 版本：
+
+```bash
+cargo build --release --bin mooncake_benchmark
+
+g++ -std=c++20 -O3 -DNDEBUG \
+  -I ~/src/cpp/Mooncake/extern/yalantinglibs/include \
+  -I ~/src/cpp/Mooncake/extern/yalantinglibs/include/ylt/thirdparty \
+  interop/mooncake_benchmark.cpp -pthread -o /tmp/mooncake_benchmark
+```
+
+服务端性能建议固定同一个 C++ client，只替换 server。下面以 `get`、batch 16、串行请求为例；其余操作只需替换 `get`：
+
+```bash
+# Rust server
+target/release/mooncake_benchmark server 127.0.0.1:19094 1
+/tmp/mooncake_benchmark client 127.0.0.1 19094 get 16 200000 1 20000
+
+# C++ server
+/tmp/mooncake_benchmark server 19095 1
+/tmp/mooncake_benchmark client 127.0.0.1 19095 get 16 200000 1 20000
+```
+
+客户端性能则固定 C++ server，分别运行两个 client：
+
+```bash
+/tmp/mooncake_benchmark server 19095 1
+target/release/mooncake_benchmark client 127.0.0.1:19095 get 16 200000 1 20000
+/tmp/mooncake_benchmark client 127.0.0.1 19095 get 16 200000 1 20000
+```
+
+client 参数依次是 `operation batch-size iterations pipeline warmup`。输出同时包含每批 QPS、每 key QPS 和单次完成延迟。`pipeline=1` 最适合比较串行延迟；提高 pipeline 可测单连接饱和吞吐，但两种客户端提交异步请求的方式不同，因此判断 runtime/server 差异时优先采用“固定 C++ client、替换 server”的结果。正式测量应将 server/client 固定到不同物理核，并重复至少三轮取中位数。
+
+两端的 schema 和 route 元数据可直接比对：
+
+```bash
+target/release/mooncake_benchmark metadata
+/tmp/mooncake_benchmark metadata
+```
+
+[`tests/mooncake_wire.rs`](tests/mooncake_wire.rs) 固定了五个接口的 C++ type literal、type hash、route hash 和代表性 `BatchPutEnd` 字节序列。
 
 ## 本机性能对比
 

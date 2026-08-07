@@ -306,6 +306,14 @@ impl Reservation {
     pub fn owned_descriptor(&self) -> MemoryDescriptor {
         self.descriptor().to_owned()
     }
+
+    pub(crate) fn release_batch(reservations: Vec<Self>) {
+        OffsetAllocationHandle::release_batch(
+            reservations
+                .into_iter()
+                .map(|reservation| reservation.allocation),
+        );
+    }
 }
 
 impl fmt::Debug for Reservation {

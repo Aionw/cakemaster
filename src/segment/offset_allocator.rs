@@ -43,6 +43,12 @@ pub(crate) struct OffsetAllocationHandle {
     reserved_bytes: u64,
 }
 
+struct PendingRelease {
+    owner: Arc<SharedAllocator>,
+    allocation: Allocation,
+    reserved_bytes: u64,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AllocatorStats {
     pub(crate) capacity: u64,
@@ -157,17 +163,29 @@ impl ByteAllocator {
 
 impl SharedAllocator {
     fn release(&self, allocation: Allocation, reserved_bytes: u64) {
+        self.release_many(std::iter::once((allocation, reserved_bytes)));
+    }
+
+    fn release_many(&self, releases: impl IntoIterator<Item = (Allocation, u64)>) {
         let mut state = mutex_lock(&self.state);
-        state.inner.free(allocation);
+        let mut allocation_count = 0_u64;
+        let mut released_bytes = 0_u64;
+        for (allocation, reserved_bytes) in releases {
+            state.inner.free(allocation);
+            allocation_count += 1;
+            released_bytes += reserved_bytes;
+        }
         state.live_allocations = state
             .live_allocations
-            .checked_sub(1)
+            .checked_sub(allocation_count)
             .expect("allocation handles guarantee balanced release");
         state.used_bytes = state
             .used_bytes
-            .checked_sub(reserved_bytes)
+            .checked_sub(released_bytes)
             .expect("allocation handles guarantee balanced byte accounting");
-        if self.largest_free_region_hint.load(Ordering::Relaxed) < self.managed_capacity {
+        if allocation_count != 0
+            && self.largest_free_region_hint.load(Ordering::Relaxed) < self.managed_capacity
+        {
             self.refresh_largest_free_region(&state);
         }
     }
@@ -200,6 +218,42 @@ impl OffsetAllocationHandle {
     #[inline]
     pub(crate) fn spec(&self) -> &MemorySegmentSpec {
         &self.owner.spec
+    }
+
+    pub(crate) fn release_batch(handles: impl IntoIterator<Item = Self>) {
+        let mut releases = handles
+            .into_iter()
+            .map(Self::into_pending_release)
+            .collect::<Vec<_>>();
+        releases.sort_unstable_by_key(|release| Arc::as_ptr(&release.owner) as usize);
+
+        let mut group_start = 0;
+        while group_start < releases.len() {
+            let owner_ptr = Arc::as_ptr(&releases[group_start].owner);
+            let mut group_end = group_start + 1;
+            while group_end < releases.len()
+                && std::ptr::eq(Arc::as_ptr(&releases[group_end].owner), owner_ptr)
+            {
+                group_end += 1;
+            }
+            releases[group_start].owner.release_many(
+                releases[group_start..group_end]
+                    .iter()
+                    .map(|release| (release.allocation, release.reserved_bytes)),
+            );
+            group_start = group_end;
+        }
+    }
+
+    fn into_pending_release(mut self) -> PendingRelease {
+        PendingRelease {
+            owner: self.owner.clone(),
+            allocation: self
+                .allocation
+                .take()
+                .expect("live allocation handles contain an allocation"),
+            reserved_bytes: self.reserved_bytes,
+        }
     }
 }
 
@@ -283,5 +337,26 @@ mod tests {
         drop(pressure);
         assert!(allocator.may_satisfy(4096));
         assert_eq!(allocator.allocate(4096).unwrap().offset(), 0);
+    }
+
+    #[test]
+    fn batch_release_groups_handles_by_allocator_and_coalesces() {
+        let first = allocator(4096, 1024);
+        let second = allocator(8192, 1024);
+        let releases = vec![
+            first.allocate(128).unwrap(),
+            second.allocate(512).unwrap(),
+            first.allocate(256).unwrap(),
+            second.allocate(1024).unwrap(),
+        ];
+
+        super::OffsetAllocationHandle::release_batch(releases);
+
+        assert_eq!(first.stats().live_allocations, 0);
+        assert_eq!(first.stats().available_bytes, 4096);
+        assert_eq!(second.stats().live_allocations, 0);
+        assert_eq!(second.stats().available_bytes, 8192);
+        assert_eq!(first.allocate(4096).unwrap().offset(), 0);
+        assert_eq!(second.allocate(8192).unwrap().offset(), 0);
     }
 }
