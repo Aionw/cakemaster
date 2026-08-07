@@ -13,6 +13,8 @@ resolver = "3"
 
 [dependencies]
 coro-rpc = { path = "crates/coro-rpc" }
+offset-allocator = "0.2"
+parking_lot = "0.12"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 
 [build-dependencies]
