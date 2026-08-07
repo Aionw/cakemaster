@@ -2,9 +2,18 @@
 name = "cakemaster"
 version = "0.1.0"
 edition = "2024"
-description = "Tokio implementation of the yalantinglibs coro_rpc v0 wire protocol"
+description = "Application using the internal coro-rpc workspace crate"
 license = "Apache-2.0"
+build = "build.rs"
+
+[workspace]
+members = ["crates/coro-rpc", "crates/coro-rpc-codegen"]
+default-members = [".", "crates/coro-rpc", "crates/coro-rpc-codegen"]
+resolver = "3"
 
 [dependencies]
-md-5 = "0.11"
+coro-rpc = { path = "crates/coro-rpc" }
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[build-dependencies]
+coro-rpc-codegen = { path = "crates/coro-rpc-codegen" }

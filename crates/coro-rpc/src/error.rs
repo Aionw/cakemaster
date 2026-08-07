@@ -1,5 +1,7 @@
 use std::fmt;
 
+use thiserror::Error;
+
 use crate::struct_pack::StructPackError;
 
 /// Standard error codes declared by yalantinglibs `coro_rpc`.
@@ -76,58 +78,36 @@ impl RpcErrorCode {
 }
 
 /// An error returned by the remote RPC handler.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("remote RPC error {code}: {message}")]
 pub struct RemoteError {
     pub code: u16,
     pub message: String,
 }
 
-impl fmt::Display for RemoteError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "remote RPC error {}: {}", self.code, self.message)
-    }
-}
-
-impl std::error::Error for RemoteError {}
-
 /// Errors produced by [`crate::RpcClient`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum RpcError {
+    #[error("I/O error: {0}")]
     Io(String),
+    #[error("protocol error: {0}")]
     Protocol(String),
-    Codec(StructPackError),
-    Remote(RemoteError),
+    #[error("struct_pack error: {0}")]
+    Codec(#[from] StructPackError),
+    #[error(transparent)]
+    Remote(#[from] RemoteError),
+    #[error("RPC request timed out")]
     TimedOut,
+    #[error("RPC connection closed")]
     ConnectionClosed,
+    #[error("RPC request is too large")]
     RequestTooLarge,
+    #[error("RPC sequence number conflict")]
     SerialNumberConflict,
 }
 
 impl RpcError {
     pub(crate) fn io(error: impl fmt::Display) -> Self {
         Self::Io(error.to_string())
-    }
-}
-
-impl fmt::Display for RpcError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(message) => write!(f, "I/O error: {message}"),
-            Self::Protocol(message) => write!(f, "protocol error: {message}"),
-            Self::Codec(error) => write!(f, "struct_pack error: {error}"),
-            Self::Remote(error) => error.fmt(f),
-            Self::TimedOut => f.write_str("RPC request timed out"),
-            Self::ConnectionClosed => f.write_str("RPC connection closed"),
-            Self::RequestTooLarge => f.write_str("RPC request is too large"),
-            Self::SerialNumberConflict => f.write_str("RPC sequence number conflict"),
-        }
-    }
-}
-
-impl std::error::Error for RpcError {}
-
-impl From<StructPackError> for RpcError {
-    fn from(value: StructPackError) -> Self {
-        Self::Codec(value)
     }
 }

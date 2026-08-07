@@ -6,7 +6,8 @@
 //! is field-based rather than ABI/padding-based.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::fmt;
+
+use thiserror::Error;
 
 use crate::hash::md5_hash32;
 
@@ -42,50 +43,31 @@ const META_RESERVED_MASK: u8 = 0b1110_0000;
 const DEFAULT_CONTAINER_LIMIT: usize = 64 * 1024 * 1024;
 
 /// Errors produced while encoding or decoding a struct_pack value.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum StructPackError {
+    #[error("need {needed} bytes, only {remaining} remain")]
     UnexpectedEof { needed: usize, remaining: usize },
+    #[error("type hash mismatch (expected {expected:#010x}, got {actual:#010x})")]
     InvalidTypeHash { expected: u32, actual: u32 },
+    #[error("full type literal does not match")]
     InvalidTypeLiteral,
+    #[error("C++ string is not valid UTF-8")]
     InvalidUtf8,
+    #[error("invalid bool byte {0}")]
     InvalidBool(u8),
+    #[error("invalid char32 value {0:#x}")]
     InvalidChar(u32),
+    #[error("container length {length} exceeds limit {limit}")]
     ContainerTooLarge { length: u64, limit: usize },
+    #[error("container length cannot be represented")]
     LengthOverflow,
+    #[error("{0} trailing bytes remain")]
     TrailingBytes(usize),
+    #[error("invalid metadata: {0}")]
     InvalidMetadata(&'static str),
+    #[error("compatible-data size declares {declared} bytes, actual size is {actual}")]
     DeclaredSizeMismatch { declared: u64, actual: usize },
 }
-
-impl fmt::Display for StructPackError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::UnexpectedEof { needed, remaining } => {
-                write!(f, "need {needed} bytes, only {remaining} remain")
-            }
-            Self::InvalidTypeHash { expected, actual } => write!(
-                f,
-                "type hash mismatch (expected {expected:#010x}, got {actual:#010x})"
-            ),
-            Self::InvalidTypeLiteral => f.write_str("full type literal does not match"),
-            Self::InvalidUtf8 => f.write_str("C++ string is not valid UTF-8"),
-            Self::InvalidBool(value) => write!(f, "invalid bool byte {value}"),
-            Self::InvalidChar(value) => write!(f, "invalid char32 value {value:#x}"),
-            Self::ContainerTooLarge { length, limit } => {
-                write!(f, "container length {length} exceeds limit {limit}")
-            }
-            Self::LengthOverflow => f.write_str("container length cannot be represented"),
-            Self::TrailingBytes(count) => write!(f, "{count} trailing bytes remain"),
-            Self::InvalidMetadata(message) => write!(f, "invalid metadata: {message}"),
-            Self::DeclaredSizeMismatch { declared, actual } => write!(
-                f,
-                "compatible-data size declares {declared} bytes, actual size is {actual}"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for StructPackError {}
 
 /// A C++ `std::string` that may contain arbitrary non-UTF-8 bytes.
 ///
@@ -147,10 +129,17 @@ pub fn type_hash<T: StructPack>() -> u32 {
 
 /// Serializes a value in release-compatible struct_pack form.
 pub fn serialize<T: StructPack>(value: &T) -> Result<Vec<u8>, StructPackError> {
+    serialize_with_type_hash(value, type_hash::<T>())
+}
+
+pub(crate) fn serialize_with_type_hash<T: StructPack>(
+    value: &T,
+    type_hash: u32,
+) -> Result<Vec<u8>, StructPackError> {
     let max_length = value.max_container_len();
     let length_width = width_for_length(max_length);
     let has_metadata = length_width != 1;
-    let hash = type_hash::<T>() | u32::from(has_metadata);
+    let hash = type_hash | u32::from(has_metadata);
 
     let mut output = Vec::new();
     output.extend_from_slice(&hash.to_le_bytes());
@@ -176,6 +165,21 @@ pub fn deserialize_with_limit<T: StructPack>(
     input: &[u8],
     container_limit: usize,
 ) -> Result<T, StructPackError> {
+    deserialize_with_type_hash_and_limit(input, type_hash::<T>(), container_limit)
+}
+
+pub(crate) fn deserialize_with_type_hash<T: StructPack>(
+    input: &[u8],
+    type_hash: u32,
+) -> Result<T, StructPackError> {
+    deserialize_with_type_hash_and_limit(input, type_hash, DEFAULT_CONTAINER_LIMIT)
+}
+
+fn deserialize_with_type_hash_and_limit<T: StructPack>(
+    input: &[u8],
+    expected_hash: u32,
+    container_limit: usize,
+) -> Result<T, StructPackError> {
     let mut decoder = Decoder {
         input,
         position: 0,
@@ -184,7 +188,6 @@ pub fn deserialize_with_limit<T: StructPack>(
     };
 
     let encoded_hash = decoder.read_u32()?;
-    let expected_hash = type_hash::<T>();
     if encoded_hash & 0xffff_fffe != expected_hash {
         return Err(StructPackError::InvalidTypeHash {
             expected: expected_hash,
@@ -762,7 +765,7 @@ pub mod __private {
 /// `YLT_REFL`.
 ///
 /// ```
-/// use cakemaster::impl_struct_pack;
+/// use coro_rpc::impl_struct_pack;
 ///
 /// struct Person {
 ///     id: i32,

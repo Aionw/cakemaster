@@ -4,8 +4,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use cakemaster::impl_struct_pack;
-use cakemaster::struct_pack::{deserialize, serialize, type_hash, type_literal};
+use coro_rpc::impl_struct_pack;
+use coro_rpc::struct_pack::{deserialize, serialize, type_hash, type_literal};
 
 #[derive(Debug, PartialEq, Eq)]
 struct Person {

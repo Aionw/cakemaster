@@ -7,14 +7,18 @@
 mod client;
 mod error;
 mod hash;
+mod method;
 pub mod protocol;
 mod server;
 pub mod struct_pack;
 
+pub use bytes::Bytes;
 pub use client::{ClientConfig, RpcClient, RpcReply};
 pub use error::{RemoteError, RpcError, RpcErrorCode};
 pub use hash::function_id;
+pub use method::{RpcMethod, RpcNoArgsMethod};
 pub use server::{
     BoundRpcServer, RegisterError, RequestContext, RpcFailure, RpcResponse, RpcServer, ServerConfig,
 };
 pub use struct_pack::{ByteString, StructPack, StructPackError};
+pub use tokio::net::ToSocketAddrs;

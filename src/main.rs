@@ -1,6 +1,39 @@
 use std::error::Error;
 
-use cakemaster::{RpcClient, RpcError, RpcFailure, RpcResponse, RpcServer};
+use coro_rpc::{RequestContext, RpcError, RpcFailure, RpcResponse};
+
+pub mod generated {
+    include!(concat!(env!("OUT_DIR"), "/cakemaster_rpc.rs"));
+}
+
+use generated::api::{DemoService, DemoServiceClient, DemoServiceServer};
+
+struct DemoServiceImpl;
+
+impl DemoService for DemoServiceImpl {
+    async fn echo(&self, value: String) -> Result<String, RpcFailure> {
+        Ok(value)
+    }
+
+    async fn add(&self, left: i32, right: i32) -> Result<i32, RpcFailure> {
+        Ok(left + right)
+    }
+
+    async fn ping(&self) -> Result<String, RpcFailure> {
+        Ok("pong".to_owned())
+    }
+
+    async fn fail(&self) -> Result<(), RpcFailure> {
+        Err(RpcFailure::new(1001, "expected interop error"))
+    }
+
+    async fn attachment_echo(
+        &self,
+        context: RequestContext,
+    ) -> Result<RpcResponse<()>, RpcFailure> {
+        Ok(RpcResponse::with_attachment((), context.attachment))
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -29,43 +62,30 @@ async fn run() -> Result<(), Box<dyn Error>> {
 }
 
 async fn run_server(address: &str) -> Result<(), Box<dyn Error>> {
-    let mut server = RpcServer::new();
-    server
-        .register::<String, String, _, _>("echo", |value| async move { Ok(value) })?
-        .register::<(i32, i32), i32, _, _>("add", |(left, right)| async move { Ok(left + right) })?
-        .register_no_args::<String, _, _>("ping", || async { Ok("pong".to_owned()) })?
-        .register_no_args::<(), _, _>("fail", || async {
-            Err(RpcFailure::new(1001, "expected interop error"))
-        })?
-        .register_no_args_with_context::<(), _, _>("attachment_echo", |context| async move {
-            Ok(RpcResponse::with_attachment((), context.attachment))
-        })?;
-
+    let server = DemoServiceServer::new(DemoServiceImpl).into_rpc_server()?;
     let bound = server.bind(address).await?;
     println!("Tokio coro_rpc server listening on {}", bound.local_addr()?);
-    bound.run().await?;
+    bound
+        .run_until(async {
+            let _ = tokio::signal::ctrl_c().await;
+        })
+        .await?;
     Ok(())
 }
 
 async fn run_client(address: &str) -> Result<(), Box<dyn Error>> {
-    let client = RpcClient::connect(address).await?;
-    let echo = client
-        .call::<String, String>("echo", &"hello from Rust".to_owned())
-        .await?;
-    let sum = client.call::<(i32, i32), i32>("add", &(20, 22)).await?;
-    let pong = client.call_no_args::<String>("ping").await?;
-    let failure = client.call_no_args::<()>("fail").await.unwrap_err();
-    if !matches!(
-        failure,
-        RpcError::Remote(ref remote)
-            if remote.code == 1001 && remote.message == "expected interop error"
-    ) {
-        return Err(failure.into());
+    let client = DemoServiceClient::connect(address).await?;
+    let echo = client.echo("hello from Rust".to_owned()).await?;
+    let sum = client.add(20, 22).await?;
+    let pong = client.ping().await?;
+    match client.fail().await {
+        Err(RpcError::Remote(remote))
+            if remote.code == 1001 && remote.message == "expected interop error" => {}
+        Err(error) => return Err(error.into()),
+        Ok(()) => return Err("fail unexpectedly succeeded".into()),
     }
-    let attachment = client
-        .call_no_args_with_attachment::<()>("attachment_echo", b"Rust attachment".to_vec())
-        .await?;
-    if attachment.attachment != b"Rust attachment" {
+    let attachment = client.attachment_echo(b"Rust attachment".to_vec()).await?;
+    if attachment.attachment.as_ref() != b"Rust attachment" {
         return Err("attachment mismatch".into());
     }
     println!("echo={echo:?}, add={sum}, ping={pong:?}, error=1001, attachment=OK");
