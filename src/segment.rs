@@ -8,14 +8,16 @@ mod offset_allocator;
 pub mod placement;
 mod pool;
 mod reservation;
+mod spec;
 pub mod stats;
 mod transport;
 
 pub use config::SegmentPoolConfig;
-pub use descriptor::{
-    MemoryDescriptor, MemoryDescriptorRef, MemoryRegion, MemorySegmentSpec, SegmentTopology,
-};
+pub use descriptor::{MemoryDescriptor, MemoryDescriptorRef, MemoryRegion, SegmentTopology};
 pub use identity::{ClientId, SegmentId, SegmentIdentity};
 pub use pool::{AttachOutcome, PoolSnapshot, SegmentCandidate, SegmentPool};
 pub use reservation::Reservation;
+pub use spec::{
+    MemorySegmentSpec, ReplicaClass, SegmentKind, SegmentMetadata, SegmentResourceId, SegmentSpec,
+};
 pub use transport::{TransportEndpoint, TransportProtocol};

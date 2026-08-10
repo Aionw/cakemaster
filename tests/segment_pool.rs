@@ -7,8 +7,9 @@ use cakemaster::segment::placement::{
 };
 use cakemaster::segment::stats::SegmentState;
 use cakemaster::segment::{
-    AttachOutcome, ClientId, MemoryRegion, MemorySegmentSpec, SegmentId, SegmentIdentity,
-    SegmentPool, SegmentPoolConfig, SegmentTopology, TransportEndpoint, TransportProtocol,
+    AttachOutcome, ClientId, MemoryRegion, MemorySegmentSpec, ReplicaClass, SegmentId,
+    SegmentIdentity, SegmentKind, SegmentPool, SegmentPoolConfig, SegmentResourceId,
+    SegmentTopology, TransportEndpoint, TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
@@ -68,6 +69,18 @@ fn requests_and_segments_expose_semantic_groups() {
     assert_eq!(segment.region().size(), CAPACITY);
     assert_eq!(segment.topology().host_id(), Some("host-a"));
 
+    let pool = pool();
+    let candidate = pool.attach(segment.clone()).unwrap().candidate().clone();
+    assert_eq!(candidate.kind(), SegmentKind::Memory);
+    assert_eq!(candidate.replica_class(), ReplicaClass::Memory);
+    assert_eq!(
+        candidate.resource_id(),
+        SegmentResourceId::Dedicated(segment.identity().id())
+    );
+    assert_eq!(candidate.spec().metadata(), segment.metadata());
+    assert_eq!(candidate.memory_spec(), Some(&segment));
+    assert_eq!(pool.snapshot().replica_class(), ReplicaClass::Memory);
+
     let excluded = SegmentId::new(9, 9);
     let request = PlacementRequest::new(
         AllocationSpec::new(4096),
@@ -82,6 +95,7 @@ fn requests_and_segments_expose_semantic_groups() {
     assert_eq!(request.allocation().bytes(), 4096);
     assert_eq!(request.replicas().count(), 3);
     assert_eq!(request.replicas().failure_domain(), FailureDomain::Host);
+    assert_eq!(request.replica_class(), ReplicaClass::Memory);
     assert_eq!(request.fulfillment(), FulfillmentPolicy::AllOrNothing);
     assert_eq!(
         request.constraints().preferred_names()[0].as_ref(),

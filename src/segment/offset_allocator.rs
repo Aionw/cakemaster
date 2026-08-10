@@ -1,4 +1,3 @@
-use super::descriptor::MemorySegmentSpec;
 use offset_allocator::{Allocation, Allocator};
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -16,7 +15,6 @@ pub(crate) struct ByteAllocator {
 
 struct SharedAllocator {
     state: Mutex<AllocatorState>,
-    spec: Arc<MemorySegmentSpec>,
     quantum_shift: u32,
     managed_capacity: u64,
     /// Conservative upper bound for the largest request the binning algorithm
@@ -59,8 +57,7 @@ pub(crate) struct AllocatorStats {
 }
 
 impl ByteAllocator {
-    pub(crate) fn new(spec: Arc<MemorySegmentSpec>, max_allocator_nodes: u32) -> Self {
-        let capacity = spec.region().size();
+    pub(crate) fn new(capacity: u64, max_allocator_nodes: u32) -> Self {
         debug_assert_ne!(capacity, 0);
         debug_assert!(max_allocator_nodes >= 3);
         debug_assert!(max_allocator_nodes < u32::MAX - 1);
@@ -82,7 +79,6 @@ impl ByteAllocator {
                     used_bytes: 0,
                     live_allocations: 0,
                 }),
-                spec,
                 quantum_shift,
                 managed_capacity,
                 largest_free_region_hint: AtomicU64::new(
@@ -215,11 +211,6 @@ impl OffsetAllocationHandle {
         self.reserved_bytes
     }
 
-    #[inline]
-    pub(crate) fn spec(&self) -> &MemorySegmentSpec {
-        &self.owner.spec
-    }
-
     pub(crate) fn release_batch(handles: impl IntoIterator<Item = Self>) {
         let mut releases = handles
             .into_iter()
@@ -268,21 +259,9 @@ impl Drop for OffsetAllocationHandle {
 #[cfg(test)]
 mod tests {
     use super::ByteAllocator;
-    use crate::segment::{
-        ClientId, MemoryRegion, MemorySegmentSpec, SegmentId, SegmentIdentity, TransportEndpoint,
-        TransportProtocol,
-    };
-    use std::sync::Arc;
 
     fn allocator(capacity: u64, max_allocator_nodes: u32) -> ByteAllocator {
-        ByteAllocator::new(
-            Arc::new(MemorySegmentSpec::new(
-                SegmentIdentity::new(SegmentId::new(1, 1), ClientId::new(1, 1), "test-memory"),
-                MemoryRegion::new(0x1_0000_0000, capacity),
-                TransportEndpoint::new(TransportProtocol::Tcp, "127.0.0.1:12345"),
-            )),
-            max_allocator_nodes,
-        )
+        ByteAllocator::new(capacity, max_allocator_nodes)
     }
 
     #[test]

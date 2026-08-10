@@ -1,4 +1,3 @@
-use super::identity::SegmentIdentity;
 use super::transport::TransportEndpoint;
 use std::sync::Arc;
 
@@ -44,50 +43,6 @@ impl SegmentTopology {
 
     pub(crate) fn host_id_arc(&self) -> Option<Arc<str>> {
         self.host_id.clone()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MemorySegmentSpec {
-    identity: SegmentIdentity,
-    region: MemoryRegion,
-    transport: TransportEndpoint,
-    topology: SegmentTopology,
-}
-
-impl MemorySegmentSpec {
-    pub fn new(
-        identity: SegmentIdentity,
-        region: MemoryRegion,
-        transport: TransportEndpoint,
-    ) -> Self {
-        Self {
-            identity,
-            region,
-            transport,
-            topology: SegmentTopology::default(),
-        }
-    }
-
-    pub fn with_topology(mut self, topology: SegmentTopology) -> Self {
-        self.topology = topology;
-        self
-    }
-
-    pub const fn identity(&self) -> &SegmentIdentity {
-        &self.identity
-    }
-
-    pub const fn region(&self) -> MemoryRegion {
-        self.region
-    }
-
-    pub const fn transport(&self) -> &TransportEndpoint {
-        &self.transport
-    }
-
-    pub const fn topology(&self) -> &SegmentTopology {
-        &self.topology
     }
 }
 

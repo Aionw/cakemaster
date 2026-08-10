@@ -1,9 +1,10 @@
 use super::{AttachOutcome, PoolSnapshot, SegmentCandidate};
-use crate::segment::descriptor::{MemoryRegion, MemorySegmentSpec};
+use crate::segment::descriptor::MemoryRegion;
 use crate::segment::error::{AttachError, LifecycleError, ReserveError};
 use crate::segment::identity::{ClientId, SegmentId};
 use crate::segment::offset_allocator::ByteAllocator;
 use crate::segment::reservation::Reservation;
+use crate::segment::spec::{ReplicaClass, SegmentSpec};
 use crate::segment::stats::{
     SegmentReservationStats, SegmentSpaceStats, SegmentState, SegmentStats,
 };
@@ -16,12 +17,12 @@ pub(super) struct Catalog {
     pool_id: u64,
     generation: u64,
     segments: HashMap<SegmentId, Arc<Segment>>,
-    allocatable: Arc<[SegmentCandidate]>,
+    allocatable: HashMap<ReplicaClass, Arc<[SegmentCandidate]>>,
 }
 
 pub(super) struct Segment {
     pool_id: u64,
-    spec: Arc<MemorySegmentSpec>,
+    spec: Arc<SegmentSpec>,
     phase: Mutex<SegmentState>,
     allocator: ByteAllocator,
     accepting: AtomicBool,
@@ -37,13 +38,13 @@ impl Catalog {
             pool_id,
             generation: 0,
             segments: HashMap::new(),
-            allocatable: Arc::from([]),
+            allocatable: HashMap::new(),
         }
     }
 
     pub(super) fn attach(
         &mut self,
-        spec: MemorySegmentSpec,
+        spec: SegmentSpec,
         max_allocator_nodes: u32,
     ) -> Result<AttachOutcome, AttachError> {
         if let Some(existing) = self.candidate(spec.identity().id()) {
@@ -62,10 +63,15 @@ impl Catalog {
         Ok(AttachOutcome::Attached(candidate))
     }
 
-    pub(super) fn snapshot(&self) -> PoolSnapshot {
+    pub(super) fn snapshot(&self, replica_class: ReplicaClass) -> PoolSnapshot {
         PoolSnapshot {
             generation: self.generation,
-            candidates: self.allocatable.clone(),
+            replica_class,
+            candidates: self
+                .allocatable
+                .get(&replica_class)
+                .cloned()
+                .unwrap_or_else(|| Arc::from([])),
         }
     }
 
@@ -96,13 +102,16 @@ impl Catalog {
         self.mutation().remove(owner, id)
     }
 
-    fn overlapping_segment(
-        &self,
-        spec: &MemorySegmentSpec,
-    ) -> Result<Option<SegmentId>, AttachError> {
+    fn overlapping_segment(&self, spec: &SegmentSpec) -> Result<Option<SegmentId>, AttachError> {
+        let spec = spec
+            .memory()
+            .expect("memory is the only attached segment backend");
         let end = spec.region().end().ok_or(AttachError::AddressOverflow)?;
         Ok(self.segments.values().find_map(|segment| {
-            let existing = segment.spec.as_ref();
+            let existing = segment
+                .spec
+                .memory()
+                .expect("memory is the only attached segment backend");
             (existing.identity().owner() == spec.identity().owner()
                 && existing.transport() == spec.transport()
                 && spec.region().base()
@@ -120,31 +129,51 @@ impl Catalog {
     }
 
     fn rebuild_snapshot(&mut self) {
-        let mut candidates: Vec<_> = self
+        let mut candidates_by_class: HashMap<_, Vec<_>> = HashMap::new();
+        for segment in self
             .segments
             .values()
             .filter(|segment| segment.accepting.load(Ordering::Acquire))
-            .map(|segment| SegmentCandidate {
-                pool_id: self.pool_id,
-                segment: segment.clone(),
-            })
-            .collect();
-        candidates.sort_unstable_by_key(SegmentCandidate::id);
-        if candidates.len() == self.allocatable.len()
-            && candidates
-                .iter()
-                .zip(self.allocatable.iter())
-                .all(|(candidate, current)| Arc::ptr_eq(&candidate.segment, &current.segment))
         {
+            candidates_by_class
+                .entry(segment.spec.replica_class())
+                .or_default()
+                .push(SegmentCandidate {
+                    pool_id: self.pool_id,
+                    segment: segment.clone(),
+                });
+        }
+        for candidates in candidates_by_class.values_mut() {
+            candidates.sort_unstable_by_key(SegmentCandidate::id);
+        }
+
+        let unchanged = candidates_by_class.len() == self.allocatable.len()
+            && candidates_by_class
+                .iter()
+                .all(|(replica_class, candidates)| {
+                    self.allocatable.get(replica_class).is_some_and(|current| {
+                        candidates.len() == current.len()
+                            && candidates
+                                .iter()
+                                .zip(current.iter())
+                                .all(|(candidate, current)| {
+                                    Arc::ptr_eq(&candidate.segment, &current.segment)
+                                })
+                    })
+                });
+        if unchanged {
             return;
         }
-        self.allocatable = Arc::from(candidates);
+        self.allocatable = candidates_by_class
+            .into_iter()
+            .map(|(replica_class, candidates)| (replica_class, Arc::from(candidates)))
+            .collect();
         self.generation = self.generation.wrapping_add(1);
     }
 }
 
 impl CatalogMutation<'_> {
-    fn insert(&mut self, spec: MemorySegmentSpec, max_allocator_nodes: u32) -> SegmentCandidate {
+    fn insert(&mut self, spec: SegmentSpec, max_allocator_nodes: u32) -> SegmentCandidate {
         let spec = Arc::new(spec);
         let segment = Arc::new(Segment::new(
             self.catalog.pool_id,
@@ -208,8 +237,13 @@ impl Drop for CatalogMutation<'_> {
 }
 
 impl Segment {
-    fn new(pool_id: u64, spec: Arc<MemorySegmentSpec>, max_allocator_nodes: u32) -> Self {
-        let allocator = ByteAllocator::new(spec.clone(), max_allocator_nodes);
+    fn new(pool_id: u64, spec: Arc<SegmentSpec>, max_allocator_nodes: u32) -> Self {
+        let capacity = spec
+            .memory()
+            .expect("memory is the only attached segment backend")
+            .region()
+            .size();
+        let allocator = ByteAllocator::new(capacity, max_allocator_nodes);
         Self {
             pool_id,
             spec,
@@ -223,12 +257,16 @@ impl Segment {
         self.pool_id
     }
 
-    pub(super) fn spec(&self) -> &MemorySegmentSpec {
+    pub(super) fn spec(&self) -> &SegmentSpec {
         &self.spec
     }
 
     #[inline]
     pub(super) fn reserve(self: &Arc<Self>, bytes: u64) -> Result<Reservation, ReserveError> {
+        let spec = self
+            .spec
+            .memory()
+            .expect("memory is the only direct segment backend");
         if bytes == 0 {
             return Err(ReserveError::ZeroSize);
         }
@@ -248,7 +286,7 @@ impl Segment {
             .allocator
             .allocate_after_precheck(bytes)
             .ok_or(ReserveError::OutOfSpace(self.spec.identity().id()))?;
-        let buffer_address = match self.spec.region().base().checked_add(allocation.offset()) {
+        let buffer_address = match spec.region().base().checked_add(allocation.offset()) {
             Some(address) => address,
             None => return Err(ReserveError::AddressOverflow(self.spec.identity().id())),
         };
@@ -256,6 +294,7 @@ impl Segment {
 
         Ok(Reservation {
             allocation,
+            segment: self.spec.clone(),
             region: MemoryRegion::new(buffer_address, bytes),
         })
     }

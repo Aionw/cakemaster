@@ -4,10 +4,10 @@ use self::catalog::{Catalog, Segment};
 use super::config::{
     MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE, MIN_ALLOCATOR_NODES_PER_SEGMENT, SegmentPoolConfig,
 };
-use super::descriptor::MemorySegmentSpec;
 use super::error::{AttachError, LifecycleError, PoolConfigError, ReserveError};
 use super::identity::{ClientId, SegmentId};
 use super::reservation::Reservation;
+use super::spec::{MemorySegmentSpec, ReplicaClass, SegmentKind, SegmentResourceId, SegmentSpec};
 use super::stats::SegmentStats;
 use parking_lot::RwLock;
 use std::fmt;
@@ -33,8 +33,24 @@ impl SegmentCandidate {
         self.segment.spec().identity().id()
     }
 
-    pub fn spec(&self) -> &MemorySegmentSpec {
+    pub fn spec(&self) -> &SegmentSpec {
         self.segment.spec()
+    }
+
+    pub fn kind(&self) -> SegmentKind {
+        self.segment.spec().kind()
+    }
+
+    pub fn replica_class(&self) -> ReplicaClass {
+        self.segment.spec().replica_class()
+    }
+
+    pub fn resource_id(&self) -> SegmentResourceId {
+        self.segment.spec().resource_id()
+    }
+
+    pub fn memory_spec(&self) -> Option<&MemorySegmentSpec> {
+        self.segment.spec().memory()
     }
 
     pub fn stats(&self) -> SegmentStats {
@@ -56,12 +72,17 @@ impl fmt::Debug for SegmentCandidate {
 #[derive(Clone, Debug)]
 pub struct PoolSnapshot {
     generation: u64,
+    replica_class: ReplicaClass,
     candidates: Arc<[SegmentCandidate]>,
 }
 
 impl PoolSnapshot {
     pub const fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub const fn replica_class(&self) -> ReplicaClass {
+        self.replica_class
     }
 
     pub fn candidates(&self) -> &[SegmentCandidate] {
@@ -123,7 +144,8 @@ impl SegmentPool {
         })
     }
 
-    pub fn attach(&self, spec: MemorySegmentSpec) -> Result<AttachOutcome, AttachError> {
+    pub fn attach(&self, spec: impl Into<SegmentSpec>) -> Result<AttachOutcome, AttachError> {
+        let spec = spec.into();
         validate_spec(&spec)?;
         self.catalog
             .write()
@@ -131,7 +153,11 @@ impl SegmentPool {
     }
 
     pub fn snapshot(&self) -> PoolSnapshot {
-        self.catalog.read().snapshot()
+        self.snapshot_for(ReplicaClass::Memory)
+    }
+
+    pub fn snapshot_for(&self, replica_class: ReplicaClass) -> PoolSnapshot {
+        self.catalog.read().snapshot(replica_class)
     }
 
     pub fn candidate(&self, id: SegmentId) -> Option<SegmentCandidate> {
@@ -189,7 +215,13 @@ impl Default for SegmentPool {
     }
 }
 
-fn validate_spec(spec: &MemorySegmentSpec) -> Result<(), AttachError> {
+fn validate_spec(spec: &SegmentSpec) -> Result<(), AttachError> {
+    match spec {
+        SegmentSpec::Memory(spec) => validate_memory_spec(spec),
+    }
+}
+
+fn validate_memory_spec(spec: &MemorySegmentSpec) -> Result<(), AttachError> {
     if spec.identity().id().is_nil() {
         return Err(AttachError::NilSegmentId);
     }

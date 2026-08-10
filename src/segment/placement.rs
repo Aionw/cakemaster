@@ -2,6 +2,7 @@ use super::error::ReserveError;
 use super::identity::SegmentId;
 use super::pool::{PoolSnapshot, SegmentCandidate, SegmentPool};
 use super::reservation::Reservation;
+use super::spec::{ReplicaClass, SegmentResourceId};
 use super::stats::SegmentStats;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,6 +19,7 @@ pub enum FulfillmentPolicy {
 pub enum FailureDomain {
     #[default]
     Segment,
+    Resource,
     Host,
 }
 
@@ -101,6 +103,7 @@ impl PlacementConstraints {
 pub struct PlacementRequest {
     allocation: AllocationSpec,
     replicas: ReplicaPolicy,
+    replica_class: ReplicaClass,
     fulfillment: FulfillmentPolicy,
     constraints: PlacementConstraints,
 }
@@ -110,6 +113,7 @@ impl PlacementRequest {
         Self {
             allocation,
             replicas,
+            replica_class: ReplicaClass::Memory,
             fulfillment: FulfillmentPolicy::AllOrNothing,
             constraints: PlacementConstraints::default(),
         }
@@ -117,6 +121,11 @@ impl PlacementRequest {
 
     pub const fn with_fulfillment(mut self, fulfillment: FulfillmentPolicy) -> Self {
         self.fulfillment = fulfillment;
+        self
+    }
+
+    pub const fn for_replica_class(mut self, replica_class: ReplicaClass) -> Self {
+        self.replica_class = replica_class;
         self
     }
 
@@ -131,6 +140,10 @@ impl PlacementRequest {
 
     pub const fn replicas(&self) -> ReplicaPolicy {
         self.replicas
+    }
+
+    pub const fn replica_class(&self) -> ReplicaClass {
+        self.replica_class
     }
 
     pub const fn fulfillment(&self) -> FulfillmentPolicy {
@@ -225,7 +238,7 @@ where
             return Err(PlacementError::ZeroReplicas);
         }
 
-        let snapshot = self.pool.snapshot();
+        let snapshot = self.pool.snapshot_for(request.replica_class);
         let candidates = self.policy.order(&snapshot, request);
         let mut domains = HashSet::with_capacity(request.replicas.count);
         let mut reservations = Vec::with_capacity(request.replicas.count);
@@ -305,6 +318,7 @@ pub enum PlacementError {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum DomainKey {
     Segment(SegmentId),
+    Resource(SegmentResourceId),
     Host(Arc<str>),
     SegmentWithoutHost(SegmentId),
 }
@@ -318,6 +332,7 @@ struct RankedCandidate {
 fn domain_key(candidate: &SegmentCandidate, domain: FailureDomain) -> DomainKey {
     match domain {
         FailureDomain::Segment => DomainKey::Segment(candidate.id()),
+        FailureDomain::Resource => DomainKey::Resource(candidate.resource_id()),
         FailureDomain::Host => candidate.spec().topology().host_id_arc().map_or_else(
             || DomainKey::SegmentWithoutHost(candidate.id()),
             DomainKey::Host,

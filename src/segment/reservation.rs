@@ -1,16 +1,19 @@
 use super::descriptor::{MemoryDescriptor, MemoryDescriptorRef, MemoryRegion};
 use super::identity::SegmentId;
 use super::offset_allocator::OffsetAllocationHandle;
+use super::spec::SegmentSpec;
 use std::fmt;
+use std::sync::Arc;
 
 pub struct Reservation {
     pub(super) allocation: OffsetAllocationHandle,
+    pub(super) segment: Arc<SegmentSpec>,
     pub(super) region: MemoryRegion,
 }
 
 impl Reservation {
     pub fn segment_id(&self) -> SegmentId {
-        self.allocation.spec().identity().id()
+        self.segment.identity().id()
     }
 
     pub const fn offset(&self) -> u64 {
@@ -30,7 +33,11 @@ impl Reservation {
     }
 
     pub fn descriptor(&self) -> MemoryDescriptorRef<'_> {
-        MemoryDescriptorRef::new(self.region, self.allocation.spec().transport())
+        let spec = self
+            .segment
+            .memory()
+            .expect("memory is the only direct segment backend");
+        MemoryDescriptorRef::new(self.region, spec.transport())
     }
 
     pub fn owned_descriptor(&self) -> MemoryDescriptor {
