@@ -7,10 +7,11 @@ use super::identity::{ClientId, SegmentId};
 use super::offset_allocator::ByteAllocator;
 use super::reservation::Reservation;
 use super::stats::{SegmentReservationStats, SegmentSpaceStats, SegmentState, SegmentStats};
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -140,7 +141,7 @@ impl SegmentPool {
 
     pub fn attach(&self, spec: MemorySegmentSpec) -> Result<AttachOutcome, AttachError> {
         validate_spec(&spec)?;
-        let mut catalog = write_lock(&self.catalog);
+        let mut catalog = self.catalog.write();
 
         if let Some(existing) = catalog.segments.get(&spec.identity().id()) {
             let candidate = SegmentCandidate {
@@ -191,7 +192,7 @@ impl SegmentPool {
     }
 
     pub fn snapshot(&self) -> PoolSnapshot {
-        let catalog = read_lock(&self.catalog);
+        let catalog = self.catalog.read();
         PoolSnapshot {
             generation: catalog.generation,
             candidates: catalog.allocatable.clone(),
@@ -199,7 +200,7 @@ impl SegmentPool {
     }
 
     pub fn candidate(&self, id: SegmentId) -> Option<SegmentCandidate> {
-        let catalog = read_lock(&self.catalog);
+        let catalog = self.catalog.read();
         catalog.segments.get(&id).map(|segment| SegmentCandidate {
             pool_id: self.pool_id,
             segment: segment.clone(),
@@ -211,7 +212,7 @@ impl SegmentPool {
     }
 
     pub fn len(&self) -> usize {
-        read_lock(&self.catalog).segments.len()
+        self.catalog.read().segments.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -234,7 +235,9 @@ impl SegmentPool {
         if bytes == 0 {
             return Err(ReserveError::ZeroSize);
         }
-        let segment = read_lock(&self.catalog)
+        let segment = self
+            .catalog
+            .read()
             .segments
             .get(&id)
             .cloned()
@@ -243,7 +246,7 @@ impl SegmentPool {
     }
 
     pub fn quiesce(&self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
-        let mut catalog = write_lock(&self.catalog);
+        let mut catalog = self.catalog.write();
         let segment = owned_segment(&catalog, owner, id)?;
         segment.quiesce();
         rebuild_snapshot(&mut catalog, self.pool_id);
@@ -251,7 +254,7 @@ impl SegmentPool {
     }
 
     pub fn reactivate(&self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
-        let mut catalog = write_lock(&self.catalog);
+        let mut catalog = self.catalog.write();
         let segment = owned_segment(&catalog, owner, id)?;
         segment.reactivate();
         rebuild_snapshot(&mut catalog, self.pool_id);
@@ -259,7 +262,7 @@ impl SegmentPool {
     }
 
     pub fn remove(&self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
-        let mut catalog = write_lock(&self.catalog);
+        let mut catalog = self.catalog.write();
         let segment = owned_segment(&catalog, owner, id)?;
         segment.prepare_remove()?;
         catalog.segments.remove(&id);
@@ -298,7 +301,7 @@ impl Segment {
             return Err(ReserveError::OutOfSpace(self.spec.identity().id()));
         }
 
-        let phase = mutex_lock(&self.phase);
+        let phase = self.phase.lock();
         if *phase != SegmentState::Accepting {
             return Err(ReserveError::NotAccepting(self.spec.identity().id()));
         }
@@ -320,7 +323,7 @@ impl Segment {
     }
 
     fn quiesce(&self) {
-        let mut phase = mutex_lock(&self.phase);
+        let mut phase = self.phase.lock();
         if *phase == SegmentState::Accepting {
             *phase = SegmentState::Quiesced;
             self.accepting.store(false, Ordering::Release);
@@ -328,7 +331,7 @@ impl Segment {
     }
 
     fn reactivate(&self) {
-        let mut phase = mutex_lock(&self.phase);
+        let mut phase = self.phase.lock();
         if *phase == SegmentState::Quiesced {
             *phase = SegmentState::Accepting;
             self.accepting.store(true, Ordering::Release);
@@ -336,7 +339,7 @@ impl Segment {
     }
 
     fn prepare_remove(&self) -> Result<(), LifecycleError> {
-        let mut phase = mutex_lock(&self.phase);
+        let mut phase = self.phase.lock();
         let live_allocations = self.allocator.stats().live_allocations;
         match *phase {
             SegmentState::Accepting => {
@@ -356,7 +359,7 @@ impl Segment {
     }
 
     fn stats(&self) -> SegmentStats {
-        let state = *mutex_lock(&self.phase);
+        let state = *self.phase.lock();
         let stats = self.allocator.stats();
         SegmentStats {
             space: SegmentSpaceStats {
@@ -439,20 +442,4 @@ fn rebuild_snapshot(catalog: &mut Catalog, pool_id: u64) {
     candidates.sort_unstable_by_key(SegmentCandidate::id);
     catalog.allocatable = Arc::from(candidates);
     catalog.generation = catalog.generation.wrapping_add(1);
-}
-
-fn read_lock<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
-    lock.read()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-fn write_lock<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
-    lock.write()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-}
-
-#[inline(always)]
-fn mutex_lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
-    lock.lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }

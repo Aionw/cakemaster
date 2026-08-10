@@ -1,6 +1,6 @@
 use super::descriptor::MemorySegmentSpec;
 use offset_allocator::{Allocation, Allocator};
-use parking_lot::{Mutex, MutexGuard};
+use parking_lot::Mutex;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -124,7 +124,7 @@ impl ByteAllocator {
         let allocation_units = u32::try_from(allocation_units).ok()?;
 
         let (allocation, reserved_bytes) = {
-            let mut state = mutex_lock(&self.shared.state);
+            let mut state = self.shared.state.lock();
             let allocation = match state.inner.allocate(allocation_units) {
                 Some(allocation) => allocation,
                 None => {
@@ -149,7 +149,7 @@ impl ByteAllocator {
     }
 
     pub(crate) fn stats(&self) -> AllocatorStats {
-        let state = mutex_lock(&self.shared.state);
+        let state = self.shared.state.lock();
         let report = state.inner.storage_report();
         AllocatorStats {
             capacity: self.shared.managed_capacity,
@@ -167,7 +167,7 @@ impl SharedAllocator {
     }
 
     fn release_many(&self, releases: impl IntoIterator<Item = (Allocation, u64)>) {
-        let mut state = mutex_lock(&self.state);
+        let mut state = self.state.lock();
         let mut allocation_count = 0_u64;
         let mut released_bytes = 0_u64;
         for (allocation, reserved_bytes) in releases {
@@ -263,11 +263,6 @@ impl Drop for OffsetAllocationHandle {
             self.owner.release(allocation, self.reserved_bytes);
         }
     }
-}
-
-#[inline(always)]
-fn mutex_lock<T>(lock: &Mutex<T>) -> MutexGuard<'_, T> {
-    lock.lock()
 }
 
 #[cfg(test)]
