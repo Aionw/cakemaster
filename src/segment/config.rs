@@ -1,6 +1,8 @@
 //! Segment-pool allocator configuration.
 
 pub const DEFAULT_MAX_ALLOCATOR_NODES_PER_SEGMENT: u32 = 128 * 1024;
+pub(super) const MIN_ALLOCATOR_NODES_PER_SEGMENT: u32 = 3;
+pub(super) const MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE: u32 = u32::MAX - 1;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SegmentPoolConfig {

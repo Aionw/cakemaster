@@ -1,4 +1,6 @@
-use cakemaster::object::error::{LookupError, PublishError, PutError, RemoveError, StageError};
+use cakemaster::object::error::{
+    LookupError, ObjectCatalogConfigError, PublishError, PutError, RemoveError, StageError,
+};
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
@@ -39,6 +41,17 @@ fn replica(pool: &SegmentPool, bytes: u64) -> ReplicaSet {
         ReplicaId::new(1),
         pool.reserve_on(SEGMENT_ID, bytes).unwrap(),
     )))
+}
+
+#[test]
+fn rejects_inconsistent_lease_configuration_with_context() {
+    assert_eq!(
+        ObjectCatalog::with_config(ObjectCatalogConfig::new(16).with_lease(10, 11)).err(),
+        Some(ObjectCatalogConfigError::LeaseRefreshExceedsTtl {
+            lease_ttl_ticks: 10,
+            lease_refresh_ticks: 11,
+        })
+    );
 }
 
 #[test]

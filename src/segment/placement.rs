@@ -4,8 +4,8 @@ use super::pool::{PoolSnapshot, SegmentCandidate, SegmentPool};
 use super::reservation::Reservation;
 use super::stats::SegmentStats;
 use std::collections::HashSet;
-use std::fmt;
 use std::sync::Arc;
+use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum FulfillmentPolicy {
@@ -247,7 +247,7 @@ where
                 Err(ReserveError::NotAccepting(_) | ReserveError::OutOfSpace(_)) => {
                     // Snapshots are intentionally lock-free and may be stale.
                 }
-                Err(error) => return Err(PlacementError::Reserve(error)),
+                Err(error) => return Err(error.into()),
             }
         }
 
@@ -290,38 +290,16 @@ impl IntoIterator for ReservationSet {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum PlacementError {
+    #[error("placement size must not be zero")]
     ZeroSize,
+    #[error("replica count must not be zero")]
     ZeroReplicas,
+    #[error("could allocate only {allocated} of {requested} requested replicas")]
     InsufficientReplicas { requested: usize, allocated: usize },
-    Reserve(ReserveError),
-}
-
-impl fmt::Display for PlacementError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroSize => formatter.write_str("placement size must not be zero"),
-            Self::ZeroReplicas => formatter.write_str("replica count must not be zero"),
-            Self::InsufficientReplicas {
-                requested,
-                allocated,
-            } => write!(
-                formatter,
-                "could allocate only {allocated} of {requested} requested replicas"
-            ),
-            Self::Reserve(error) => write!(formatter, "reservation failed: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for PlacementError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Reserve(error) => Some(error),
-            _ => None,
-        }
-    }
+    #[error("failed to reserve a replica: {0}")]
+    Reserve(#[from] ReserveError),
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]

@@ -203,13 +203,3 @@ impl ObjectRead {
         self.lease_expires_at
     }
 }
-
-impl fmt::Debug for ObjectRead {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ObjectRead")
-            .field("object", &self.object)
-            .field("lease_expires_at", &self.lease_expires_at)
-            .finish()
-    }
-}

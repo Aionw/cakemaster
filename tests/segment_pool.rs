@@ -1,4 +1,6 @@
-use cakemaster::segment::error::{AttachError, LifecycleError, ReserveError};
+use cakemaster::segment::error::{
+    AttachError, LifecycleError, ParseTransportProtocolError, ReserveError,
+};
 use cakemaster::segment::placement::{
     AllocationSpec, FailureDomain, FulfillmentPolicy, PlacementConstraints, PlacementError,
     PlacementRequest, ReplicaAllocator, ReplicaPolicy,
@@ -39,6 +41,23 @@ fn protocol_is_typed_in_core_and_extensible_at_the_wire_boundary() {
     assert_eq!(custom.as_str(), "sunrise_link");
     assert!("TCP".parse::<TransportProtocol>().is_err());
     assert!("".parse::<TransportProtocol>().is_err());
+
+    let invalid_protocol = Arc::<str>::from("TCP");
+    let invalid_spec = MemorySegmentSpec::new(
+        SegmentIdentity::new(SegmentId::new(1, 1), OWNER, "invalid-protocol"),
+        MemoryRegion::new(0x1000, 4096),
+        TransportEndpoint::new(
+            TransportProtocol::Custom(invalid_protocol.clone()),
+            "endpoint",
+        ),
+    );
+    assert_eq!(
+        pool().attach(invalid_spec).unwrap_err(),
+        AttachError::InvalidTransportProtocol {
+            protocol: invalid_protocol,
+            source: ParseTransportProtocolError,
+        }
+    );
 }
 
 #[test]

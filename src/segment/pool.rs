@@ -1,4 +1,6 @@
-use super::config::SegmentPoolConfig;
+use super::config::{
+    MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE, MIN_ALLOCATOR_NODES_PER_SEGMENT, SegmentPoolConfig,
+};
 use super::descriptor::{MemoryRegion, MemorySegmentSpec};
 use super::error::{AttachError, LifecycleError, PoolConfigError, ReserveError};
 use super::identity::{ClientId, SegmentId};
@@ -117,7 +119,9 @@ impl SegmentPool {
 
     pub fn with_config(config: SegmentPoolConfig) -> Result<Self, PoolConfigError> {
         let max_nodes = config.max_allocator_nodes_per_segment;
-        if !(3..u32::MAX - 1).contains(&max_nodes) {
+        if !(MIN_ALLOCATOR_NODES_PER_SEGMENT..MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE)
+            .contains(&max_nodes)
+        {
             return Err(PoolConfigError {
                 max_allocator_nodes_per_segment: max_nodes,
             });
@@ -380,19 +384,17 @@ fn validate_spec(spec: &MemorySegmentSpec) -> Result<(), AttachError> {
         return Err(AttachError::EmptyName);
     }
     if spec.region().base() == 0 {
-        return Err(AttachError::InvalidBase);
+        return Err(AttachError::ZeroBaseAddress);
     }
     if spec.transport().endpoint().is_empty() {
         return Err(AttachError::EmptyTransportEndpoint);
     }
-    if spec
-        .transport()
-        .protocol()
-        .as_str()
-        .parse::<super::transport::TransportProtocol>()
-        .is_err()
-    {
-        return Err(AttachError::InvalidTransportProtocol);
+    let protocol = spec.transport().protocol().as_str();
+    if let Err(source) = protocol.parse::<super::transport::TransportProtocol>() {
+        return Err(AttachError::InvalidTransportProtocol {
+            protocol: Arc::from(protocol),
+            source,
+        });
     }
     if spec.topology().host_id().is_some_and(str::is_empty) {
         return Err(AttachError::EmptyHostId);

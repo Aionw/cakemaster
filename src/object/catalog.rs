@@ -130,7 +130,7 @@ pub struct ObjectHandle {
     node: Arc<CatalogNode>,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct ObjectRead {
     object: ObjectHandle,
     lease_expires_at: CatalogTick,
@@ -627,13 +627,16 @@ fn validate_config(config: ObjectCatalogConfig) -> Result<(), ObjectCatalogConfi
         return Err(ObjectCatalogConfigError::ZeroLeaseTtl);
     }
     if config.lease_refresh_ticks > config.lease_ttl_ticks {
-        return Err(ObjectCatalogConfigError::RefreshExceedsLease);
+        return Err(ObjectCatalogConfigError::LeaseRefreshExceedsTtl {
+            lease_ttl_ticks: config.lease_ttl_ticks,
+            lease_refresh_ticks: config.lease_refresh_ticks,
+        });
     }
     if config.pending_timeout_ticks == 0 {
         return Err(ObjectCatalogConfigError::ZeroPendingTimeout);
     }
     if config.max_retired_bytes == 0 {
-        return Err(ObjectCatalogConfigError::ZeroRetiredLimit);
+        return Err(ObjectCatalogConfigError::ZeroMaxRetiredBytes);
     }
     Ok(())
 }

@@ -85,6 +85,7 @@ dependencies = [
  "offset-allocator",
  "parking_lot",
  "scc",
+ "thiserror",
 ]
 
 [[package]]
