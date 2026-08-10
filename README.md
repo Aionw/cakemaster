@@ -294,6 +294,13 @@ g++ -std=c++20 -O3 -DNDEBUG \
 命令见
 [`docs/object_catalog_mooncake_benchmark.md`](docs/object_catalog_mooncake_benchmark.md)。
 
+## Tokio ClientTaskQueue
+
+[`ClientTaskQueue`](crates/cakemaster-server/src/client_task_queue.rs) 是 Master 侧的
+per-client Tokio channel。Master producer 持有可克隆的 `ClientTaskTx`，client 的 fetch
+RPC handler 持有唯一的 `ClientTaskRx`；有界 `mpsc` 负责 FIFO、异步背压、唤醒和取消
+安全。完成上报走独立 RPC 路径，不属于该队列；具体任务和 RPC wire 类型也由上层定义。
+
 ## Mooncake wire/RPC 空服务性能对比
 
 [`crates/cakemaster-proto/idl/mooncake_master.thrift`](crates/cakemaster-proto/idl/mooncake_master.thrift) 和 [`crates/cakemaster-server/src/bin/mooncake_benchmark.rs`](crates/cakemaster-server/src/bin/mooncake_benchmark.rs) 提供与 Mooncake `WrappedMasterService` 相同 wire 的 Rust peer，[`interop/mooncake_benchmark.cpp`](interop/mooncake_benchmark.cpp) 是使用 Mooncake 自带 yalantinglibs 的 C++ peer。两端只实现最小合法返回值，不维护 segment、replica、lease 或 object 状态，适合单独比较 RPC framing、struct_pack 编解码、调度和网络开销。

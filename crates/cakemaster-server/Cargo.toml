@@ -15,4 +15,5 @@ cakemaster = { path = "../.." }
 cakemaster-proto = { path = "../cakemaster-proto" }
 coro-rpc = { path = "../coro-rpc" }
 futures-util = "0.3"
+thiserror.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
