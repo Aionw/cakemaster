@@ -1,7 +1,14 @@
-use super::types::{
-    CatalogTick, CollectBudget, ObjectCommit, ObjectContent, ObjectIdentity, ObjectLookup,
-    ReclaimTarget, ReplicaLease, ReplicaReclaimBatch, ReplicaSet, WriteId, WriteOwner,
+use super::config::ObjectCatalogConfig;
+use super::content::ObjectContent;
+use super::diagnostics::ObjectCatalogStats;
+use super::error::{
+    LookupError, ObjectCatalogConfigError, PublishError, PutError, RemoveError, RevokeError,
+    StageError,
 };
+use super::identity::{ObjectIdentity, ObjectLookup};
+use super::reclamation::{CatalogTick, CollectBudget, CollectReport};
+use super::replica::{ReplicaLease, ReplicaReclaimBatch, ReplicaSet};
+use super::write::{ObjectCommit, WriteId, WriteOwner};
 use arc_swap::ArcSwapOption;
 use crossbeam_queue::SegQueue;
 use parking_lot::Mutex;
@@ -11,6 +18,9 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
+mod collector;
+mod handles;
+
 const SLOT_OPEN: u8 = 0;
 const SLOT_CLOSING: u8 = 1;
 
@@ -19,188 +29,6 @@ const OBJECT_PENDING: u8 = 1;
 const OBJECT_PUBLISHING: u8 = 2;
 const OBJECT_PUBLISHED: u8 = 3;
 const OBJECT_RETIRING: u8 = 4;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ObjectCatalogConfig {
-    index: CatalogIndexConfig,
-    leases: ObjectLeasePolicy,
-    reclamation: ReclamationPolicy,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CatalogIndexConfig {
-    expected_objects: usize,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ObjectLeasePolicy {
-    lease_ttl_ticks: u64,
-    lease_refresh_ticks: u64,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct ReclamationPolicy {
-    pending_timeout_ticks: u64,
-    empty_slot_grace_ticks: u64,
-    max_retired_bytes: u64,
-}
-
-impl ObjectCatalogConfig {
-    pub const fn new(expected_objects: usize) -> Self {
-        Self {
-            index: CatalogIndexConfig::new(expected_objects),
-            leases: ObjectLeasePolicy::new(10_000, 5_000),
-            reclamation: ReclamationPolicy::new(30_000, 60_000, 1_u64 << 30),
-        }
-    }
-
-    pub const fn with_index(mut self, index: CatalogIndexConfig) -> Self {
-        self.index = index;
-        self
-    }
-
-    pub const fn with_lease_policy(mut self, leases: ObjectLeasePolicy) -> Self {
-        self.leases = leases;
-        self
-    }
-
-    pub const fn with_reclamation_policy(mut self, reclamation: ReclamationPolicy) -> Self {
-        self.reclamation = reclamation;
-        self
-    }
-
-    pub const fn with_lease(mut self, ttl_ticks: u64, refresh_ticks: u64) -> Self {
-        self.leases = ObjectLeasePolicy::new(ttl_ticks, refresh_ticks);
-        self
-    }
-
-    pub const fn with_pending_timeout(mut self, ticks: u64) -> Self {
-        self.reclamation.pending_timeout_ticks = ticks;
-        self
-    }
-
-    pub const fn with_empty_slot_grace(mut self, ticks: u64) -> Self {
-        self.reclamation.empty_slot_grace_ticks = ticks;
-        self
-    }
-
-    pub const fn with_max_retired_bytes(mut self, bytes: u64) -> Self {
-        self.reclamation.max_retired_bytes = bytes;
-        self
-    }
-
-    pub const fn index(self) -> CatalogIndexConfig {
-        self.index
-    }
-
-    pub const fn leases(self) -> ObjectLeasePolicy {
-        self.leases
-    }
-
-    pub const fn reclamation(self) -> ReclamationPolicy {
-        self.reclamation
-    }
-}
-
-impl CatalogIndexConfig {
-    pub const fn new(expected_objects: usize) -> Self {
-        Self { expected_objects }
-    }
-
-    pub const fn expected_objects(self) -> usize {
-        self.expected_objects
-    }
-}
-
-impl ObjectLeasePolicy {
-    pub const fn new(ttl_ticks: u64, refresh_ticks: u64) -> Self {
-        Self {
-            lease_ttl_ticks: ttl_ticks,
-            lease_refresh_ticks: refresh_ticks,
-        }
-    }
-
-    pub const fn lease_ttl_ticks(self) -> u64 {
-        self.lease_ttl_ticks
-    }
-
-    pub const fn lease_refresh_ticks(self) -> u64 {
-        self.lease_refresh_ticks
-    }
-}
-
-impl ReclamationPolicy {
-    pub const fn new(
-        pending_timeout_ticks: u64,
-        empty_slot_grace_ticks: u64,
-        max_retired_bytes: u64,
-    ) -> Self {
-        Self {
-            pending_timeout_ticks,
-            empty_slot_grace_ticks,
-            max_retired_bytes,
-        }
-    }
-
-    pub const fn pending_timeout_ticks(self) -> u64 {
-        self.pending_timeout_ticks
-    }
-
-    pub const fn empty_slot_grace_ticks(self) -> u64 {
-        self.empty_slot_grace_ticks
-    }
-
-    pub const fn max_retired_bytes(self) -> u64 {
-        self.max_retired_bytes
-    }
-}
-
-impl Default for ObjectCatalogConfig {
-    fn default() -> Self {
-        Self::new(64 * 1024)
-    }
-}
-
-impl Default for CatalogIndexConfig {
-    fn default() -> Self {
-        ObjectCatalogConfig::default().index()
-    }
-}
-
-impl Default for ObjectLeasePolicy {
-    fn default() -> Self {
-        ObjectCatalogConfig::default().leases()
-    }
-}
-
-impl Default for ReclamationPolicy {
-    fn default() -> Self {
-        ObjectCatalogConfig::default().reclamation()
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ObjectCatalogConfigError {
-    ZeroExpectedObjects,
-    ZeroLeaseTtl,
-    RefreshExceedsLease,
-    ZeroPendingTimeout,
-    ZeroRetiredLimit,
-}
-
-impl fmt::Display for ObjectCatalogConfigError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self {
-            Self::ZeroExpectedObjects => "expected object count must not be zero",
-            Self::ZeroLeaseTtl => "object lease TTL must not be zero",
-            Self::RefreshExceedsLease => "lease refresh threshold must not exceed the lease TTL",
-            Self::ZeroPendingTimeout => "pending object timeout must not be zero",
-            Self::ZeroRetiredLimit => "retired byte limit must not be zero",
-        })
-    }
-}
-
-impl std::error::Error for ObjectCatalogConfigError {}
 
 #[derive(Clone)]
 pub struct ObjectCatalog {
@@ -308,99 +136,6 @@ pub struct ObjectRead {
     lease_expires_at: CatalogTick,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PutError {
-    EmptyKey,
-    AlreadyExists,
-    WriteInProgress,
-    ReclamationBacklog,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum StageError {
-    CatalogDropped,
-    ClaimLost,
-    ZeroSize,
-    NoReplicas,
-    ReplicaTooSmall {
-        replica: super::types::ReplicaId,
-        required_bytes: u64,
-        capacity_bytes: u64,
-    },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum PublishError {
-    ForeignCatalog,
-    ObjectGone,
-    PublicationInProgress,
-    NotPending,
-    CommitConflict,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RevokeError {
-    ForeignCatalog,
-    ObjectGone,
-    AlreadyPublished,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LookupError {
-    NotFound,
-    NotReady,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum RemoveError {
-    NotFound,
-    NotReady,
-    Leased { expires_at: CatalogTick },
-}
-
-macro_rules! impl_error {
-    ($type:ty) => {
-        impl std::error::Error for $type {}
-
-        impl fmt::Display for $type {
-            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(formatter, "{self:?}")
-            }
-        }
-    };
-}
-
-impl_error!(PutError);
-impl_error!(StageError);
-impl_error!(PublishError);
-impl_error!(RevokeError);
-impl_error!(LookupError);
-impl_error!(RemoveError);
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct CollectReport {
-    pub busy: bool,
-    pub scanned_candidates: usize,
-    pub expired_pending: usize,
-    pub retired_objects: usize,
-    pub retired_bytes: u64,
-    pub reclaimed_objects: usize,
-    pub reclaimed_bytes: u64,
-    pub removed_empty_slots: usize,
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct ObjectCatalogStats {
-    pub slots: usize,
-    pub claims: usize,
-    pub pending_objects: usize,
-    pub published_objects: usize,
-    pub pending_bytes: u64,
-    pub live_bytes: u64,
-    pub retired_bytes: u64,
-    pub reclaim_debt: u64,
-}
-
 impl ObjectCatalog {
     pub fn new() -> Self {
         Self::with_config(ObjectCatalogConfig::default())
@@ -411,7 +146,7 @@ impl ObjectCatalog {
         validate_config(config)?;
         Ok(Self {
             inner: Arc::new(CatalogInner {
-                entries: HashMap::with_capacity(config.index.expected_objects),
+                entries: HashMap::with_capacity(config.expected_objects),
                 config,
                 young: SegQueue::new(),
                 protected: SegQueue::new(),
@@ -431,10 +166,6 @@ impl ObjectCatalog {
         })
     }
 
-    pub fn config(&self) -> ObjectCatalogConfig {
-        self.inner.config
-    }
-
     pub fn claim_put(
         &self,
         identity: ObjectIdentity,
@@ -444,9 +175,7 @@ impl ObjectCatalog {
         if identity.key().is_empty() {
             return Err(PutError::EmptyKey);
         }
-        if self.inner.retired_bytes.load(Ordering::Relaxed)
-            >= self.inner.config.reclamation.max_retired_bytes
-        {
+        if self.inner.retired_bytes.load(Ordering::Relaxed) >= self.inner.config.max_retired_bytes {
             return Err(PutError::ReclamationBacklog);
         }
 
@@ -648,7 +377,11 @@ impl ObjectCatalog {
                 _ => unreachable!("object lifecycle is validated internally"),
             }
 
-            let lease_expires_at = node.control.acquire_lease(now, self.inner.config.leases);
+            let lease_expires_at = node.control.acquire_lease(
+                now,
+                self.inner.config.lease_ttl_ticks,
+                self.inner.config.lease_refresh_ticks,
+            );
             node.control.recent.store(true, Ordering::Relaxed);
             if node.control.lifecycle.load(Ordering::Acquire) == OBJECT_PUBLISHED
                 && slot_points_to(&slot, &node)
@@ -711,10 +444,8 @@ impl ObjectCatalog {
         Ok(())
     }
 
-    pub fn request_reclaim(&self, target: ReclaimTarget) {
-        self.inner
-            .reclaim_debt
-            .fetch_max(target.bytes(), Ordering::Relaxed);
+    pub fn request_reclaim(&self, bytes: u64) {
+        self.inner.reclaim_debt.fetch_max(bytes, Ordering::Relaxed);
     }
 
     pub fn collect_step(&self, now: CatalogTick, budget: CollectBudget) -> CollectReport {
@@ -767,7 +498,7 @@ impl CatalogInner {
         self.empty_slots.push(EmptySlotCandidate {
             identity: slot.identity.clone(),
             slot: Arc::downgrade(&slot),
-            deadline: now.saturating_add(self.config.reclamation.empty_slot_grace_ticks),
+            deadline: now.saturating_add(self.config.empty_slot_grace_ticks),
         });
     }
 
@@ -804,221 +535,6 @@ impl CatalogInner {
         });
         self.enqueue_empty(slot, now);
     }
-
-    fn expire_pending(&self, now: CatalogTick, budget: CollectBudget, report: &mut CollectReport) {
-        let candidates = self.pending.len().min(budget.max_candidates());
-        for _ in 0..candidates {
-            let Some(pending) = self.pending.pop() else {
-                break;
-            };
-            if pending.deadline > now {
-                self.pending.push(pending);
-                continue;
-            }
-            let Some(slot) = pending.candidate.slot.upgrade() else {
-                continue;
-            };
-            let Some(node) = pending.candidate.node.upgrade() else {
-                continue;
-            };
-            if node.record.get().is_none() {
-                continue;
-            }
-            if node
-                .control
-                .lifecycle
-                .compare_exchange(
-                    OBJECT_PENDING,
-                    OBJECT_RETIRING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                continue;
-            }
-            if clear_slot(&slot, &node) {
-                self.retire_pending(slot, node, now);
-                report.expired_pending += 1;
-            }
-        }
-    }
-
-    fn evict(&self, now: CatalogTick, budget: CollectBudget, report: &mut CollectReport) {
-        // Snapshot both generation sizes before scanning. An object promoted
-        // from young to protected must not be reconsidered in the same pause.
-        let young_candidates = self.young.len();
-        let protected_candidates = self.protected.len();
-        let mut remaining = budget.max_candidates();
-
-        for _ in 0..young_candidates.min(remaining) {
-            if self.reclaim_target_is_covered() {
-                return;
-            }
-            let Some(candidate) = self.young.pop() else {
-                break;
-            };
-            remaining -= 1;
-            self.evict_candidate(candidate, false, now, report);
-        }
-        for _ in 0..protected_candidates.min(remaining) {
-            if self.reclaim_target_is_covered() {
-                return;
-            }
-            let Some(candidate) = self.protected.pop() else {
-                break;
-            };
-            self.evict_candidate(candidate, true, now, report);
-        }
-    }
-
-    fn reclaim_target_is_covered(&self) -> bool {
-        self.reclaim_debt.load(Ordering::Relaxed) <= self.retired_bytes.load(Ordering::Relaxed)
-    }
-
-    fn evict_candidate(
-        &self,
-        candidate: GcCandidate,
-        from_protected: bool,
-        now: CatalogTick,
-        report: &mut CollectReport,
-    ) {
-        report.scanned_candidates += 1;
-        let Some(slot) = candidate.slot.upgrade() else {
-            return;
-        };
-        let Some(node) = candidate.node.upgrade() else {
-            return;
-        };
-        if node.control.lifecycle.load(Ordering::Acquire) != OBJECT_PUBLISHED
-            || !slot_points_to(&slot, &node)
-        {
-            return;
-        }
-
-        if node.control.recent.swap(false, Ordering::Relaxed) {
-            self.protected.push(candidate);
-            return;
-        }
-        if node
-            .control
-            .lifecycle
-            .compare_exchange(
-                OBJECT_PUBLISHED,
-                OBJECT_RETIRING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return;
-        }
-
-        if node.control.lease_until.load(Ordering::Acquire) > now.get() {
-            node.control
-                .lifecycle
-                .store(OBJECT_PUBLISHED, Ordering::Release);
-            self.protected.push(candidate);
-            return;
-        }
-        if clear_slot(&slot, &node) {
-            let bytes = node
-                .record
-                .get()
-                .expect("published objects always have records")
-                .reserved_bytes;
-            self.retire_published(slot, node, now);
-            report.retired_objects += 1;
-            report.retired_bytes = report.retired_bytes.saturating_add(bytes);
-        } else {
-            node.control
-                .lifecycle
-                .store(OBJECT_PUBLISHED, Ordering::Release);
-            if from_protected {
-                self.protected.push(candidate);
-            } else {
-                self.young.push(candidate);
-            }
-        }
-    }
-
-    fn reclaim(&self, now: CatalogTick, budget: CollectBudget, report: &mut CollectReport) {
-        let retired_objects = self.retired.len().min(budget.max_reclaims());
-        let mut resources = ReplicaReclaimBatch::with_capacity(retired_objects);
-        for _ in 0..retired_objects {
-            let Some(retired) = self.retired.pop() else {
-                break;
-            };
-            if retired.retry_at > now {
-                self.retired.push(retired);
-                continue;
-            }
-
-            match Arc::try_unwrap(retired.node) {
-                Ok(node) => {
-                    let record = node
-                        .record
-                        .into_inner()
-                        .expect("retired objects always have records");
-                    resources.extend(record.replicas);
-                    atomic_saturating_sub(&self.retired_bytes, retired.reserved_bytes);
-                    atomic_saturating_sub(&self.reclaim_debt, retired.reserved_bytes);
-                    report.reclaimed_objects += 1;
-                    report.reclaimed_bytes = report
-                        .reclaimed_bytes
-                        .saturating_add(retired.reserved_bytes);
-                }
-                Err(node) => self.retired.push(RetiredObject {
-                    node,
-                    reserved_bytes: retired.reserved_bytes,
-                    retry_at: now.saturating_add(1),
-                }),
-            }
-        }
-        resources.release();
-    }
-
-    fn clean_empty_slots(
-        &self,
-        now: CatalogTick,
-        budget: CollectBudget,
-        report: &mut CollectReport,
-    ) {
-        let candidates = self.empty_slots.len().min(budget.max_empty_slots());
-        for _ in 0..candidates {
-            let Some(candidate) = self.empty_slots.pop() else {
-                break;
-            };
-            if candidate.deadline > now {
-                self.empty_slots.push(candidate);
-                continue;
-            }
-            let Some(slot) = candidate.slot.upgrade() else {
-                continue;
-            };
-            if slot.current.load().is_some()
-                || slot
-                    .state
-                    .compare_exchange(SLOT_OPEN, SLOT_CLOSING, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-            {
-                continue;
-            }
-            let removed = self
-                .entries
-                .remove_if_sync(&candidate.identity.as_lookup(), |indexed| {
-                    Arc::ptr_eq(indexed, &slot)
-                        && slot.state.load(Ordering::Acquire) == SLOT_CLOSING
-                        && slot.current.load().is_none()
-                });
-            if removed.is_some() {
-                self.slots.fetch_sub(1, Ordering::Relaxed);
-                report.removed_empty_slots += 1;
-            } else {
-                slot.state.store(SLOT_OPEN, Ordering::Release);
-            }
-        }
-    }
 }
 
 impl ObjectSlot {
@@ -1050,9 +566,14 @@ impl CatalogNode {
 }
 
 impl ObjectControl {
-    fn acquire_lease(&self, now: CatalogTick, policy: ObjectLeasePolicy) -> CatalogTick {
-        let refresh_at = now.saturating_add(policy.lease_refresh_ticks).get();
-        let desired = now.saturating_add(policy.lease_ttl_ticks).get();
+    fn acquire_lease(
+        &self,
+        now: CatalogTick,
+        lease_ttl_ticks: u64,
+        lease_refresh_ticks: u64,
+    ) -> CatalogTick {
+        let refresh_at = now.saturating_add(lease_refresh_ticks).get();
+        let desired = now.saturating_add(lease_ttl_ticks).get();
         let mut current = self.lease_until.load(Ordering::Relaxed);
         while current < refresh_at {
             match self.lease_until.compare_exchange_weak(
@@ -1078,220 +599,6 @@ impl GcCandidate {
     }
 }
 
-impl PutClaim {
-    pub const fn id(&self) -> WriteId {
-        self.id
-    }
-
-    pub fn identity(&self) -> &ObjectIdentity {
-        &self.identity
-    }
-
-    pub const fn owner(&self) -> WriteOwner {
-        self.owner
-    }
-
-    pub fn stage(
-        mut self,
-        content: ObjectContent,
-        replicas: ReplicaSet,
-    ) -> Result<PutTicket, StageError> {
-        if content.logical_bytes() == 0 {
-            return Err(StageError::ZeroSize);
-        }
-        if replicas.is_empty() {
-            return Err(StageError::NoReplicas);
-        }
-        if let Some(replica) = replicas
-            .replicas()
-            .iter()
-            .find(|replica| replica.capacity_bytes() < content.logical_bytes())
-        {
-            return Err(StageError::ReplicaTooSmall {
-                replica: replica.id(),
-                required_bytes: content.logical_bytes(),
-                capacity_bytes: replica.capacity_bytes(),
-            });
-        }
-        let catalog = self.catalog.upgrade().ok_or(StageError::CatalogDropped)?;
-        let slot = self.slot.upgrade().ok_or(StageError::ClaimLost)?;
-        let node = self.node.as_ref().ok_or(StageError::ClaimLost)?;
-        if !slot_points_to(&slot, node) {
-            return Err(StageError::ClaimLost);
-        }
-        if node.control.write_id != self.id
-            || node.control.owner != self.owner
-            || node.control.lifecycle.load(Ordering::Acquire) != OBJECT_CLAIMED
-        {
-            return Err(StageError::ClaimLost);
-        }
-
-        let reserved_bytes = replicas.reserved_bytes();
-        if node
-            .record
-            .set(ObjectRecord {
-                identity: self.identity.clone(),
-                content,
-                replicas,
-                reserved_bytes,
-            })
-            .is_err()
-            || node
-                .control
-                .lifecycle
-                .compare_exchange(
-                    OBJECT_CLAIMED,
-                    OBJECT_PENDING,
-                    Ordering::Release,
-                    Ordering::Acquire,
-                )
-                .is_err()
-        {
-            return Err(StageError::ClaimLost);
-        }
-
-        catalog.claims.fetch_sub(1, Ordering::Relaxed);
-        catalog.pending_objects.fetch_add(1, Ordering::Relaxed);
-        catalog
-            .pending_bytes
-            .fetch_add(reserved_bytes, Ordering::Relaxed);
-        let node = node.clone();
-        let candidate = GcCandidate::new(&slot, &node);
-        catalog.pending.push(PendingCandidate {
-            candidate,
-            deadline: self
-                .started_at
-                .saturating_add(catalog.config.reclamation.pending_timeout_ticks),
-        });
-        self.node = None;
-
-        Ok(PutTicket {
-            catalog: Arc::downgrade(&catalog),
-            slot: Arc::downgrade(&slot),
-            node,
-            id: self.id,
-        })
-    }
-}
-
-impl Drop for PutClaim {
-    fn drop(&mut self) {
-        let Some(node) = self.node.take() else {
-            return;
-        };
-        let Some(catalog) = self.catalog.upgrade() else {
-            return;
-        };
-        let Some(slot) = self.slot.upgrade() else {
-            return;
-        };
-        if clear_slot(&slot, &node) {
-            catalog.claims.fetch_sub(1, Ordering::Relaxed);
-            catalog.enqueue_empty(slot, self.started_at);
-        }
-    }
-}
-
-impl fmt::Debug for PutClaim {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PutClaim")
-            .field("identity", &self.identity)
-            .field("id", &self.id)
-            .field("owner", &self.owner)
-            .finish_non_exhaustive()
-    }
-}
-
-impl PutTicket {
-    pub const fn id(&self) -> WriteId {
-        self.id
-    }
-
-    pub fn identity(&self) -> &ObjectIdentity {
-        &self.node.record().identity
-    }
-
-    pub fn content(&self) -> ObjectContent {
-        self.node.record().content
-    }
-
-    pub fn replicas(&self) -> &[ReplicaLease] {
-        self.node.record().replicas.replicas()
-    }
-}
-
-impl fmt::Debug for PutTicket {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PutTicket")
-            .field("identity", &self.identity())
-            .field("id", &self.id)
-            .field("content", &self.content())
-            .field("replicas", &self.replicas())
-            .finish()
-    }
-}
-
-impl ObjectHandle {
-    pub fn identity(&self) -> &ObjectIdentity {
-        &self.node.record().identity
-    }
-
-    pub fn content(&self) -> ObjectContent {
-        self.node.record().content
-    }
-
-    pub fn commit(&self) -> ObjectCommit {
-        *self
-            .node
-            .control
-            .commit
-            .get()
-            .expect("published objects always have commit metadata")
-    }
-
-    pub fn replicas(&self) -> &[ReplicaLease] {
-        self.node.record().replicas.replicas()
-    }
-
-    pub fn owner(&self) -> WriteOwner {
-        self.node.control.owner
-    }
-}
-
-impl fmt::Debug for ObjectHandle {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ObjectHandle")
-            .field("identity", &self.identity())
-            .field("content", &self.content())
-            .field("commit", &self.commit())
-            .field("replicas", &self.replicas())
-            .finish()
-    }
-}
-
-impl ObjectRead {
-    pub const fn object(&self) -> &ObjectHandle {
-        &self.object
-    }
-
-    pub const fn lease_expires_at(&self) -> CatalogTick {
-        self.lease_expires_at
-    }
-}
-
-impl fmt::Debug for ObjectRead {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("ObjectRead")
-            .field("object", &self.object)
-            .field("lease_expires_at", &self.lease_expires_at)
-            .finish()
-    }
-}
-
 impl Equivalent<ObjectIdentity> for ObjectLookup<'_> {
     fn equivalent(&self, key: &ObjectIdentity) -> bool {
         self.namespace() == key.namespace() && self.key() == key.key().as_str()
@@ -1313,19 +620,19 @@ fn clear_slot(slot: &ObjectSlot, expected: &Arc<CatalogNode>) -> bool {
 }
 
 fn validate_config(config: ObjectCatalogConfig) -> Result<(), ObjectCatalogConfigError> {
-    if config.index.expected_objects == 0 {
+    if config.expected_objects == 0 {
         return Err(ObjectCatalogConfigError::ZeroExpectedObjects);
     }
-    if config.leases.lease_ttl_ticks == 0 {
+    if config.lease_ttl_ticks == 0 {
         return Err(ObjectCatalogConfigError::ZeroLeaseTtl);
     }
-    if config.leases.lease_refresh_ticks > config.leases.lease_ttl_ticks {
+    if config.lease_refresh_ticks > config.lease_ttl_ticks {
         return Err(ObjectCatalogConfigError::RefreshExceedsLease);
     }
-    if config.reclamation.pending_timeout_ticks == 0 {
+    if config.pending_timeout_ticks == 0 {
         return Err(ObjectCatalogConfigError::ZeroPendingTimeout);
     }
-    if config.reclamation.max_retired_bytes == 0 {
+    if config.max_retired_bytes == 0 {
         return Err(ObjectCatalogConfigError::ZeroRetiredLimit);
     }
     Ok(())

@@ -1,7 +1,9 @@
+//! Segment pool throughput benchmark.
+
+use cakemaster::segment::config::DEFAULT_MAX_ALLOCATOR_NODES_PER_SEGMENT;
 use cakemaster::segment::{
-    ClientId, DEFAULT_MAX_ALLOCATOR_NODES_PER_SEGMENT, MemoryRegion, MemorySegmentSpec, SegmentId,
-    SegmentIdentity, SegmentPool, SegmentPoolConfig, SegmentTopology, TransportEndpoint,
-    TransportProtocol,
+    ClientId, MemoryRegion, MemorySegmentSpec, SegmentId, SegmentIdentity, SegmentPool,
+    SegmentPoolConfig, SegmentTopology, TransportEndpoint, TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};

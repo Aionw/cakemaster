@@ -1,12 +1,14 @@
+//! Object catalog throughput benchmark.
+
+use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
-    CatalogTick, CollectBudget, MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig,
-    ObjectCommit, ObjectContent, ObjectIdentity, ReclaimReason, ReclaimTarget, ReplicaId,
-    ReplicaLease, ReplicaSet, WriteOwner,
+    MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
+    ObjectIdentity, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
 };
+use cakemaster::segment::config::DEFAULT_MAX_ALLOCATOR_NODES_PER_SEGMENT;
 use cakemaster::segment::{
-    ClientId, DEFAULT_MAX_ALLOCATOR_NODES_PER_SEGMENT, MemoryRegion, MemorySegmentSpec,
-    PoolSnapshot, SegmentId, SegmentIdentity, SegmentPool, SegmentPoolConfig, TransportEndpoint,
-    TransportProtocol,
+    ClientId, MemoryRegion, MemorySegmentSpec, PoolSnapshot, SegmentId, SegmentIdentity,
+    SegmentPool, SegmentPoolConfig, TransportEndpoint, TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -297,10 +299,7 @@ fn run_collector(
         next_collection = next_collection.saturating_add(COLLECT_EVERY_OPERATIONS);
         let stats = catalog.stats();
         if stats.live_bytes > watermark {
-            catalog.request_reclaim(ReclaimTarget::new(
-                stats.live_bytes - watermark,
-                ReclaimReason::CapacityPressure,
-            ));
+            catalog.request_reclaim(stats.live_bytes - watermark);
         }
 
         let started = Instant::now();

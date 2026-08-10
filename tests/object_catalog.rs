@@ -1,8 +1,8 @@
+use cakemaster::object::error::{LookupError, PublishError, PutError, RemoveError, StageError};
+use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
-    CatalogTick, CollectBudget, LookupError, MemoryReplica, NamespaceId, ObjectCatalog,
-    ObjectCatalogConfig, ObjectCommit, ObjectContent, ObjectIdentity, ObjectLookup, PublishError,
-    PutError, ReclaimReason, ReclaimTarget, RemoveError, ReplicaId, ReplicaLease, ReplicaSet,
-    StageError, WriteOwner,
+    MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
+    ObjectIdentity, ObjectLookup, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
 };
 use cakemaster::segment::{
     ClientId, MemoryRegion, MemorySegmentSpec, SegmentId, SegmentIdentity, SegmentPool,
@@ -283,7 +283,7 @@ fn reclamation_promotes_recent_objects_and_defers_pinned_resources() {
     drop(cold_ticket);
     drop(cold_handle);
 
-    catalog.request_reclaim(ReclaimTarget::new(4096, ReclaimReason::CapacityPressure));
+    catalog.request_reclaim(4096);
     let report = catalog.collect_step(CatalogTick::new(5), CollectBudget::new(8, 8, 0));
     assert_eq!(report.scanned_candidates, 2);
     assert_eq!(report.retired_objects, 1);
@@ -296,7 +296,7 @@ fn reclamation_promotes_recent_objects_and_defers_pinned_resources() {
 
     // The read handle is an epoch pin: retirement detaches the object after
     // its lease expires, but reclamation cannot return the reservation yet.
-    catalog.request_reclaim(ReclaimTarget::new(4096, ReclaimReason::Explicit));
+    catalog.request_reclaim(4096);
     let report = catalog.collect_step(CatalogTick::new(10), CollectBudget::new(8, 8, 0));
     assert_eq!(report.retired_objects, 1);
     assert_eq!(report.reclaimed_objects, 0);
@@ -370,10 +370,7 @@ fn high_concurrency_put_get_and_incremental_collection_leave_no_resources() {
         scope.spawn(move || {
             collector_barrier.wait();
             for tick in 0..operations_per_worker {
-                catalog.request_reclaim(ReclaimTarget::new(
-                    16 * 1024,
-                    ReclaimReason::CapacityPressure,
-                ));
+                catalog.request_reclaim(16 * 1024);
                 black_box(
                     catalog
                         .collect_step(CatalogTick::new(tick as u64), CollectBudget::new(16, 16, 4)),
@@ -386,7 +383,7 @@ fn high_concurrency_put_get_and_incremental_collection_leave_no_resources() {
 
     assert_eq!(catalog.stats().claims, 0);
     assert_eq!(catalog.stats().pending_objects, 0);
-    catalog.request_reclaim(ReclaimTarget::new(u64::MAX, ReclaimReason::Explicit));
+    catalog.request_reclaim(u64::MAX);
     for _ in 0..4 {
         catalog.collect_step(
             CatalogTick::new(u64::MAX),

@@ -1,15 +1,10 @@
-use coro_rpc::{RemoteError, RequestContext, RpcError, RpcFailure, RpcResponse};
-use tokio::sync::oneshot;
-
-pub mod generated {
-    include!(concat!(env!("OUT_DIR"), "/cakemaster_rpc.rs"));
-}
-
-use generated::api::{
+use cakemaster_proto::api::{
     DemoService, DemoServiceClient, DemoServiceServer, DescriptorVariant, DiskDescriptor,
     ErrorCode, LocalDiskDescriptor, MemoryDescriptor, NoFDescriptor, ReplicaDescriptor, User,
     UserId,
 };
+use coro_rpc::{RemoteError, RequestContext, RpcError, RpcFailure, RpcResponse};
+use tokio::sync::oneshot;
 
 struct TestService;
 

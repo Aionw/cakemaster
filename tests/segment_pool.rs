@@ -1,9 +1,12 @@
+use cakemaster::segment::error::{AttachError, LifecycleError, ReserveError};
+use cakemaster::segment::placement::{
+    AllocationSpec, FailureDomain, FulfillmentPolicy, PlacementConstraints, PlacementError,
+    PlacementRequest, ReplicaAllocator, ReplicaPolicy,
+};
+use cakemaster::segment::stats::SegmentState;
 use cakemaster::segment::{
-    AllocationSpec, AttachError, AttachOutcome, ClientId, FailureDomain, FulfillmentPolicy,
-    LifecycleError, MemoryRegion, MemorySegmentSpec, PlacementConstraints, PlacementError,
-    PlacementRequest, ReplicaAllocator, ReplicaPolicy, ReserveError, SegmentId, SegmentIdentity,
-    SegmentPool, SegmentPoolConfig, SegmentState, SegmentTopology, TransportEndpoint,
-    TransportProtocol,
+    AttachOutcome, ClientId, MemoryRegion, MemorySegmentSpec, SegmentId, SegmentIdentity,
+    SegmentPool, SegmentPoolConfig, SegmentTopology, TransportEndpoint, TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};

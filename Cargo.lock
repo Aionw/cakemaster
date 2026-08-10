@@ -81,13 +81,29 @@ name = "cakemaster"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "coro-rpc",
- "coro-rpc-codegen",
  "crossbeam-queue",
- "futures-util",
  "offset-allocator",
  "parking_lot",
  "scc",
+]
+
+[[package]]
+name = "cakemaster-proto"
+version = "0.1.0"
+dependencies = [
+ "coro-rpc",
+ "coro-rpc-codegen",
+ "tokio",
+]
+
+[[package]]
+name = "cakemaster-server"
+version = "0.1.0"
+dependencies = [
+ "cakemaster",
+ "cakemaster-proto",
+ "coro-rpc",
+ "futures-util",
  "tokio",
 ]
 

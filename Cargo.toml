@@ -2,24 +2,28 @@
 name = "cakemaster"
 version = "0.1.0"
 edition = "2024"
-description = "Application using the internal coro-rpc workspace crate"
+description = "Core object catalog and memory segment management for Cakemaster"
 license = "Apache-2.0"
-build = "build.rs"
 
 [workspace]
-members = ["crates/coro-rpc", "crates/coro-rpc-codegen"]
-default-members = [".", "crates/coro-rpc", "crates/coro-rpc-codegen"]
+members = [
+    "crates/cakemaster-proto",
+    "crates/cakemaster-server",
+    "crates/coro-rpc",
+    "crates/coro-rpc-codegen",
+]
+default-members = [
+    ".",
+    "crates/cakemaster-proto",
+    "crates/cakemaster-server",
+    "crates/coro-rpc",
+    "crates/coro-rpc-codegen",
+]
 resolver = "3"
 
 [dependencies]
 arc-swap = "1.9"
-coro-rpc = { path = "crates/coro-rpc" }
 crossbeam-queue = "0.3"
-futures-util = "0.3"
 offset-allocator = "0.2"
 parking_lot = "0.12"
 scc = "3.8"
-tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
-
-[build-dependencies]
-coro-rpc-codegen = { path = "crates/coro-rpc-codegen" }

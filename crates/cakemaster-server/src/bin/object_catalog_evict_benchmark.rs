@@ -1,7 +1,9 @@
+//! Object catalog eviction benchmark.
+
+use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
-    CatalogTick, CollectBudget, MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig,
-    ObjectCommit, ObjectContent, ObjectIdentity, ReclaimReason, ReclaimTarget, ReplicaId,
-    ReplicaLease, ReplicaSet, WriteOwner,
+    MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
+    ObjectIdentity, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
 };
 use cakemaster::segment::{
     ClientId, MemoryRegion, MemorySegmentSpec, SegmentId, SegmentIdentity, SegmentPool,
@@ -249,10 +251,7 @@ fn run_collection(
     result: &mut EvictResult,
 ) {
     let started = Instant::now();
-    catalog.request_reclaim(ReclaimTarget::new(
-        target_bytes,
-        ReclaimReason::CapacityPressure,
-    ));
+    catalog.request_reclaim(target_bytes);
     while result.freed_bytes < target_bytes {
         let step_started = Instant::now();
         let report = catalog.collect_step(CatalogTick::new(1), budget);

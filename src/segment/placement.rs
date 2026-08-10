@@ -1,5 +1,8 @@
-use super::pool::{PoolSnapshot, Reservation, ReserveError, SegmentCandidate, SegmentPool};
-use super::types::SegmentId;
+use super::error::ReserveError;
+use super::identity::SegmentId;
+use super::pool::{PoolSnapshot, SegmentCandidate, SegmentPool};
+use super::reservation::Reservation;
+use super::stats::SegmentStats;
 use std::collections::HashSet;
 use std::fmt;
 use std::sync::Arc;
@@ -276,10 +279,6 @@ impl ReservationSet {
     pub fn iter(&self) -> std::slice::Iter<'_, Reservation> {
         self.0.iter()
     }
-
-    pub fn into_vec(self) -> Vec<Reservation> {
-        self.0
-    }
 }
 
 impl IntoIterator for ReservationSet {
@@ -334,7 +333,7 @@ enum DomainKey {
 
 struct RankedCandidate {
     candidate: SegmentCandidate,
-    stats: super::types::SegmentStats,
+    stats: SegmentStats,
     preference: usize,
 }
 

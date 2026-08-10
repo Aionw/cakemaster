@@ -1,57 +1,16 @@
-use super::offset_allocator::{ByteAllocator, OffsetAllocationHandle};
-use super::types::{
-    ClientId, MemoryDescriptor, MemoryDescriptorRef, MemoryRegion, MemorySegmentSpec, SegmentId,
-    SegmentReservationStats, SegmentSpaceStats, SegmentState, SegmentStats,
-};
+use super::config::SegmentPoolConfig;
+use super::descriptor::{MemoryRegion, MemorySegmentSpec};
+use super::error::{AttachError, LifecycleError, PoolConfigError, ReserveError};
+use super::identity::{ClientId, SegmentId};
+use super::offset_allocator::ByteAllocator;
+use super::reservation::Reservation;
+use super::stats::{SegmentReservationStats, SegmentSpaceStats, SegmentState, SegmentStats};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-pub const DEFAULT_MAX_ALLOCATOR_NODES_PER_SEGMENT: u32 = 128 * 1024;
-
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SegmentPoolConfig {
-    max_allocator_nodes_per_segment: u32,
-}
-
-impl SegmentPoolConfig {
-    pub const fn new(max_allocator_nodes_per_segment: u32) -> Self {
-        Self {
-            max_allocator_nodes_per_segment,
-        }
-    }
-
-    pub const fn max_allocator_nodes_per_segment(self) -> u32 {
-        self.max_allocator_nodes_per_segment
-    }
-}
-
-impl Default for SegmentPoolConfig {
-    fn default() -> Self {
-        Self::new(DEFAULT_MAX_ALLOCATOR_NODES_PER_SEGMENT)
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct PoolConfigError {
-    max_allocator_nodes_per_segment: u32,
-}
-
-impl fmt::Display for PoolConfigError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "max allocator nodes per segment must be in 3..{}, got {}",
-            u32::MAX - 1,
-            self.max_allocator_nodes_per_segment
-        )
-    }
-}
-
-impl std::error::Error for PoolConfigError {}
 
 pub struct SegmentPool {
     pool_id: u64,
@@ -147,185 +106,6 @@ impl AttachOutcome {
 
     pub const fn is_new(&self) -> bool {
         matches!(self, Self::Attached(_))
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AttachError {
-    NilSegmentId,
-    NilOwnerId,
-    EmptyName,
-    InvalidBase,
-    EmptyTransportEndpoint,
-    InvalidTransportProtocol,
-    EmptyHostId,
-    ZeroSize,
-    AddressOverflow,
-    ConflictingSegmentId(SegmentId),
-    OverlappingAddressRange { existing: SegmentId },
-}
-
-impl fmt::Display for AttachError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NilSegmentId => formatter.write_str("segment id must not be nil"),
-            Self::NilOwnerId => formatter.write_str("segment owner id must not be nil"),
-            Self::EmptyName => formatter.write_str("segment name must not be empty"),
-            Self::InvalidBase => {
-                formatter.write_str("memory segment base address must not be zero")
-            }
-            Self::EmptyTransportEndpoint => {
-                formatter.write_str("transport endpoint must not be empty")
-            }
-            Self::InvalidTransportProtocol => {
-                formatter.write_str("transport protocol is not a valid identifier")
-            }
-            Self::EmptyHostId => formatter.write_str("host id must not be empty when present"),
-            Self::ZeroSize => formatter.write_str("segment size must not be zero"),
-            Self::AddressOverflow => formatter.write_str("segment address range overflows u64"),
-            Self::ConflictingSegmentId(id) => {
-                write!(
-                    formatter,
-                    "segment id {id} is already attached with different metadata"
-                )
-            }
-            Self::OverlappingAddressRange { existing } => write!(
-                formatter,
-                "segment address range overlaps existing segment {existing} in the same address space"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for AttachError {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum LifecycleError {
-    NotFound(SegmentId),
-    OwnerMismatch {
-        segment: SegmentId,
-        expected: ClientId,
-        actual: ClientId,
-    },
-    StillAccepting(SegmentId),
-    Busy {
-        segment: SegmentId,
-        live_allocations: u64,
-    },
-}
-
-impl fmt::Display for LifecycleError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NotFound(id) => write!(formatter, "segment {id} was not found"),
-            Self::OwnerMismatch {
-                segment,
-                expected,
-                actual,
-            } => write!(
-                formatter,
-                "segment {segment} belongs to client {expected}, not {actual}"
-            ),
-            Self::StillAccepting(id) => {
-                write!(formatter, "segment {id} must be quiesced before removal")
-            }
-            Self::Busy {
-                segment,
-                live_allocations,
-            } => write!(
-                formatter,
-                "segment {segment} still has {live_allocations} live allocations"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for LifecycleError {}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ReserveError {
-    ZeroSize,
-    ForeignCandidate,
-    NotFound(SegmentId),
-    NotAccepting(SegmentId),
-    OutOfSpace(SegmentId),
-    AddressOverflow(SegmentId),
-}
-
-impl fmt::Display for ReserveError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ZeroSize => formatter.write_str("reservation size must not be zero"),
-            Self::ForeignCandidate => {
-                formatter.write_str("segment candidate belongs to another pool")
-            }
-            Self::NotFound(id) => write!(formatter, "segment {id} was not found"),
-            Self::NotAccepting(id) => {
-                write!(formatter, "segment {id} is not accepting reservations")
-            }
-            Self::OutOfSpace(id) => write!(formatter, "segment {id} has no suitable free range"),
-            Self::AddressOverflow(id) => {
-                write!(formatter, "allocated address overflowed in segment {id}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ReserveError {}
-
-pub struct Reservation {
-    allocation: OffsetAllocationHandle,
-    region: MemoryRegion,
-}
-
-impl Reservation {
-    pub fn segment_id(&self) -> SegmentId {
-        self.allocation.spec().identity().id()
-    }
-
-    pub const fn offset(&self) -> u64 {
-        self.allocation.offset()
-    }
-
-    pub const fn requested_bytes(&self) -> u64 {
-        self.allocation.requested_bytes()
-    }
-
-    pub const fn reserved_bytes(&self) -> u64 {
-        self.allocation.reserved_bytes()
-    }
-
-    pub const fn region(&self) -> MemoryRegion {
-        self.region
-    }
-
-    pub fn descriptor(&self) -> MemoryDescriptorRef<'_> {
-        MemoryDescriptorRef::new(self.region, self.allocation.spec().transport())
-    }
-
-    pub fn owned_descriptor(&self) -> MemoryDescriptor {
-        self.descriptor().to_owned()
-    }
-
-    pub(crate) fn release_batch(reservations: Vec<Self>) {
-        OffsetAllocationHandle::release_batch(
-            reservations
-                .into_iter()
-                .map(|reservation| reservation.allocation),
-        );
-    }
-}
-
-impl fmt::Debug for Reservation {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Reservation")
-            .field("segment_id", &self.segment_id())
-            .field("offset", &self.offset())
-            .field("region", &self.region)
-            .field("reserved_bytes", &self.reserved_bytes())
-            .field("descriptor", &self.descriptor())
-            .finish()
     }
 }
 
@@ -609,7 +389,7 @@ fn validate_spec(spec: &MemorySegmentSpec) -> Result<(), AttachError> {
         .transport()
         .protocol()
         .as_str()
-        .parse::<super::types::TransportProtocol>()
+        .parse::<super::transport::TransportProtocol>()
         .is_err()
     {
         return Err(AttachError::InvalidTransportProtocol);

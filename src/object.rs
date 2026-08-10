@@ -11,16 +11,18 @@
 //! never performs a stop-the-world map scan.
 
 mod catalog;
-mod types;
+pub mod config;
+mod content;
+pub mod diagnostics;
+pub mod error;
+mod identity;
+pub mod reclamation;
+mod replica;
+mod write;
 
-pub use catalog::{
-    CatalogIndexConfig, CollectReport, LookupError, ObjectCatalog, ObjectCatalogConfig,
-    ObjectCatalogConfigError, ObjectCatalogStats, ObjectHandle, ObjectLeasePolicy, ObjectRead,
-    PublishError, PutClaim, PutError, PutTicket, ReclamationPolicy, RemoveError, RevokeError,
-    StageError,
-};
-pub use types::{
-    CatalogTick, CollectBudget, MemoryReplica, NamespaceId, ObjectCommit, ObjectContent,
-    ObjectIdentity, ObjectKey, ObjectKind, ObjectLookup, ReclaimReason, ReclaimTarget, ReplicaId,
-    ReplicaLease, ReplicaSet, WriteId, WriteOwner,
-};
+pub use catalog::{ObjectCatalog, ObjectHandle, ObjectRead, PutClaim, PutTicket};
+pub use config::ObjectCatalogConfig;
+pub use content::{ObjectContent, ObjectKind};
+pub use identity::{NamespaceId, ObjectIdentity, ObjectKey, ObjectLookup};
+pub use replica::{MemoryReplica, ReplicaId, ReplicaLease, ReplicaSet};
+pub use write::{ObjectCommit, WriteId, WriteOwner};

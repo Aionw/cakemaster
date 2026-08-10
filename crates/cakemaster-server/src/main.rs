@@ -1,15 +1,10 @@
 use std::error::Error;
 
-use coro_rpc::{RequestContext, RpcError, RpcFailure, RpcResponse};
-
-pub mod generated {
-    include!(concat!(env!("OUT_DIR"), "/cakemaster_rpc.rs"));
-}
-
-use generated::api::{
+use cakemaster_proto::api::{
     DemoService, DemoServiceClient, DemoServiceServer, DescriptorVariant, DiskDescriptor,
     ErrorCode, ReplicaDescriptor,
 };
+use coro_rpc::{RequestContext, RpcError, RpcFailure, RpcResponse};
 
 struct DemoServiceImpl;
 

@@ -1,7 +1,9 @@
+//! Object catalog watermark benchmark.
+
+use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
-    CatalogTick, CollectBudget, MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig,
-    ObjectCommit, ObjectContent, ObjectIdentity, ReclaimReason, ReclaimTarget, ReplicaId,
-    ReplicaLease, ReplicaSet, WriteOwner,
+    MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
+    ObjectIdentity, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
 };
 use cakemaster::segment::{
     ClientId, MemoryRegion, MemorySegmentSpec, SegmentCandidate, SegmentId, SegmentIdentity,
@@ -379,10 +381,7 @@ fn run_collector(
                     .eviction_ratio
                     .max(last_ratio - arguments.high_watermark_ratio + arguments.eviction_ratio);
                 let target_bytes = ((stats.live_bytes as f64) * target_ratio).ceil() as u64;
-                catalog.request_reclaim(ReclaimTarget::new(
-                    target_bytes,
-                    ReclaimReason::CapacityPressure,
-                ));
+                catalog.request_reclaim(target_bytes);
                 result.reclaim_events += 1;
             }
             next_trigger = now + trigger_interval;

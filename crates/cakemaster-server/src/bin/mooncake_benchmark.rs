@@ -1,22 +1,16 @@
 use std::error::Error;
 use std::time::Instant;
 
-use coro_rpc::struct_pack::{serialize, type_hash, type_literal};
-use coro_rpc::{ClientConfig, RpcClient, RpcError, RpcFailure, RpcMethod, StructPack, function_id};
-use futures_util::future::join_all;
-use tokio::runtime::Builder;
-
-#[allow(dead_code)]
-mod generated {
-    include!(concat!(env!("OUT_DIR"), "/mooncake_master_rpc.rs"));
-}
-
-use generated::mooncake::{
+use cakemaster_proto::mooncake::{
     BufferDescriptor, DescriptorVariant, ExpectedBool, ExpectedGetReplicaListResponse,
     ExpectedReplicaDescriptors, ExpectedVoid, GetReplicaListResponse, MemoryDescriptor,
     ObjectDataType, ObjectMeta, ReplicaDescriptor, ReplicaStatus, ReplicaType, ReplicateConfig,
     Uuid, WrappedMasterService, WrappedMasterServiceServer,
 };
+use coro_rpc::struct_pack::{serialize, type_hash, type_literal};
+use coro_rpc::{ClientConfig, RpcClient, RpcError, RpcFailure, RpcMethod, StructPack, function_id};
+use futures_util::future::join_all;
+use tokio::runtime::Builder;
 
 const BATCH_EXIST_KEY: &str = "mooncake::WrappedMasterService::BatchExistKey";
 const BATCH_GET_REPLICA_LIST: &str = "mooncake::WrappedMasterService::BatchGetReplicaList";

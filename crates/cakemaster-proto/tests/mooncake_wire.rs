@@ -1,16 +1,11 @@
 #![allow(dead_code)]
 
-use coro_rpc::function_id;
-use coro_rpc::struct_pack::{deserialize, serialize, type_hash, type_literal};
-
-mod generated {
-    include!(concat!(env!("OUT_DIR"), "/mooncake_master_rpc.rs"));
-}
-
-use generated::mooncake::{
+use cakemaster_proto::mooncake::{
     ExpectedBool, ExpectedGetReplicaListResponse, ExpectedReplicaDescriptors, ExpectedVoid,
     ObjectDataType, ObjectMeta, ReplicaType, ReplicateConfig, Uuid,
 };
+use coro_rpc::function_id;
+use coro_rpc::struct_pack::{deserialize, serialize, type_hash, type_literal};
 
 type BatchKeyRequest = (Vec<String>, String);
 type BatchExistsResponse = Vec<ExpectedBool>;

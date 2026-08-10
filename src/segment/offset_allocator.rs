@@ -1,4 +1,4 @@
-use super::types::MemorySegmentSpec;
+use super::descriptor::MemorySegmentSpec;
 use offset_allocator::{Allocation, Allocator};
 use parking_lot::{Mutex, MutexGuard};
 use std::sync::Arc;

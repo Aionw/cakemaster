@@ -1,6 +1,6 @@
 # cakemaster
 
-基于 Tokio 的 yalantinglibs `coro_rpc` v0 兼容实现，可让 Rust 与 C++ `coro_rpc` 客户端/服务端通过 TCP 直接互调。
+Cakemaster workspace 包含高并发 object catalog、memory segment/placement 核心库，以及基于 Tokio 的 yalantinglibs `coro_rpc` v0 兼容实现，可让 Rust 与 C++ `coro_rpc` 客户端/服务端通过 TCP 直接互调。
 
 兼容基线为 `alibaba/yalantinglibs` 的 `c1cef74057b139944c982d840c09c9940f26e08e` 提交。协议实现依据该版本的 [`coro_rpc_protocol.hpp`](https://github.com/alibaba/yalantinglibs/blob/c1cef74057b139944c982d840c09c9940f26e08e/include/ylt/coro_rpc/impl/protocol/coro_rpc_protocol.hpp) 和 [`struct_pack`](https://alibaba.github.io/yalantinglibs/en/struct_pack/struct_pack_layout.html)。
 
@@ -28,30 +28,43 @@
 
 ## 直接运行
 
-仓库按常见的 application + internal crate 方式组织：
+仓库按 core、contract、application 三层 workspace 组织：
 
 ```text
-src/main.rs                 # cakemaster 应用入口
+src/                        # cakemaster 核心领域库：object catalog 与 segment pool
+crates/cakemaster-proto/    # IDL、build.rs 与唯一的生成接口入口
+crates/cakemaster-server/   # 服务入口和诊断/性能工具
 crates/coro-rpc/src/        # 可复用的 RPC 协议、client 与 server
 crates/coro-rpc-codegen/    # Thrift AST 校验与 Rust stub 生成
 crates/coro-rpc/tests/      # RPC crate 的兼容与端到端测试
 crates/coro-rpc/examples/   # RPC crate 的 benchmark
-idl/                        # 应用 RPC 契约
-build.rs                    # 将 Thrift IDL 生成到 Cargo OUT_DIR
 ```
 
-根 package 通过 path dependency 使用 `coro-rpc`，因此 RPC 框架不会和应用代码混在根 `src/` 下。
+依赖方向固定为 server → core/proto → coro-rpc；核心库不依赖 Tokio、RPC 或 codegen。
+领域 API 通过 `object`、`segment` 两个门面暴露；错误、回收控制、placement 和诊断类型位于各自的具名子模块，内部实现文件保持私有。
+
+核心类型保持短路径，扩展接口按职责导入：
+
+```rust
+use cakemaster::object::{ObjectCatalog, ObjectCatalogConfig, ObjectIdentity};
+use cakemaster::object::error::LookupError;
+use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
+use cakemaster::segment::{MemorySegmentSpec, SegmentPool};
+use cakemaster::segment::placement::{PlacementRequest, ReplicaAllocator};
+```
+
+值对象和 ID 使用私有字段加构造/读取方法来维持语义边界；统计快照使用公开字段。配置修改采用消费式 `with_*` builder，不提供共享可变 setter。
 
 启动 Rust 服务端：
 
 ```bash
-cargo run --release -- server 127.0.0.1:9000
+cargo run --release -p cakemaster-server --bin cakemaster -- server 127.0.0.1:9000
 ```
 
 运行 Rust 客户端：
 
 ```bash
-cargo run --release -- client 127.0.0.1:9000
+cargo run --release -p cakemaster-server --bin cakemaster -- client 127.0.0.1:9000
 ```
 
 演示程序注册了以下与 C++ 同名、同签名的接口：
@@ -72,7 +85,7 @@ Thrift 只用作接口定义，不引入 Thrift transport、protocol 或 runtime
 
 IDL 语法树由维护中的 [`arborium-thrift`](https://docs.rs/arborium-thrift/latest/arborium_thrift/) 与 [Tree-sitter](https://github.com/tree-sitter/tree-sitter) 解析；本项目只负责把语法树降到 coro_rpc 所需的语义模型、校验 struct_pack 子集并生成 stub。Rust 代码使用 `quote`/`syn`/`prettyplease` 生成和格式化，MD5 使用 `md-5` crate，没有自写 Thrift lexer/parser、Rust 源码拼接器或 MD5 实现。
 
-[`idl/cakemaster.thrift`](idl/cakemaster.thrift) 中的核心 service：
+[`crates/cakemaster-proto/idl/cakemaster.thrift`](crates/cakemaster-proto/idl/cakemaster.thrift) 中的核心 service：
 
 ```thrift
 namespace rs api
@@ -114,7 +127,7 @@ service DemoService {
 }
 ```
 
-应用的 `build.rs` 调用 codegen：
+`cakemaster-proto` 的 `build.rs` 调用 codegen：
 
 ```rust
 let output = std::path::PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
@@ -122,18 +135,17 @@ coro_rpc_codegen::Builder::new()
     .compile("idl/cakemaster.thrift", output.join("cakemaster_rpc.rs"))?;
 ```
 
-生成代码通过 Cargo 的 `OUT_DIR` 引入：
+生成代码只在 `cakemaster-proto` 中通过 Cargo 的 `OUT_DIR` 引入一次：
 
 ```rust
-pub mod generated {
-    include!(concat!(env!("OUT_DIR"), "/cakemaster_rpc.rs"));
-}
+include!(concat!(env!("OUT_DIR"), "/cakemaster_rpc.rs"));
+include!(concat!(env!("OUT_DIR"), "/mooncake_master_rpc.rs"));
 ```
 
 客户端不再声明 `RpcMethod`：
 
 ```rust
-use generated::api::DemoServiceClient;
+use cakemaster_proto::api::DemoServiceClient;
 
 let client = DemoServiceClient::connect("127.0.0.1:9000").await?;
 let value = client.echo("hello".to_owned()).await?;
@@ -144,7 +156,7 @@ let sum = client.add(20, 22).await?;
 
 ```rust
 use coro_rpc::{RequestContext, RpcFailure, RpcResponse};
-use generated::api::{DemoService, DemoServiceServer, ErrorCode, ReplicaDescriptor};
+use cakemaster_proto::api::{DemoService, DemoServiceServer, ErrorCode, ReplicaDescriptor};
 
 struct Service;
 
@@ -240,11 +252,11 @@ cargo test --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-[`crates/coro-rpc/tests/upstream_golden.rs`](crates/coro-rpc/tests/upstream_golden.rs) 使用 C++ 上游生成的固定字节序列验证类型哈希和编码；[`crates/coro-rpc/tests/end_to_end.rs`](crates/coro-rpc/tests/end_to_end.rs) 验证流水线、错误与 attachment；[`crates/coro-rpc-codegen/tests/codegen.rs`](crates/coro-rpc-codegen/tests/codegen.rs) 验证 Thrift 解析、校验和 stub 生成；[`tests/generated_end_to_end.rs`](tests/generated_end_to_end.rs) 使用同一份生成契约验证 client/server 与业务 struct。`interop/` 中还包含直接编译 yalantinglibs 的向量生成器和双向 C++ peer。
+[`crates/coro-rpc/tests/upstream_golden.rs`](crates/coro-rpc/tests/upstream_golden.rs) 使用 C++ 上游生成的固定字节序列验证类型哈希和编码；[`crates/coro-rpc/tests/end_to_end.rs`](crates/coro-rpc/tests/end_to_end.rs) 验证流水线、错误与 attachment；[`crates/coro-rpc-codegen/tests/codegen.rs`](crates/coro-rpc-codegen/tests/codegen.rs) 验证 Thrift 解析、校验和 stub 生成；[`crates/cakemaster-proto/tests/generated_end_to_end.rs`](crates/cakemaster-proto/tests/generated_end_to_end.rs) 使用同一份生成契约验证 client/server 与业务 struct。`interop/` 中还包含直接编译 yalantinglibs 的向量生成器和双向 C++ peer。
 
 ## Mooncake Master RPC 性能对比
 
-[`idl/mooncake_master.thrift`](idl/mooncake_master.thrift) 和 [`src/bin/mooncake_benchmark.rs`](src/bin/mooncake_benchmark.rs) 提供与 Mooncake `WrappedMasterService` 相同 wire 的 Rust peer，[`interop/mooncake_benchmark.cpp`](interop/mooncake_benchmark.cpp) 是使用 Mooncake 自带 yalantinglibs 的 C++ peer。两端只实现最小合法返回值，不维护 segment、replica、lease 或 object 状态，适合单独比较 RPC framing、struct_pack 编解码、调度和网络开销。
+[`crates/cakemaster-proto/idl/mooncake_master.thrift`](crates/cakemaster-proto/idl/mooncake_master.thrift) 和 [`crates/cakemaster-server/src/bin/mooncake_benchmark.rs`](crates/cakemaster-server/src/bin/mooncake_benchmark.rs) 提供与 Mooncake `WrappedMasterService` 相同 wire 的 Rust peer，[`interop/mooncake_benchmark.cpp`](interop/mooncake_benchmark.cpp) 是使用 Mooncake 自带 yalantinglibs 的 C++ peer。两端只实现最小合法返回值，不维护 segment、replica、lease 或 object 状态，适合单独比较 RPC framing、struct_pack 编解码、调度和网络开销。
 
 推理框架的三个操作会落到以下五个 Master RPC：
 
@@ -259,7 +271,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 构建 Rust 与 C++ 版本：
 
 ```bash
-cargo build --release --bin mooncake_benchmark
+cargo build --release -p cakemaster-server --bin mooncake_benchmark
 
 g++ -std=c++20 -O3 -DNDEBUG \
   -I ~/src/cpp/Mooncake/extern/yalantinglibs/include \
@@ -296,7 +308,7 @@ target/release/mooncake_benchmark metadata
 /tmp/mooncake_benchmark metadata
 ```
 
-[`tests/mooncake_wire.rs`](tests/mooncake_wire.rs) 固定了五个接口的 C++ type literal、type hash、route hash 和代表性 `BatchPutEnd` 字节序列。
+[`crates/cakemaster-proto/tests/mooncake_wire.rs`](crates/cakemaster-proto/tests/mooncake_wire.rs) 固定了五个接口的 C++ type literal、type hash、route hash 和代表性 `BatchPutEnd` 字节序列。
 
 ## 本机性能对比
 
