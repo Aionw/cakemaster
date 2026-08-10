@@ -213,6 +213,46 @@ impl CxlSegmentSpec {
     }
 }
 
+/// A client-local SSD target managed through asynchronous offload admission.
+///
+/// Capacity is intentionally not part of the mount specification: clients
+/// report it independently through heartbeats, just as Mooncake does.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalSsdSegmentSpec {
+    metadata: SegmentMetadata,
+    initial_offload_enabled: bool,
+}
+
+impl LocalSsdSegmentSpec {
+    pub fn new(identity: SegmentIdentity, initial_offload_enabled: bool) -> Self {
+        Self {
+            metadata: SegmentMetadata::new(identity),
+            initial_offload_enabled,
+        }
+    }
+
+    pub fn with_topology(mut self, topology: SegmentTopology) -> Self {
+        self.metadata = self.metadata.with_topology(topology);
+        self
+    }
+
+    pub const fn metadata(&self) -> &SegmentMetadata {
+        &self.metadata
+    }
+
+    pub const fn identity(&self) -> &SegmentIdentity {
+        self.metadata.identity()
+    }
+
+    pub const fn initial_offload_enabled(&self) -> bool {
+        self.initial_offload_enabled
+    }
+
+    pub const fn topology(&self) -> &SegmentTopology {
+        self.metadata.topology()
+    }
+}
+
 /// Concrete storage implementation mounted in a [`SegmentPool`](super::SegmentPool).
 ///
 /// A segment kind describes how capacity is provided. It is deliberately
@@ -224,6 +264,7 @@ pub enum SegmentKind {
     Memory,
     Cxl,
     Nof,
+    LocalSsd,
 }
 
 /// Replica family produced by a segment.
@@ -235,6 +276,7 @@ pub enum SegmentKind {
 pub enum ReplicaClass {
     Memory,
     Nof,
+    LocalSsd,
 }
 
 /// Identity of the physical capacity provider behind a logical segment.
@@ -248,6 +290,7 @@ pub enum SegmentResourceId {
     Dedicated(SegmentId),
     CxlArena(CxlArenaId),
     NofNamespace(TransportEndpoint),
+    LocalSsd(super::identity::ClientId),
 }
 
 /// Type-safe specification for every segment backend known to the pool.
@@ -261,6 +304,7 @@ pub enum SegmentSpec {
     Memory(MemorySegmentSpec),
     Cxl(CxlSegmentSpec),
     Nof(NofSegmentSpec),
+    LocalSsd(LocalSsdSegmentSpec),
 }
 
 impl SegmentSpec {
@@ -269,6 +313,7 @@ impl SegmentSpec {
             Self::Memory(_) => SegmentKind::Memory,
             Self::Cxl(_) => SegmentKind::Cxl,
             Self::Nof(_) => SegmentKind::Nof,
+            Self::LocalSsd(_) => SegmentKind::LocalSsd,
         }
     }
 
@@ -276,6 +321,7 @@ impl SegmentSpec {
         match self {
             Self::Memory(_) | Self::Cxl(_) => ReplicaClass::Memory,
             Self::Nof(_) => ReplicaClass::Nof,
+            Self::LocalSsd(_) => ReplicaClass::LocalSsd,
         }
     }
 
@@ -292,6 +338,7 @@ impl SegmentSpec {
             Self::Memory(spec) => SegmentResourceId::Dedicated(spec.identity().id()),
             Self::Cxl(spec) => SegmentResourceId::CxlArena(spec.arena().id().clone()),
             Self::Nof(spec) => SegmentResourceId::NofNamespace(spec.transport().clone()),
+            Self::LocalSsd(spec) => SegmentResourceId::LocalSsd(spec.identity().owner()),
         }
     }
 
@@ -300,35 +347,44 @@ impl SegmentSpec {
             Self::Memory(spec) => spec.metadata(),
             Self::Cxl(spec) => spec.metadata(),
             Self::Nof(spec) => spec.metadata(),
+            Self::LocalSsd(spec) => spec.metadata(),
         }
     }
 
     pub const fn memory(&self) -> Option<&MemorySegmentSpec> {
         match self {
             Self::Memory(spec) => Some(spec),
-            Self::Cxl(_) | Self::Nof(_) => None,
+            Self::Cxl(_) | Self::Nof(_) | Self::LocalSsd(_) => None,
         }
     }
 
     pub const fn cxl(&self) -> Option<&CxlSegmentSpec> {
         match self {
             Self::Cxl(spec) => Some(spec),
-            Self::Memory(_) | Self::Nof(_) => None,
+            Self::Memory(_) | Self::Nof(_) | Self::LocalSsd(_) => None,
         }
     }
 
     pub const fn nof(&self) -> Option<&NofSegmentSpec> {
         match self {
-            Self::Memory(_) | Self::Cxl(_) => None,
+            Self::Memory(_) | Self::Cxl(_) | Self::LocalSsd(_) => None,
             Self::Nof(spec) => Some(spec),
         }
     }
 
-    pub(crate) const fn direct_region(&self) -> MemoryRegion {
+    pub const fn local_ssd(&self) -> Option<&LocalSsdSegmentSpec> {
         match self {
-            Self::Memory(spec) => spec.region(),
-            Self::Cxl(spec) => MemoryRegion::new(0, spec.arena().capacity_bytes()),
-            Self::Nof(spec) => spec.region(),
+            Self::LocalSsd(spec) => Some(spec),
+            Self::Memory(_) | Self::Cxl(_) | Self::Nof(_) => None,
+        }
+    }
+
+    pub(crate) const fn direct_region(&self) -> Option<MemoryRegion> {
+        match self {
+            Self::Memory(spec) => Some(spec.region()),
+            Self::Cxl(spec) => Some(MemoryRegion::new(0, spec.arena().capacity_bytes())),
+            Self::Nof(spec) => Some(spec.region()),
+            Self::LocalSsd(_) => None,
         }
     }
 }
@@ -348,5 +404,11 @@ impl From<NofSegmentSpec> for SegmentSpec {
 impl From<CxlSegmentSpec> for SegmentSpec {
     fn from(spec: CxlSegmentSpec) -> Self {
         Self::Cxl(spec)
+    }
+}
+
+impl From<LocalSsdSegmentSpec> for SegmentSpec {
+    fn from(spec: LocalSsdSegmentSpec) -> Self {
+        Self::LocalSsd(spec)
     }
 }

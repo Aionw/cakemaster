@@ -1,7 +1,8 @@
-use super::{AttachOutcome, PoolSnapshot, SegmentCandidate};
+use super::{AttachOutcome, OffloadSnapshot, PoolSnapshot, SegmentCandidate};
 use crate::segment::descriptor::MemoryRegion;
-use crate::segment::error::{AttachError, LifecycleError, ReserveError};
+use crate::segment::error::{AttachError, LifecycleError, LocalSsdError, ReserveError};
 use crate::segment::identity::{ClientId, SegmentId};
+use crate::segment::local_ssd::{AdmissionFailure, LocalSsdCapacity, LocalSsdStats, OffloadPermit};
 use crate::segment::offset_allocator::ByteAllocator;
 use crate::segment::reservation::{Reservation, ReservationCounter};
 use crate::segment::spec::{CxlArenaId, CxlArenaSpec, ReplicaClass, SegmentSpec};
@@ -19,6 +20,7 @@ pub(super) struct Catalog {
     segments: HashMap<SegmentId, Arc<Segment>>,
     cxl_arenas: HashMap<CxlArenaId, CxlArena>,
     allocatable: HashMap<ReplicaClass, Arc<[SegmentCandidate]>>,
+    offload_targets: Arc<[SegmentCandidate]>,
 }
 
 struct CxlArena {
@@ -30,9 +32,14 @@ pub(super) struct Segment {
     pool_id: u64,
     spec: Arc<SegmentSpec>,
     phase: Mutex<SegmentState>,
-    allocator: ByteAllocator,
+    backend: SegmentBackend,
     live_reservations: Arc<AtomicU64>,
     accepting: AtomicBool,
+}
+
+enum SegmentBackend {
+    Direct(ByteAllocator),
+    LocalSsd(LocalSsdCapacity),
 }
 
 struct CatalogMutation<'a> {
@@ -47,6 +54,7 @@ impl Catalog {
             segments: HashMap::new(),
             cxl_arenas: HashMap::new(),
             allocatable: HashMap::new(),
+            offload_targets: Arc::from([]),
         }
     }
 
@@ -65,8 +73,8 @@ impl Catalog {
 
         self.validate_resource_conflicts(&spec)?;
 
-        let allocator = self.allocator_for(&spec, max_allocator_nodes)?;
-        let candidate = self.mutation().insert(spec, allocator);
+        let backend = self.backend_for(&spec, max_allocator_nodes)?;
+        let candidate = self.mutation().insert(spec, backend);
         Ok(AttachOutcome::Attached(candidate))
     }
 
@@ -82,6 +90,13 @@ impl Catalog {
         }
     }
 
+    pub(super) fn offload_snapshot(&self) -> OffloadSnapshot {
+        OffloadSnapshot {
+            generation: self.generation,
+            candidates: self.offload_targets.clone(),
+        }
+    }
+
     pub(super) fn candidate(&self, id: SegmentId) -> Option<SegmentCandidate> {
         self.segments.get(&id).map(|segment| SegmentCandidate {
             pool_id: self.pool_id,
@@ -91,6 +106,28 @@ impl Catalog {
 
     pub(super) fn len(&self) -> usize {
         self.segments.len()
+    }
+
+    pub(super) fn report_local_ssd_capacity(
+        &self,
+        owner: ClientId,
+        id: SegmentId,
+        capacity_bytes: u64,
+    ) -> Result<(), LocalSsdError> {
+        self.owned_local_ssd_segment(owner, id)?
+            .report_local_ssd_capacity(capacity_bytes)
+    }
+
+    pub(super) fn set_local_ssd_offload_enabled(
+        &mut self,
+        owner: ClientId,
+        id: SegmentId,
+        enabled: bool,
+    ) -> Result<(), LocalSsdError> {
+        self.owned_local_ssd_segment(owner, id)?
+            .set_local_ssd_offload_enabled(enabled)?;
+        self.rebuild_snapshot();
+        Ok(())
     }
 
     pub(super) fn quiesce(&mut self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
@@ -107,6 +144,30 @@ impl Catalog {
 
     pub(super) fn remove(&mut self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
         self.mutation().remove(owner, id)
+    }
+
+    fn owned_local_ssd_segment(
+        &self,
+        owner: ClientId,
+        id: SegmentId,
+    ) -> Result<Arc<Segment>, LocalSsdError> {
+        let segment = self
+            .segments
+            .get(&id)
+            .cloned()
+            .ok_or(LocalSsdError::NotFound(id))?;
+        let expected = segment.spec.identity().owner();
+        if expected != owner {
+            return Err(LocalSsdError::OwnerMismatch {
+                segment: id,
+                expected,
+                actual: owner,
+            });
+        }
+        if !matches!(&segment.backend, SegmentBackend::LocalSsd(_)) {
+            return Err(LocalSsdError::NotLocalSsd(id));
+        }
+        Ok(segment)
     }
 
     fn validate_resource_conflicts(&self, spec: &SegmentSpec) -> Result<(), AttachError> {
@@ -137,20 +198,38 @@ impl Catalog {
                 }
             }
             SegmentSpec::Cxl(_) => {}
+            SegmentSpec::LocalSsd(spec) => {
+                if let Some(existing) = self.segments.values().find_map(|segment| {
+                    let existing = segment.spec.local_ssd()?;
+                    (existing.identity().owner() == spec.identity().owner())
+                        .then(|| existing.identity().id())
+                }) {
+                    return Err(AttachError::DuplicateLocalSsdOwner { existing });
+                }
+            }
         }
         Ok(())
     }
 
-    fn allocator_for(
+    fn backend_for(
         &mut self,
         spec: &SegmentSpec,
         max_allocator_nodes: u32,
-    ) -> Result<ByteAllocator, AttachError> {
+    ) -> Result<SegmentBackend, AttachError> {
+        if let SegmentSpec::LocalSsd(local_ssd) = spec {
+            return Ok(SegmentBackend::LocalSsd(LocalSsdCapacity::new(
+                local_ssd.initial_offload_enabled(),
+            )));
+        }
+
         let SegmentSpec::Cxl(cxl) = spec else {
-            return Ok(ByteAllocator::new(
-                spec.direct_region().size(),
+            let region = spec
+                .direct_region()
+                .expect("non-LocalSSD segments have a direct byte range");
+            return Ok(SegmentBackend::Direct(ByteAllocator::new(
+                region.size(),
                 max_allocator_nodes,
-            ));
+            )));
         };
 
         if let Some(arena) = self.cxl_arenas.get(cxl.arena().id()) {
@@ -159,7 +238,7 @@ impl Catalog {
                     arena: cxl.arena().id().clone(),
                 });
             }
-            return Ok(arena.allocator.clone());
+            return Ok(SegmentBackend::Direct(arena.allocator.clone()));
         }
 
         let allocator = ByteAllocator::new(cxl.arena().capacity_bytes(), max_allocator_nodes);
@@ -170,7 +249,7 @@ impl Catalog {
                 allocator: allocator.clone(),
             },
         );
-        Ok(allocator)
+        Ok(SegmentBackend::Direct(allocator))
     }
 
     fn mutation(&mut self) -> CatalogMutation<'_> {
@@ -179,22 +258,33 @@ impl Catalog {
 
     fn rebuild_snapshot(&mut self) {
         let mut candidates_by_class: HashMap<_, Vec<_>> = HashMap::new();
+        let mut offload_targets = Vec::new();
         for segment in self
             .segments
             .values()
             .filter(|segment| segment.accepting.load(Ordering::Acquire))
         {
-            candidates_by_class
-                .entry(segment.spec.replica_class())
-                .or_default()
-                .push(SegmentCandidate {
-                    pool_id: self.pool_id,
-                    segment: segment.clone(),
-                });
+            let candidate = SegmentCandidate {
+                pool_id: self.pool_id,
+                segment: segment.clone(),
+            };
+            match &segment.backend {
+                SegmentBackend::LocalSsd(capacity) if capacity.offload_enabled() => {
+                    offload_targets.push(candidate);
+                }
+                SegmentBackend::LocalSsd(_) => {}
+                SegmentBackend::Direct(_) => {
+                    candidates_by_class
+                        .entry(segment.spec.replica_class())
+                        .or_default()
+                        .push(candidate);
+                }
+            }
         }
         for candidates in candidates_by_class.values_mut() {
             candidates.sort_unstable_by_key(SegmentCandidate::id);
         }
+        offload_targets.sort_unstable_by_key(SegmentCandidate::id);
 
         let unchanged = candidates_by_class.len() == self.allocatable.len()
             && candidates_by_class
@@ -209,7 +299,8 @@ impl Catalog {
                                     Arc::ptr_eq(&candidate.segment, &current.segment)
                                 })
                     })
-                });
+                })
+            && same_candidates(&offload_targets, &self.offload_targets);
         if unchanged {
             return;
         }
@@ -217,14 +308,15 @@ impl Catalog {
             .into_iter()
             .map(|(replica_class, candidates)| (replica_class, Arc::from(candidates)))
             .collect();
+        self.offload_targets = Arc::from(offload_targets);
         self.generation = self.generation.wrapping_add(1);
     }
 }
 
 impl CatalogMutation<'_> {
-    fn insert(&mut self, spec: SegmentSpec, allocator: ByteAllocator) -> SegmentCandidate {
+    fn insert(&mut self, spec: SegmentSpec, backend: SegmentBackend) -> SegmentCandidate {
         let spec = Arc::new(spec);
-        let segment = Arc::new(Segment::new(self.catalog.pool_id, spec, allocator));
+        let segment = Arc::new(Segment::new(self.catalog.pool_id, spec, backend));
         let candidate = SegmentCandidate {
             pool_id: self.catalog.pool_id,
             segment: segment.clone(),
@@ -282,12 +374,12 @@ impl Drop for CatalogMutation<'_> {
 }
 
 impl Segment {
-    fn new(pool_id: u64, spec: Arc<SegmentSpec>, allocator: ByteAllocator) -> Self {
+    fn new(pool_id: u64, spec: Arc<SegmentSpec>, backend: SegmentBackend) -> Self {
         Self {
             pool_id,
             spec,
             phase: Mutex::new(SegmentState::Accepting),
-            allocator,
+            backend,
             live_reservations: Arc::new(AtomicU64::new(0)),
             accepting: AtomicBool::new(true),
         }
@@ -303,13 +395,18 @@ impl Segment {
 
     #[inline]
     pub(super) fn reserve(self: &Arc<Self>, bytes: u64) -> Result<Reservation, ReserveError> {
+        let SegmentBackend::Direct(allocator) = &self.backend else {
+            return Err(ReserveError::NotDirectlyAllocatable(
+                self.spec.identity().id(),
+            ));
+        };
         if bytes == 0 {
             return Err(ReserveError::ZeroSize);
         }
         if !self.accepting.load(Ordering::Acquire) {
             return Err(ReserveError::NotAccepting(self.spec.identity().id()));
         }
-        if !self.allocator.may_satisfy(bytes) {
+        if !allocator.may_satisfy(bytes) {
             return Err(ReserveError::OutOfSpace(self.spec.identity().id()));
         }
 
@@ -318,13 +415,13 @@ impl Segment {
             return Err(ReserveError::NotAccepting(self.spec.identity().id()));
         }
 
-        let allocation = self
-            .allocator
+        let allocation = allocator
             .allocate_after_precheck(bytes)
             .ok_or(ReserveError::OutOfSpace(self.spec.identity().id()))?;
         let buffer_address = match self
             .spec
             .direct_region()
+            .expect("direct backends have a byte range")
             .base()
             .checked_add(allocation.offset())
         {
@@ -340,6 +437,65 @@ impl Segment {
             _counter: counter,
             region: MemoryRegion::new(buffer_address, bytes),
         })
+    }
+
+    pub(super) fn report_local_ssd_capacity(
+        &self,
+        capacity_bytes: u64,
+    ) -> Result<(), LocalSsdError> {
+        let SegmentBackend::LocalSsd(capacity) = &self.backend else {
+            return Err(LocalSsdError::NotLocalSsd(self.spec.identity().id()));
+        };
+        capacity.report(capacity_bytes);
+        Ok(())
+    }
+
+    pub(super) fn set_local_ssd_offload_enabled(&self, enabled: bool) -> Result<(), LocalSsdError> {
+        let SegmentBackend::LocalSsd(capacity) = &self.backend else {
+            return Err(LocalSsdError::NotLocalSsd(self.spec.identity().id()));
+        };
+        capacity.set_offload_enabled(enabled);
+        Ok(())
+    }
+
+    pub(super) fn admit_offload(
+        self: &Arc<Self>,
+        bytes: u64,
+    ) -> Result<OffloadPermit, LocalSsdError> {
+        let id = self.spec.identity().id();
+        let SegmentBackend::LocalSsd(capacity) = &self.backend else {
+            return Err(LocalSsdError::NotLocalSsd(id));
+        };
+        if bytes == 0 {
+            return Err(LocalSsdError::ZeroSize);
+        }
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(LocalSsdError::NotAccepting(id));
+        }
+
+        let phase = self.phase.lock();
+        if *phase != SegmentState::Accepting {
+            return Err(LocalSsdError::NotAccepting(id));
+        }
+        let allocation = capacity.admit(bytes).map_err(|error| match error {
+            AdmissionFailure::OffloadDisabled => LocalSsdError::OffloadDisabled(id),
+            AdmissionFailure::CapacityNotReported => LocalSsdError::CapacityNotReported(id),
+            AdmissionFailure::OutOfSpace => LocalSsdError::OutOfSpace(id),
+        })?;
+        let permit = OffloadPermit::new(
+            allocation,
+            self.live_reservations.clone(),
+            self.spec.clone(),
+        );
+        drop(phase);
+        Ok(permit)
+    }
+
+    pub(super) fn local_ssd_stats(&self) -> Option<LocalSsdStats> {
+        match &self.backend {
+            SegmentBackend::Direct(_) => None,
+            SegmentBackend::LocalSsd(capacity) => Some(capacity.stats()),
+        }
     }
 
     fn quiesce(&self) {
@@ -380,18 +536,40 @@ impl Segment {
 
     pub(super) fn stats(&self) -> SegmentStats {
         let state = *self.phase.lock();
-        let stats = self.allocator.stats();
+        let space = match &self.backend {
+            SegmentBackend::Direct(allocator) => {
+                let stats = allocator.stats();
+                SegmentSpaceStats {
+                    capacity_bytes: stats.capacity,
+                    used_bytes: stats.used_bytes,
+                    available_bytes: stats.available_bytes,
+                    largest_free_region_bytes: stats.largest_free_region,
+                }
+            }
+            SegmentBackend::LocalSsd(capacity) => {
+                let stats = capacity.stats();
+                SegmentSpaceStats {
+                    capacity_bytes: stats.capacity_bytes,
+                    used_bytes: stats.admitted_bytes,
+                    available_bytes: stats.available_bytes,
+                    largest_free_region_bytes: 0,
+                }
+            }
+        };
         SegmentStats {
-            space: SegmentSpaceStats {
-                capacity_bytes: stats.capacity,
-                used_bytes: stats.used_bytes,
-                available_bytes: stats.available_bytes,
-                largest_free_region_bytes: stats.largest_free_region,
-            },
+            space,
             reservations: SegmentReservationStats {
                 live: self.live_reservations.load(Ordering::Acquire),
             },
             state,
         }
     }
+}
+
+fn same_candidates(left: &[SegmentCandidate], right: &[SegmentCandidate]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(left, right)| Arc::ptr_eq(&left.segment, &right.segment))
 }

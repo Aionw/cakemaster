@@ -71,6 +71,9 @@ impl Reservation {
             SegmentSpec::Nof(spec) => {
                 ReservationDescriptorRef::Nof(NofDescriptorRef::new(self.region, spec.transport()))
             }
+            SegmentSpec::LocalSsd(_) => {
+                unreachable!("LocalSSD capacity cannot produce direct reservations")
+            }
         }
     }
 

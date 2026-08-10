@@ -1,7 +1,7 @@
 use crate::segment::placement::ReservationSet;
 use crate::segment::{
-    MemoryDescriptor, MemoryDescriptorRef, NofDescriptor, NofDescriptorRef, ReplicaClass,
-    Reservation, SegmentId,
+    LocalSsdDescriptor, LocalSsdDescriptorRef, LocalSsdLease, MemoryDescriptor,
+    MemoryDescriptorRef, NofDescriptor, NofDescriptorRef, ReplicaClass, Reservation, SegmentId,
 };
 use std::fmt;
 
@@ -136,11 +136,63 @@ impl fmt::Debug for NofReplica {
     }
 }
 
+pub struct LocalSsdReplica {
+    id: ReplicaId,
+    lease: LocalSsdLease,
+}
+
+impl LocalSsdReplica {
+    pub const fn new(id: ReplicaId, lease: LocalSsdLease) -> Self {
+        Self { id, lease }
+    }
+
+    pub const fn id(&self) -> ReplicaId {
+        self.id
+    }
+
+    pub fn segment_id(&self) -> SegmentId {
+        self.lease.segment_id()
+    }
+
+    pub const fn reserved_bytes(&self) -> u64 {
+        self.lease.bytes()
+    }
+
+    pub const fn capacity_bytes(&self) -> u64 {
+        self.lease.bytes()
+    }
+
+    pub fn descriptor(&self) -> LocalSsdDescriptorRef<'_> {
+        self.lease.descriptor()
+    }
+
+    pub fn owned_descriptor(&self) -> LocalSsdDescriptor {
+        self.descriptor().to_owned()
+    }
+
+    pub(crate) fn into_lease(self) -> LocalSsdLease {
+        self.lease
+    }
+}
+
+impl fmt::Debug for LocalSsdReplica {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LocalSsdReplica")
+            .field("id", &self.id)
+            .field("segment_id", &self.segment_id())
+            .field("reserved_bytes", &self.reserved_bytes())
+            .field("descriptor", &self.descriptor())
+            .finish()
+    }
+}
+
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ReplicaLease {
     Memory(MemoryReplica),
     Nof(NofReplica),
+    LocalSsd(LocalSsdReplica),
 }
 
 impl ReplicaLease {
@@ -148,6 +200,7 @@ impl ReplicaLease {
         match self {
             Self::Memory(replica) => replica.id(),
             Self::Nof(replica) => replica.id(),
+            Self::LocalSsd(replica) => replica.id(),
         }
     }
 
@@ -155,6 +208,7 @@ impl ReplicaLease {
         match self {
             Self::Memory(replica) => replica.segment_id(),
             Self::Nof(replica) => replica.segment_id(),
+            Self::LocalSsd(replica) => replica.segment_id(),
         }
     }
 
@@ -162,6 +216,7 @@ impl ReplicaLease {
         match self {
             Self::Memory(replica) => replica.reserved_bytes(),
             Self::Nof(replica) => replica.reserved_bytes(),
+            Self::LocalSsd(replica) => replica.reserved_bytes(),
         }
     }
 
@@ -169,20 +224,28 @@ impl ReplicaLease {
         match self {
             Self::Memory(replica) => replica.capacity_bytes(),
             Self::Nof(replica) => replica.capacity_bytes(),
+            Self::LocalSsd(replica) => replica.capacity_bytes(),
         }
     }
 
     pub fn memory(&self) -> Option<&MemoryReplica> {
         match self {
             Self::Memory(replica) => Some(replica),
-            Self::Nof(_) => None,
+            Self::Nof(_) | Self::LocalSsd(_) => None,
         }
     }
 
     pub fn nof(&self) -> Option<&NofReplica> {
         match self {
-            Self::Memory(_) => None,
+            Self::Memory(_) | Self::LocalSsd(_) => None,
             Self::Nof(replica) => Some(replica),
+        }
+    }
+
+    pub fn local_ssd(&self) -> Option<&LocalSsdReplica> {
+        match self {
+            Self::Memory(_) | Self::Nof(_) => None,
+            Self::LocalSsd(replica) => Some(replica),
         }
     }
 }
@@ -203,6 +266,7 @@ enum ReplicaStorage {
 #[derive(Default)]
 pub(crate) struct ReplicaReclaimBatch {
     direct: Vec<Reservation>,
+    local_ssd: Vec<LocalSsdLease>,
 }
 
 impl ReplicaSet {
@@ -245,6 +309,9 @@ impl ReplicaSet {
                         )),
                         ReplicaClass::Nof => {
                             ReplicaLease::Nof(NofReplica::new(ReplicaId::new(id), reservation))
+                        }
+                        ReplicaClass::LocalSsd => {
+                            unreachable!("LocalSSD leases are not direct reservations")
                         }
                     }
                 }),
@@ -294,6 +361,7 @@ impl ReplicaReclaimBatch {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             direct: Vec::with_capacity(capacity),
+            local_ssd: Vec::with_capacity(capacity),
         }
     }
 
@@ -305,10 +373,12 @@ impl ReplicaReclaimBatch {
         match replica {
             ReplicaLease::Memory(replica) => self.direct.push(replica.into_reservation()),
             ReplicaLease::Nof(replica) => self.direct.push(replica.into_reservation()),
+            ReplicaLease::LocalSsd(replica) => self.local_ssd.push(replica.into_lease()),
         }
     }
 
     pub(crate) fn release(self) {
         Reservation::release_batch(self.direct);
+        drop(self.local_ssd);
     }
 }

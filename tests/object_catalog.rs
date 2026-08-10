@@ -3,15 +3,16 @@ use cakemaster::object::error::{
 };
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
-    MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
-    ObjectIdentity, ObjectLookup, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
+    LocalSsdReplica, MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit,
+    ObjectContent, ObjectIdentity, ObjectLookup, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
 };
 use cakemaster::segment::placement::{
     AllocationSpec, PlacementRequest, ReplicaAllocator, ReplicaPolicy,
 };
 use cakemaster::segment::{
-    ClientId, MemoryRegion, MemorySegmentSpec, NofSegmentSpec, ReplicaClass, SegmentId,
-    SegmentIdentity, SegmentPool, SegmentPoolConfig, TransportEndpoint, TransportProtocol,
+    ClientId, LocalSsdSegmentSpec, MemoryRegion, MemorySegmentSpec, NofSegmentSpec, ReplicaClass,
+    SegmentId, SegmentIdentity, SegmentPool, SegmentPoolConfig, TransportEndpoint,
+    TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
@@ -106,6 +107,58 @@ fn replica_set_preserves_nof_reservations_as_nof_replicas() {
     assert_eq!(nof.descriptor().region().base(), 0);
     drop(replicas);
     assert_eq!(pool.stats(nof_id).unwrap().reservations.live, 0);
+}
+
+#[test]
+fn pending_object_reclamation_releases_local_ssd_capacity() {
+    let pool = pool(1 << 20, 64);
+    let local_id = SegmentId::new(9, 3);
+    let candidate = pool
+        .attach(LocalSsdSegmentSpec::new(
+            SegmentIdentity::new(local_id, OWNER, "catalog-local-ssd"),
+            true,
+        ))
+        .unwrap()
+        .candidate()
+        .clone();
+    pool.report_local_ssd_capacity(OWNER, local_id, 1 << 20)
+        .unwrap();
+    let lease = pool
+        .admit_offload(&candidate, 4096)
+        .unwrap()
+        .commit("file://catalog-local/object")
+        .unwrap();
+    let replicas = ReplicaSet::one(ReplicaLease::LocalSsd(LocalSsdReplica::new(
+        ReplicaId::new(1),
+        lease,
+    )));
+    let local_replica = replicas.replicas()[0].local_ssd().unwrap();
+    assert_eq!(local_replica.segment_id(), local_id);
+    assert_eq!(local_replica.capacity_bytes(), 4096);
+    assert_eq!(
+        local_replica.descriptor().transport_endpoint(),
+        "file://catalog-local/object"
+    );
+
+    let catalog = ObjectCatalog::with_config(
+        ObjectCatalogConfig::new(16)
+            .with_pending_timeout(1)
+            .with_empty_slot_grace(1),
+    )
+    .unwrap();
+    let ticket = catalog
+        .claim_put(identity("local-ssd-pending"), owner(), CatalogTick::ZERO)
+        .unwrap()
+        .stage(ObjectContent::new(4096), replicas)
+        .unwrap();
+    drop(ticket);
+    assert_eq!(candidate.local_ssd_stats().unwrap().committed_bytes, 4096);
+
+    let report = catalog.collect_step(CatalogTick::new(1), CollectBudget::new(8, 8, 0));
+    assert_eq!(report.expired_pending, 1);
+    assert_eq!(report.reclaimed_objects, 1);
+    assert_eq!(candidate.local_ssd_stats().unwrap().committed_bytes, 0);
+    assert_eq!(candidate.stats().reservations.live, 0);
 }
 
 #[test]

@@ -66,6 +66,8 @@ pub enum AttachError {
     EmptyCxlArenaId,
     #[error("CXL arena {arena:?} is already registered with different capacity")]
     ConflictingCxlArena { arena: CxlArenaId },
+    #[error("client already has LocalSSD segment {existing}")]
+    DuplicateLocalSsdOwner { existing: SegmentId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -95,10 +97,40 @@ pub enum ReserveError {
     ForeignCandidate,
     #[error("segment {0} was not found")]
     NotFound(SegmentId),
+    #[error("segment {0} does not support direct reservations")]
+    NotDirectlyAllocatable(SegmentId),
     #[error("segment {0} is not accepting reservations")]
     NotAccepting(SegmentId),
     #[error("segment {0} has no suitable free range")]
     OutOfSpace(SegmentId),
     #[error("allocated address overflowed in segment {0}")]
     AddressOverflow(SegmentId),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum LocalSsdError {
+    #[error("offload size must not be zero")]
+    ZeroSize,
+    #[error("LocalSSD object transport endpoint must not be empty")]
+    EmptyTransportEndpoint,
+    #[error("segment candidate belongs to another pool")]
+    ForeignCandidate,
+    #[error("segment {0} was not found")]
+    NotFound(SegmentId),
+    #[error("segment {segment} belongs to client {expected}, not {actual}")]
+    OwnerMismatch {
+        segment: SegmentId,
+        expected: ClientId,
+        actual: ClientId,
+    },
+    #[error("segment {0} is not a LocalSSD offload target")]
+    NotLocalSsd(SegmentId),
+    #[error("LocalSSD segment {0} is not accepting offloads")]
+    NotAccepting(SegmentId),
+    #[error("LocalSSD segment {0} has offloading disabled")]
+    OffloadDisabled(SegmentId),
+    #[error("LocalSSD segment {0} has not reported capacity")]
+    CapacityNotReported(SegmentId),
+    #[error("LocalSSD segment {0} has insufficient reported capacity")]
+    OutOfSpace(SegmentId),
 }

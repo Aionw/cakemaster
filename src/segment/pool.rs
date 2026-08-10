@@ -4,12 +4,13 @@ use self::catalog::{Catalog, Segment};
 use super::config::{
     MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE, MIN_ALLOCATOR_NODES_PER_SEGMENT, SegmentPoolConfig,
 };
-use super::error::{AttachError, LifecycleError, PoolConfigError, ReserveError};
+use super::error::{AttachError, LifecycleError, LocalSsdError, PoolConfigError, ReserveError};
 use super::identity::{ClientId, SegmentId};
+use super::local_ssd::{LocalSsdStats, OffloadPermit};
 use super::reservation::Reservation;
 use super::spec::{
-    CxlSegmentSpec, MemorySegmentSpec, NofSegmentSpec, ReplicaClass, SegmentKind, SegmentMetadata,
-    SegmentResourceId, SegmentSpec,
+    CxlSegmentSpec, LocalSsdSegmentSpec, MemorySegmentSpec, NofSegmentSpec, ReplicaClass,
+    SegmentKind, SegmentMetadata, SegmentResourceId, SegmentSpec,
 };
 use super::stats::SegmentStats;
 use parking_lot::RwLock;
@@ -64,8 +65,16 @@ impl SegmentCandidate {
         self.segment.spec().nof()
     }
 
+    pub fn local_ssd_spec(&self) -> Option<&LocalSsdSegmentSpec> {
+        self.segment.spec().local_ssd()
+    }
+
     pub fn stats(&self) -> SegmentStats {
         self.segment.stats()
+    }
+
+    pub fn local_ssd_stats(&self) -> Option<LocalSsdStats> {
+        self.segment.local_ssd_stats()
     }
 }
 
@@ -94,6 +103,41 @@ impl PoolSnapshot {
 
     pub const fn replica_class(&self) -> ReplicaClass {
         self.replica_class
+    }
+
+    pub fn candidates(&self) -> &[SegmentCandidate] {
+        &self.candidates
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, SegmentCandidate> {
+        self.candidates.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.candidates.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.candidates.is_empty()
+    }
+}
+
+/// A point-in-time view of LocalSSD targets eligible for asynchronous
+/// offload admission.
+///
+/// This is deliberately distinct from [`PoolSnapshot`], which is consumed by
+/// direct range placement. Keeping the snapshot types separate prevents a
+/// LocalSSD target from accidentally entering the synchronous reservation
+/// path.
+#[derive(Clone, Debug)]
+pub struct OffloadSnapshot {
+    generation: u64,
+    candidates: Arc<[SegmentCandidate]>,
+}
+
+impl OffloadSnapshot {
+    pub const fn generation(&self) -> u64 {
+        self.generation
     }
 
     pub fn candidates(&self) -> &[SegmentCandidate] {
@@ -171,6 +215,10 @@ impl SegmentPool {
         self.catalog.read().snapshot(replica_class)
     }
 
+    pub fn offload_snapshot(&self) -> OffloadSnapshot {
+        self.catalog.read().offload_snapshot()
+    }
+
     pub fn candidate(&self, id: SegmentId) -> Option<SegmentCandidate> {
         self.catalog.read().candidate(id)
     }
@@ -207,6 +255,46 @@ impl SegmentPool {
         self.reserve(&candidate, bytes)
     }
 
+    /// Updates the heartbeat-reported LocalSSD capacity for one client.
+    pub fn report_local_ssd_capacity(
+        &self,
+        owner: ClientId,
+        id: SegmentId,
+        capacity_bytes: u64,
+    ) -> Result<(), LocalSsdError> {
+        self.catalog
+            .read()
+            .report_local_ssd_capacity(owner, id, capacity_bytes)
+    }
+
+    /// Applies the client's current offload heartbeat state. Disabling a
+    /// target removes it from new offload snapshots while existing permits
+    /// and leases retain their RAII accounting.
+    pub fn set_local_ssd_offload_enabled(
+        &self,
+        owner: ClientId,
+        id: SegmentId,
+        enabled: bool,
+    ) -> Result<(), LocalSsdError> {
+        self.catalog
+            .write()
+            .set_local_ssd_offload_enabled(owner, id, enabled)
+    }
+
+    /// Reserves reported LocalSSD capacity while an asynchronous offload is
+    /// in flight. Dropping the permit aborts the admission; committing it
+    /// returns a lease suitable for publication in an object replica set.
+    pub fn admit_offload(
+        &self,
+        candidate: &SegmentCandidate,
+        bytes: u64,
+    ) -> Result<OffloadPermit, LocalSsdError> {
+        if candidate.pool_id != self.pool_id || candidate.segment.pool_id() != self.pool_id {
+            return Err(LocalSsdError::ForeignCandidate);
+        }
+        candidate.segment.admit_offload(bytes)
+    }
+
     pub fn quiesce(&self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
         self.catalog.write().quiesce(owner, id)
     }
@@ -231,6 +319,7 @@ fn validate_spec(spec: &SegmentSpec) -> Result<(), AttachError> {
         SegmentSpec::Memory(spec) => validate_memory_spec(spec),
         SegmentSpec::Cxl(spec) => validate_cxl_spec(spec),
         SegmentSpec::Nof(spec) => validate_nof_spec(spec),
+        SegmentSpec::LocalSsd(spec) => validate_local_ssd_spec(spec),
     }
 }
 
@@ -262,6 +351,10 @@ fn validate_cxl_spec(spec: &CxlSegmentSpec) -> Result<(), AttachError> {
         return Err(AttachError::ZeroSize);
     }
     Ok(())
+}
+
+fn validate_local_ssd_spec(spec: &LocalSsdSegmentSpec) -> Result<(), AttachError> {
+    validate_metadata(spec.metadata())
 }
 
 fn validate_metadata(metadata: &SegmentMetadata) -> Result<(), AttachError> {

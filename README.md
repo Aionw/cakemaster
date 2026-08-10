@@ -1,6 +1,6 @@
 # cakemaster
 
-Cakemaster workspace 包含高并发 object catalog、memory segment/placement 核心库，以及基于 Tokio 的 yalantinglibs `coro_rpc` v0 兼容实现，可让 Rust 与 C++ `coro_rpc` 客户端/服务端通过 TCP 直接互调。
+Cakemaster workspace 包含高并发 object catalog、异构 segment/placement 核心库，以及基于 Tokio 的 yalantinglibs `coro_rpc` v0 兼容实现，可让 Rust 与 C++ `coro_rpc` 客户端/服务端通过 TCP 直接互调。
 
 兼容基线为 `alibaba/yalantinglibs` 的 `c1cef74057b139944c982d840c09c9940f26e08e` 提交。协议实现依据该版本的 [`coro_rpc_protocol.hpp`](https://github.com/alibaba/yalantinglibs/blob/c1cef74057b139944c982d840c09c9940f26e08e/include/ylt/coro_rpc/impl/protocol/coro_rpc_protocol.hpp) 和 [`struct_pack`](https://alibaba.github.io/yalantinglibs/en/struct_pack/struct_pack_layout.html)。
 
@@ -42,6 +42,8 @@ crates/coro-rpc/examples/   # RPC crate 的 benchmark
 
 依赖方向固定为 server → core/proto → coro-rpc；核心库不依赖 Tokio、RPC 或 codegen。
 领域 API 通过 `object`、`segment` 两个门面暴露；错误、回收控制、placement 和诊断类型位于各自的具名子模块，内部实现文件保持私有。
+
+SegmentPool 对 Memory、CXL、NoF 和 LocalSSD 的领域建模与扩展约束见 [`docs/segment_pool_backends.md`](docs/segment_pool_backends.md)。
 
 核心类型保持短路径，扩展接口按职责导入：
 

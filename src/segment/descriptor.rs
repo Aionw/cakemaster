@@ -216,3 +216,65 @@ impl<'a> ReservationDescriptorRef<'a> {
         }
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LocalSsdDescriptor {
+    client_id: super::identity::ClientId,
+    object_size: u64,
+    transport_endpoint: Arc<str>,
+}
+
+impl LocalSsdDescriptor {
+    pub const fn client_id(&self) -> super::identity::ClientId {
+        self.client_id
+    }
+
+    pub const fn object_size(&self) -> u64 {
+        self.object_size
+    }
+
+    pub fn transport_endpoint(&self) -> &str {
+        &self.transport_endpoint
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalSsdDescriptorRef<'a> {
+    client_id: super::identity::ClientId,
+    object_size: u64,
+    transport_endpoint: &'a str,
+}
+
+impl<'a> LocalSsdDescriptorRef<'a> {
+    pub(crate) const fn new(
+        client_id: super::identity::ClientId,
+        object_size: u64,
+        transport_endpoint: &'a str,
+    ) -> Self {
+        Self {
+            client_id,
+            object_size,
+            transport_endpoint,
+        }
+    }
+
+    pub const fn client_id(self) -> super::identity::ClientId {
+        self.client_id
+    }
+
+    pub const fn object_size(self) -> u64 {
+        self.object_size
+    }
+
+    pub const fn transport_endpoint(self) -> &'a str {
+        self.transport_endpoint
+    }
+
+    pub fn to_owned(self) -> LocalSsdDescriptor {
+        LocalSsdDescriptor {
+            client_id: self.client_id,
+            object_size: self.object_size,
+            transport_endpoint: Arc::from(self.transport_endpoint),
+        }
+    }
+}

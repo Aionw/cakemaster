@@ -1,5 +1,5 @@
 use cakemaster::segment::error::{
-    AttachError, LifecycleError, ParseTransportProtocolError, ReserveError,
+    AttachError, LifecycleError, LocalSsdError, ParseTransportProtocolError, ReserveError,
 };
 use cakemaster::segment::placement::{
     AllocationSpec, FailureDomain, FulfillmentPolicy, PlacementConstraints, PlacementError,
@@ -7,10 +7,10 @@ use cakemaster::segment::placement::{
 };
 use cakemaster::segment::stats::SegmentState;
 use cakemaster::segment::{
-    AttachOutcome, ClientId, CxlArenaId, CxlArenaSpec, CxlSegmentSpec, MemoryRegion,
-    MemorySegmentSpec, NofSegmentSpec, ReplicaClass, SegmentId, SegmentIdentity, SegmentKind,
-    SegmentPool, SegmentPoolConfig, SegmentResourceId, SegmentTopology, TransportEndpoint,
-    TransportProtocol,
+    AttachOutcome, ClientId, CxlArenaId, CxlArenaSpec, CxlSegmentSpec, LocalSsdSegmentSpec,
+    MemoryRegion, MemorySegmentSpec, NofSegmentSpec, ReplicaClass, SegmentId, SegmentIdentity,
+    SegmentKind, SegmentPool, SegmentPoolConfig, SegmentResourceId, SegmentTopology,
+    TransportEndpoint, TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
@@ -46,6 +46,14 @@ fn cxl_spec(index: u64, name: &str, arena: CxlArenaSpec, host: &str) -> CxlSegme
     CxlSegmentSpec::new(
         SegmentIdentity::new(SegmentId::new(3, index), OWNER, name),
         arena,
+    )
+    .with_topology(SegmentTopology::on_host(host))
+}
+
+fn local_ssd_spec(index: u64, owner: ClientId, enabled: bool, host: &str) -> LocalSsdSegmentSpec {
+    LocalSsdSegmentSpec::new(
+        SegmentIdentity::new(SegmentId::new(4, index), owner, "local-ssd"),
+        enabled,
     )
     .with_topology(SegmentTopology::on_host(host))
 }
@@ -209,6 +217,148 @@ fn cxl_logical_segments_share_one_physical_arena() {
         pool.attach(cxl_spec(4, "cxl-conflict", conflicting_arena, "host-d"))
             .unwrap_err(),
         AttachError::ConflictingCxlArena { arena: arena_id }
+    );
+}
+
+#[test]
+fn local_ssd_uses_heartbeat_capacity_and_two_phase_offload_leases() {
+    let pool = pool();
+    pool.attach(spec(1, "memory", "host-a")).unwrap();
+    let local_spec = local_ssd_spec(1, OWNER, true, "host-a");
+    let id = local_spec.identity().id();
+    let candidate = pool.attach(local_spec).unwrap().candidate().clone();
+
+    assert_eq!(candidate.kind(), SegmentKind::LocalSsd);
+    assert_eq!(candidate.replica_class(), ReplicaClass::LocalSsd);
+    assert_eq!(candidate.resource_id(), SegmentResourceId::LocalSsd(OWNER));
+    assert!(candidate.memory_spec().is_none());
+    assert!(candidate.local_ssd_spec().is_some());
+    assert_eq!(pool.snapshot_for(ReplicaClass::Memory).len(), 1);
+    assert!(pool.snapshot_for(ReplicaClass::LocalSsd).is_empty());
+    assert_eq!(pool.offload_snapshot().len(), 1);
+    assert_eq!(
+        pool.reserve(&candidate, 4096).unwrap_err(),
+        ReserveError::NotDirectlyAllocatable(id)
+    );
+    assert_eq!(
+        pool.admit_offload(&candidate, 4096).unwrap_err(),
+        LocalSsdError::CapacityNotReported(id)
+    );
+
+    let other_owner = ClientId::new(70, 110);
+    assert_eq!(
+        pool.report_local_ssd_capacity(other_owner, id, CAPACITY),
+        Err(LocalSsdError::OwnerMismatch {
+            segment: id,
+            expected: OWNER,
+            actual: other_owner,
+        })
+    );
+    pool.report_local_ssd_capacity(OWNER, id, CAPACITY).unwrap();
+    let stats = candidate.local_ssd_stats().unwrap();
+    assert!(stats.offload_enabled);
+    assert!(stats.capacity_reported);
+    assert_eq!(stats.capacity_bytes, CAPACITY);
+    assert_eq!(stats.available_bytes, CAPACITY);
+
+    let permit = pool.admit_offload(&candidate, 4096).unwrap();
+    assert_eq!(permit.segment_id(), id);
+    assert_eq!(permit.bytes(), 4096);
+    let stats = candidate.local_ssd_stats().unwrap();
+    assert_eq!(stats.pending_bytes, 4096);
+    assert_eq!(stats.committed_bytes, 0);
+    assert_eq!(candidate.stats().reservations.live, 1);
+    assert_eq!(
+        pool.admit_offload(&candidate, CAPACITY).unwrap_err(),
+        LocalSsdError::OutOfSpace(id)
+    );
+    permit.abort();
+    assert_eq!(candidate.local_ssd_stats().unwrap().admitted_bytes, 0);
+    assert_eq!(candidate.stats().reservations.live, 0);
+
+    assert_eq!(
+        pool.admit_offload(&candidate, 1024)
+            .unwrap()
+            .commit("")
+            .unwrap_err(),
+        LocalSsdError::EmptyTransportEndpoint
+    );
+    assert_eq!(candidate.local_ssd_stats().unwrap().admitted_bytes, 0);
+
+    let lease = pool
+        .admit_offload(&candidate, 8192)
+        .unwrap()
+        .commit("file://host-a/cache/object")
+        .unwrap();
+    let descriptor = lease.descriptor();
+    assert_eq!(descriptor.client_id(), OWNER);
+    assert_eq!(descriptor.object_size(), 8192);
+    assert_eq!(
+        descriptor.transport_endpoint(),
+        "file://host-a/cache/object"
+    );
+    let stats = candidate.local_ssd_stats().unwrap();
+    assert_eq!(stats.pending_bytes, 0);
+    assert_eq!(stats.committed_bytes, 8192);
+
+    pool.quiesce(OWNER, id).unwrap();
+    assert!(pool.offload_snapshot().is_empty());
+    assert_eq!(
+        pool.admit_offload(&candidate, 64).unwrap_err(),
+        LocalSsdError::NotAccepting(id)
+    );
+    assert_eq!(
+        pool.remove(OWNER, id),
+        Err(LifecycleError::Busy {
+            segment: id,
+            live_allocations: 1,
+        })
+    );
+    drop(lease);
+    pool.remove(OWNER, id).unwrap();
+    assert_eq!(candidate.local_ssd_stats().unwrap().committed_bytes, 0);
+}
+
+#[test]
+fn local_ssd_heartbeat_toggle_updates_only_the_offload_snapshot() {
+    let first_pool = pool();
+    let local_spec = local_ssd_spec(1, OWNER, false, "host-a");
+    let id = local_spec.identity().id();
+    let candidate = first_pool.attach(local_spec).unwrap().candidate().clone();
+    first_pool
+        .report_local_ssd_capacity(OWNER, id, CAPACITY)
+        .unwrap();
+
+    assert!(first_pool.offload_snapshot().is_empty());
+    assert_eq!(
+        first_pool.admit_offload(&candidate, 64).unwrap_err(),
+        LocalSsdError::OffloadDisabled(id)
+    );
+    first_pool
+        .set_local_ssd_offload_enabled(OWNER, id, true)
+        .unwrap();
+    assert_eq!(first_pool.offload_snapshot().len(), 1);
+    assert!(candidate.local_ssd_stats().unwrap().offload_enabled);
+
+    let duplicate = local_ssd_spec(2, OWNER, true, "host-b");
+    assert_eq!(
+        first_pool.attach(duplicate).unwrap_err(),
+        AttachError::DuplicateLocalSsdOwner { existing: id }
+    );
+
+    let second_pool = pool();
+    assert_eq!(
+        second_pool.admit_offload(&candidate, 64).unwrap_err(),
+        LocalSsdError::ForeignCandidate
+    );
+
+    first_pool
+        .set_local_ssd_offload_enabled(OWNER, id, false)
+        .unwrap();
+    assert!(first_pool.offload_snapshot().is_empty());
+    assert_eq!(
+        first_pool.admit_offload(&candidate, 64).unwrap_err(),
+        LocalSsdError::OffloadDisabled(id)
     );
 }
 
