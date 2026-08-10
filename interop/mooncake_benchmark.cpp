@@ -1,13 +1,19 @@
 // Wire-compatible no-state Mooncake Master RPC benchmark peer.
 
 #include <algorithm>
+#include <atomic>
+#include <barrier>
 #include <chrono>
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <limits>
+#include <mutex>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <utility>
 #include <variant>
@@ -24,8 +30,10 @@ namespace mooncake {
 
 enum class ErrorCode : std::int32_t {
   OK = 0,
+  NO_AVAILABLE_HANDLE = -200,
   INVALID_PARAMS = -600,
   OBJECT_NOT_FOUND = -704,
+  OBJECT_ALREADY_EXISTS = -705,
 };
 
 enum class ObjectDataType : std::uint8_t {
@@ -483,6 +491,544 @@ run_client(std::string host, std::string port, std::string operation,
   co_return 0;
 }
 
+struct MixedStats {
+  std::vector<std::uint64_t> put_latencies_ns;
+  std::vector<std::uint64_t> get_latencies_ns;
+  std::vector<std::uint64_t> exists_latencies_ns;
+  std::uint64_t put_batches{0};
+  std::uint64_t get_batches{0};
+  std::uint64_t exists_batches{0};
+  std::uint64_t put_items{0};
+  std::uint64_t put_start_success{0};
+  std::uint64_t put_success{0};
+  std::uint64_t put_no_handle{0};
+  std::uint64_t put_other_failure{0};
+  std::uint64_t get_hits{0};
+  std::uint64_t get_misses{0};
+  std::uint64_t get_errors{0};
+  std::uint64_t exists_hits{0};
+  std::uint64_t exists_misses{0};
+  std::uint64_t exists_errors{0};
+  std::uint64_t scheduled_late_requests{0};
+  std::uint64_t maximum_scheduler_lag_ns{0};
+  std::uint64_t elapsed_ns{0};
+  bool rpc_failed{false};
+};
+
+struct MixedArguments {
+  std::size_t batch_size{333};
+  std::uint64_t operation_qps{150};
+  std::uint64_t duration_seconds{30};
+  std::uint64_t warmup_seconds{10};
+  std::uint64_t prefill_objects{1'000'000};
+  std::uint64_t hot_objects{500'000};
+  std::uint64_t object_bytes{1'024};
+};
+
+std::uint64_t elapsed_ns(std::chrono::steady_clock::time_point begin) {
+  return static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - begin)
+          .count());
+}
+
+async_simple::coro::Lazy<bool>
+mixed_batch_put(coro_rpc::coro_rpc_client &client,
+                const mooncake::UUID &client_id,
+                const std::vector<std::string> &keys,
+                std::uint64_t object_bytes, MixedStats &stats,
+                bool record_latency) {
+  using Service = mooncake::WrappedMasterService;
+  const std::string tenant_id = "default";
+  std::vector<std::uint64_t> lengths(keys.size(), object_bytes);
+  mooncake::ReplicateConfig config;
+  config.data_type = mooncake::ObjectDataType::KVCACHE;
+
+  const auto begin = std::chrono::steady_clock::now();
+  auto started = co_await client.call<&Service::BatchPutStart>(
+      client_id, keys, lengths, config, tenant_id);
+  stats.put_batches++;
+  stats.put_items += keys.size();
+  if (!started) {
+    std::cerr << "BatchPutStart transport error code="
+              << started.error().code.val()
+              << " message=" << started.error().msg << '\n';
+    stats.rpc_failed = true;
+    co_return false;
+  }
+  if (started->size() != keys.size()) {
+    std::cerr << "BatchPutStart response size mismatch\n";
+    stats.rpc_failed = true;
+    co_return false;
+  }
+
+  std::vector<mooncake::ObjectMeta> metas;
+  metas.reserve(keys.size());
+  for (std::size_t index = 0; index < keys.size(); ++index) {
+    const auto &item = started.value()[index];
+    if (item) {
+      stats.put_start_success++;
+      metas.push_back({keys[index], std::nullopt});
+    } else if (item.error() == mooncake::ErrorCode::NO_AVAILABLE_HANDLE) {
+      stats.put_no_handle++;
+    } else {
+      stats.put_other_failure++;
+    }
+  }
+
+  if (!metas.empty()) {
+    auto finished = co_await client.call<&Service::BatchPutEnd>(
+        client_id, metas, mooncake::ReplicaType::ALL, tenant_id);
+    if (!finished) {
+      std::cerr << "BatchPutEnd transport error code="
+                << finished.error().code.val()
+                << " message=" << finished.error().msg << '\n';
+      stats.rpc_failed = true;
+      co_return false;
+    }
+    if (finished->size() != metas.size()) {
+      std::cerr << "BatchPutEnd response size mismatch\n";
+      stats.rpc_failed = true;
+      co_return false;
+    }
+    for (const auto &item : finished.value()) {
+      if (item) {
+        stats.put_success++;
+      } else {
+        stats.put_other_failure++;
+      }
+    }
+  }
+  if (record_latency) {
+    stats.put_latencies_ns.push_back(elapsed_ns(begin));
+  }
+  co_return true;
+}
+
+async_simple::coro::Lazy<bool>
+mixed_batch_get(coro_rpc::coro_rpc_client &client,
+                const std::vector<std::string> &keys, MixedStats &stats,
+                bool record_latency) {
+  using Service = mooncake::WrappedMasterService;
+  const auto begin = std::chrono::steady_clock::now();
+  auto response = co_await client.call<&Service::BatchGetReplicaList>(
+      keys, std::string{"default"});
+  stats.get_batches++;
+  if (!response) {
+    std::cerr << "BatchGetReplicaList transport error code="
+              << response.error().code.val()
+              << " message=" << response.error().msg << '\n';
+    stats.rpc_failed = true;
+    co_return false;
+  }
+  if (response->size() != keys.size()) {
+    std::cerr << "BatchGetReplicaList response size mismatch\n";
+    stats.rpc_failed = true;
+    co_return false;
+  }
+  for (const auto &item : response.value()) {
+    if (item) {
+      stats.get_hits++;
+    } else if (item.error() == mooncake::ErrorCode::OBJECT_NOT_FOUND) {
+      stats.get_misses++;
+    } else {
+      stats.get_errors++;
+    }
+  }
+  if (record_latency) {
+    stats.get_latencies_ns.push_back(elapsed_ns(begin));
+  }
+  co_return true;
+}
+
+async_simple::coro::Lazy<bool>
+mixed_batch_exists(coro_rpc::coro_rpc_client &client,
+                   const std::vector<std::string> &keys, MixedStats &stats,
+                   bool record_latency) {
+  using Service = mooncake::WrappedMasterService;
+  const auto begin = std::chrono::steady_clock::now();
+  auto response = co_await client.call<&Service::BatchExistKey>(
+      keys, std::string{"default"});
+  stats.exists_batches++;
+  if (!response) {
+    std::cerr << "BatchExistKey transport error code="
+              << response.error().code.val()
+              << " message=" << response.error().msg << '\n';
+    stats.rpc_failed = true;
+    co_return false;
+  }
+  if (response->size() != keys.size()) {
+    std::cerr << "BatchExistKey response size mismatch\n";
+    stats.rpc_failed = true;
+    co_return false;
+  }
+  for (const auto &item : response.value()) {
+    if (!item) {
+      stats.exists_errors++;
+    } else if (item.value()) {
+      stats.exists_hits++;
+    } else {
+      stats.exists_misses++;
+    }
+  }
+  if (record_latency) {
+    stats.exists_latencies_ns.push_back(elapsed_ns(begin));
+  }
+  co_return true;
+}
+
+std::vector<std::string>
+mixed_write_keys(std::size_t worker, std::uint64_t sequence,
+                 std::size_t batch_size) {
+  std::vector<std::string> keys;
+  keys.reserve(batch_size);
+  for (std::size_t index = 0; index < batch_size; ++index) {
+    keys.push_back("mixed-write-w" + std::to_string(worker) + "-s" +
+                   std::to_string(sequence) + "-i" + std::to_string(index));
+  }
+  return keys;
+}
+
+std::vector<std::string>
+mixed_hot_batch(const std::vector<std::string> &hot_keys, std::size_t worker,
+                std::uint64_t sequence, std::size_t batch_size) {
+  std::vector<std::string> keys;
+  keys.reserve(batch_size);
+  const auto worker_offset = (hot_keys.size() / 3) * worker;
+  const auto start =
+      (sequence * batch_size + worker_offset) % hot_keys.size();
+  for (std::size_t index = 0; index < batch_size; ++index) {
+    keys.push_back(hot_keys[(start + index) % hot_keys.size()]);
+  }
+  return keys;
+}
+
+enum class MixedOperation { PUT = 0, GET = 1, EXISTS = 2 };
+
+async_simple::coro::Lazy<bool>
+run_rate_limited_phase(coro_rpc::coro_rpc_client &client,
+                       MixedOperation operation,
+                       const mooncake::UUID &client_id,
+                       const std::vector<std::string> &hot_keys,
+                       const MixedArguments &arguments,
+                       std::uint64_t request_count,
+                       std::uint64_t sequence_base, MixedStats &stats,
+                       bool record_latency) {
+  const auto phase_start = std::chrono::steady_clock::now();
+  const auto interval_ns = 1'000'000'000ULL / arguments.operation_qps;
+  for (std::uint64_t request = 0; request < request_count; ++request) {
+    const auto deadline = phase_start +
+                          std::chrono::nanoseconds(interval_ns * request);
+    const auto now = std::chrono::steady_clock::now();
+    if (now < deadline) {
+      std::this_thread::sleep_until(deadline);
+    } else if (request != 0) {
+      const auto lag = static_cast<std::uint64_t>(
+          std::chrono::duration_cast<std::chrono::nanoseconds>(now - deadline)
+              .count());
+      stats.scheduled_late_requests++;
+      stats.maximum_scheduler_lag_ns =
+          std::max(stats.maximum_scheduler_lag_ns, lag);
+    }
+
+    const auto sequence = sequence_base + request;
+    bool ok = false;
+    if (operation == MixedOperation::PUT) {
+      auto keys = mixed_write_keys(0, sequence, arguments.batch_size);
+      ok = co_await mixed_batch_put(client, client_id, keys,
+                                    arguments.object_bytes, stats,
+                                    record_latency);
+    } else {
+      const auto reader = operation == MixedOperation::GET ? 1 : 2;
+      auto keys = mixed_hot_batch(hot_keys, reader, sequence,
+                                  arguments.batch_size);
+      if (operation == MixedOperation::GET) {
+        ok = co_await mixed_batch_get(client, keys, stats, record_latency);
+      } else {
+        ok =
+            co_await mixed_batch_exists(client, keys, stats, record_latency);
+      }
+    }
+    if (!ok) {
+      co_return false;
+    }
+  }
+  co_return true;
+}
+
+async_simple::coro::Lazy<MixedStats>
+run_rate_limited_worker(std::string host, std::string port,
+                        MixedOperation operation,
+                        const std::vector<std::string> &hot_keys,
+                        MixedArguments arguments,
+                        std::barrier<> &phase_barrier,
+                        std::atomic<bool> &failed) {
+  MixedStats stats;
+  const auto warmup_requests =
+      arguments.operation_qps * arguments.warmup_seconds;
+  const auto measured_requests =
+      arguments.operation_qps * arguments.duration_seconds;
+
+  coro_rpc::coro_rpc_client client;
+  auto error = co_await client.connect(std::move(host), std::move(port));
+  if (error) {
+    std::cerr << "mixed worker connect failed: " << error.message() << '\n';
+    stats.rpc_failed = true;
+    failed.store(true, std::memory_order_release);
+    phase_barrier.arrive_and_drop();
+    co_return stats;
+  }
+  const mooncake::UUID client_id{0xCAFE,
+                                 static_cast<std::uint64_t>(operation) + 1};
+
+  phase_barrier.arrive_and_wait();
+  if (!(co_await run_rate_limited_phase(
+          client, operation, client_id, hot_keys, arguments, warmup_requests,
+          0, stats, false))) {
+    failed.store(true, std::memory_order_release);
+  }
+
+  // All three streams finish warmup before the measured steady-state window.
+  phase_barrier.arrive_and_wait();
+  if (failed.load(std::memory_order_acquire)) {
+    stats.rpc_failed = true;
+    co_return stats;
+  }
+  stats = MixedStats{};
+  if (operation == MixedOperation::PUT) {
+    stats.put_latencies_ns.reserve(measured_requests);
+  } else if (operation == MixedOperation::GET) {
+    stats.get_latencies_ns.reserve(measured_requests);
+  } else {
+    stats.exists_latencies_ns.reserve(measured_requests);
+  }
+  const auto begin = std::chrono::steady_clock::now();
+  if (!(co_await run_rate_limited_phase(
+          client, operation, client_id, hot_keys, arguments,
+          measured_requests, warmup_requests, stats, true))) {
+    failed.store(true, std::memory_order_release);
+  }
+  stats.elapsed_ns = elapsed_ns(begin);
+  co_return stats;
+}
+
+async_simple::coro::Lazy<MixedStats>
+prefill_mixed_workload(std::string host, std::string port,
+                       const MixedArguments &arguments,
+                       const std::vector<std::string> &hot_keys) {
+  MixedStats stats;
+  coro_rpc::coro_rpc_client client;
+  auto error = co_await client.connect(std::move(host), std::move(port));
+  if (error) {
+    std::cerr << "prefill connect failed: " << error.message() << '\n';
+    stats.rpc_failed = true;
+    co_return stats;
+  }
+  const mooncake::UUID client_id{0xBEEF, 1};
+  std::uint64_t inserted = 0;
+  while (inserted < arguments.prefill_objects) {
+    const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(
+        arguments.batch_size, arguments.prefill_objects - inserted));
+    std::vector<std::string> keys;
+    keys.reserve(count);
+    for (std::size_t index = 0; index < count; ++index) {
+      keys.push_back("mixed-prefill-" + std::to_string(inserted + index));
+    }
+    const auto successes_before = stats.put_success;
+    if (!(co_await mixed_batch_put(client, client_id, keys,
+                                   arguments.object_bytes, stats, false))) {
+      co_return stats;
+    }
+    const auto successes = stats.put_success - successes_before;
+    if (successes != count) {
+      std::cerr << "prefill stopped after " << stats.put_success
+                << " successful objects; requested "
+                << arguments.prefill_objects << '\n';
+      co_return stats;
+    }
+    inserted += count;
+  }
+
+  // Touch the hot tail after cold prefill so BatchGet and BatchExists start
+  // from a stable hit set and grant the same leases on both implementations.
+  for (std::size_t offset = 0; offset < hot_keys.size();
+       offset += arguments.batch_size) {
+    const auto count = std::min(arguments.batch_size, hot_keys.size() - offset);
+    std::vector<std::string> keys(hot_keys.begin() + offset,
+                                  hot_keys.begin() + offset + count);
+    if (!(co_await mixed_batch_get(client, keys, stats, false)) ||
+        !(co_await mixed_batch_exists(client, keys, stats, false))) {
+      co_return stats;
+    }
+  }
+  co_return stats;
+}
+
+void merge_mixed_stats(MixedStats &target, MixedStats source) {
+  target.put_latencies_ns.insert(target.put_latencies_ns.end(),
+                                 source.put_latencies_ns.begin(),
+                                 source.put_latencies_ns.end());
+  target.get_latencies_ns.insert(target.get_latencies_ns.end(),
+                                 source.get_latencies_ns.begin(),
+                                 source.get_latencies_ns.end());
+  target.exists_latencies_ns.insert(target.exists_latencies_ns.end(),
+                                    source.exists_latencies_ns.begin(),
+                                    source.exists_latencies_ns.end());
+  target.put_batches += source.put_batches;
+  target.get_batches += source.get_batches;
+  target.exists_batches += source.exists_batches;
+  target.put_items += source.put_items;
+  target.put_start_success += source.put_start_success;
+  target.put_success += source.put_success;
+  target.put_no_handle += source.put_no_handle;
+  target.put_other_failure += source.put_other_failure;
+  target.get_hits += source.get_hits;
+  target.get_misses += source.get_misses;
+  target.get_errors += source.get_errors;
+  target.exists_hits += source.exists_hits;
+  target.exists_misses += source.exists_misses;
+  target.exists_errors += source.exists_errors;
+  target.scheduled_late_requests += source.scheduled_late_requests;
+  target.maximum_scheduler_lag_ns =
+      std::max(target.maximum_scheduler_lag_ns,
+               source.maximum_scheduler_lag_ns);
+  target.elapsed_ns = std::max(target.elapsed_ns, source.elapsed_ns);
+  target.rpc_failed = target.rpc_failed || source.rpc_failed;
+}
+
+std::uint64_t percentile_ns(std::vector<std::uint64_t> &samples,
+                            std::uint64_t numerator,
+                            std::uint64_t denominator) {
+  if (samples.empty()) {
+    return 0;
+  }
+  std::sort(samples.begin(), samples.end());
+  const auto rank = (samples.size() * numerator + denominator - 1) /
+                    denominator;
+  return samples[std::min(samples.size() - 1, std::max<std::size_t>(1, rank) -
+                                                  1)];
+}
+
+int run_mixed_client(const std::string &host, const std::string &port,
+                     MixedArguments arguments) {
+  if (arguments.batch_size < 2 || arguments.operation_qps == 0 ||
+      arguments.duration_seconds == 0 || arguments.prefill_objects == 0 ||
+      arguments.hot_objects == 0 ||
+      arguments.hot_objects > arguments.prefill_objects ||
+      arguments.object_bytes == 0) {
+    std::cerr << "mixed workload requires batch_size>=2, qps/duration/"
+                 "prefill/hot/object_bytes>0, and hot<=prefill\n";
+    return 64;
+  }
+
+  std::vector<std::string> hot_keys;
+  hot_keys.reserve(arguments.hot_objects);
+  const auto hot_begin = arguments.prefill_objects - arguments.hot_objects;
+  for (std::uint64_t index = hot_begin; index < arguments.prefill_objects;
+       ++index) {
+    hot_keys.push_back("mixed-prefill-" + std::to_string(index));
+  }
+
+  auto prefill = async_simple::coro::syncAwait(
+      prefill_mixed_workload(host, port, arguments, hot_keys));
+  std::cout << "mixed_prefill requested=" << arguments.prefill_objects
+            << " successful=" << prefill.put_success
+            << " get_hits=" << prefill.get_hits
+            << " get_misses=" << prefill.get_misses
+            << " exists_hits=" << prefill.exists_hits
+            << " exists_misses=" << prefill.exists_misses << '\n';
+  if (prefill.rpc_failed || prefill.put_success != arguments.prefill_objects ||
+      prefill.get_misses != 0 || prefill.exists_misses != 0) {
+    return 3;
+  }
+
+  constexpr std::size_t kOperationStreams = 3;
+  std::barrier phase_barrier(
+      static_cast<std::ptrdiff_t>(kOperationStreams));
+  std::atomic<bool> failed{false};
+  std::vector<MixedStats> worker_stats(kOperationStreams);
+  std::vector<std::thread> workers;
+  workers.reserve(kOperationStreams);
+  for (std::size_t worker = 0; worker < kOperationStreams; ++worker) {
+    workers.emplace_back([&, worker] {
+      worker_stats[worker] = async_simple::coro::syncAwait(
+          run_rate_limited_worker(host, port,
+                                  static_cast<MixedOperation>(worker),
+                                  hot_keys, arguments, phase_barrier, failed));
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+
+  MixedStats total;
+  for (auto &stats : worker_stats) {
+    merge_mixed_stats(total, std::move(stats));
+  }
+  if (total.rpc_failed) {
+    return 4;
+  }
+  const auto elapsed_seconds = total.elapsed_ns / 1'000'000'000.0;
+  const auto logical_batches =
+      total.put_batches + total.get_batches + total.exists_batches;
+  const auto logical_batch_qps = logical_batches / elapsed_seconds;
+  const auto item_ops_per_second =
+      logical_batch_qps * static_cast<double>(arguments.batch_size);
+  const auto put_p50 = percentile_ns(total.put_latencies_ns, 50, 100) / 1000.0;
+  const auto put_p99 = percentile_ns(total.put_latencies_ns, 99, 100) / 1000.0;
+  const auto put_p999 =
+      percentile_ns(total.put_latencies_ns, 999, 1000) / 1000.0;
+  const auto get_p50 = percentile_ns(total.get_latencies_ns, 50, 100) / 1000.0;
+  const auto get_p99 = percentile_ns(total.get_latencies_ns, 99, 100) / 1000.0;
+  const auto get_p999 =
+      percentile_ns(total.get_latencies_ns, 999, 1000) / 1000.0;
+  const auto exists_p50 =
+      percentile_ns(total.exists_latencies_ns, 50, 100) / 1000.0;
+  const auto exists_p99 =
+      percentile_ns(total.exists_latencies_ns, 99, 100) / 1000.0;
+  const auto exists_p999 =
+      percentile_ns(total.exists_latencies_ns, 999, 1000) / 1000.0;
+
+  std::cout << std::fixed << std::setprecision(6)
+            << "client=cpp operation=mixed-1:1:1"
+            << " batch_size=" << arguments.batch_size
+            << " target_qps_per_operation=" << arguments.operation_qps
+            << " duration_seconds=" << arguments.duration_seconds
+            << " warmup_seconds=" << arguments.warmup_seconds
+            << " prefill_objects=" << arguments.prefill_objects
+            << " hot_objects=" << arguments.hot_objects
+            << " object_bytes=" << arguments.object_bytes
+            << " elapsed_s=" << elapsed_seconds << std::setprecision(0)
+            << " logical_batch_qps=" << logical_batch_qps
+            << " item_ops_per_s=" << item_ops_per_second
+            << " put_batches=" << total.put_batches
+            << " get_batches=" << total.get_batches
+            << " exists_batches=" << total.exists_batches
+            << " put_items=" << total.put_items
+            << " put_start_success=" << total.put_start_success
+            << " put_success=" << total.put_success
+            << " put_no_handle=" << total.put_no_handle
+            << " put_other_failure=" << total.put_other_failure
+            << " get_hits=" << total.get_hits
+            << " get_misses=" << total.get_misses
+            << " get_errors=" << total.get_errors
+            << " exists_hits=" << total.exists_hits
+            << " exists_misses=" << total.exists_misses
+            << " exists_errors=" << total.exists_errors
+            << " scheduled_late_requests="
+            << total.scheduled_late_requests
+            << " maximum_scheduler_lag_us="
+            << total.maximum_scheduler_lag_ns / 1000.0
+            << std::setprecision(3) << " put_p50_us=" << put_p50
+            << " put_p99_us=" << put_p99 << " put_p999_us=" << put_p999
+            << " get_p50_us=" << get_p50 << " get_p99_us=" << get_p99
+            << " get_p999_us=" << get_p999
+            << " exists_p50_us=" << exists_p50
+            << " exists_p99_us=" << exists_p99
+            << " exists_p999_us=" << exists_p999 << '\n';
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc == 2 && std::string_view(argv[1]) == "metadata") {
     print_metadata();
@@ -512,10 +1058,38 @@ int main(int argc, char **argv) {
     return async_simple::coro::syncAwait(run_client(
         argv[2], argv[3], operation, batch_size, iterations, pipeline, warmup));
   }
+  if (argc >= 4 && std::string_view(argv[1]) == "mixed-client") {
+    MixedArguments arguments;
+    if (argc >= 5) {
+      arguments.batch_size = std::max(2UL, std::stoul(argv[4]));
+    }
+    if (argc >= 6) {
+      arguments.operation_qps = std::stoull(argv[5]);
+    }
+    if (argc >= 7) {
+      arguments.duration_seconds = std::stoull(argv[6]);
+    }
+    if (argc >= 8) {
+      arguments.warmup_seconds = std::stoull(argv[7]);
+    }
+    if (argc >= 9) {
+      arguments.prefill_objects = std::stoull(argv[8]);
+    }
+    if (argc >= 10) {
+      arguments.hot_objects = std::stoull(argv[9]);
+    }
+    if (argc >= 11) {
+      arguments.object_bytes = std::stoull(argv[10]);
+    }
+    return run_mixed_client(argv[2], argv[3], arguments);
+  }
 
   std::cerr
       << "usage: mooncake_benchmark server <port> [threads] | client <host> "
          "<port> <exists|get|put-start|put-end|put-revoke> [batch-size] "
-         "[iterations] [pipeline] [warmup]\n";
+         "[iterations] [pipeline] [warmup] | mixed-client <host> <port> "
+         "[batch-size] [qps-per-operation] [duration-seconds] "
+         "[warmup-seconds] "
+         "[prefill-objects] [hot-objects] [object-bytes]\n";
   return 64;
 }

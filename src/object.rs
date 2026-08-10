@@ -16,6 +16,7 @@ mod content;
 pub mod diagnostics;
 pub mod error;
 mod identity;
+mod manager;
 pub mod reclamation;
 mod replica;
 mod write;
@@ -24,5 +25,9 @@ pub use catalog::{ObjectCatalog, ObjectHandle, ObjectRead, PutClaim, PutTicket};
 pub use config::ObjectCatalogConfig;
 pub use content::{ObjectContent, ObjectKind};
 pub use identity::{NamespaceId, ObjectIdentity, ObjectKey, ObjectLookup};
+pub use manager::{
+    AllocatedReplica, ObjectManager, ObjectManagerMaintenance, ObjectPutPlan, ReplicaSelector,
+    StartedPut,
+};
 pub use replica::{DirectReplica, LocalSsdReplica, ReplicaId, ReplicaLease, ReplicaSet};
 pub use write::{ObjectCommit, WriteId, WriteOwner};
