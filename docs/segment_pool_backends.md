@@ -18,56 +18,68 @@ LocalSSD 也不能接入 `reserve(bytes)`，因为准入成功不代表数据已
 
 ## 当前 Rust 映射
 
-`SegmentPool` 统一负责 identity、owner 校验、catalog、quiesce/reactivate/remove
-和统计，但不强行统一后端工作流：
+`SegmentPool` 统一负责 identity、owner 校验、catalog、状态切换和统计，但不强行
+统一不同的容量与 I/O 工作流：
 
-- `SegmentSpec` 保存不可变的挂载事实；运行时 heartbeat 状态不写回 spec。
+- `SegmentSpec` 是一个类型，公共 identity 只保存一次；四个受控构造函数写入
+  私有的 configuration variant，避免公开一组互斥的 optional 字段，也避免四个
+  wrapper spec 重复转发 getter。host/rack 等调度拓扑不属于 segment 挂载事实，
+  不放进 spec；当前 placement 只使用确定存在的 owner/resource failure domain。
 - `SegmentKind` 表示具体实现，`ReplicaClass` 表示产物类型，
   `SegmentResourceId` 表示真正共享容量或故障域的资源。这三个维度相互独立。
-- `SegmentBackend::Direct` 服务 Memory、CXL、NoF；CXL logical segment clone
-  同一个 arena allocator，另外保留各自的 live reservation 计数。
-- `SegmentBackend::LocalSsd` 保存 heartbeat capacity、当前 offload enable 状态、
-  pending bytes 和 committed bytes。
-- `PoolSnapshot` 只进入同步 placement；`OffloadSnapshot` 只用于异步 offload，
-  类型上阻止 LocalSSD target 被误传给 direct placement policy。
+- 每个 logical segment 对应一个 `SegmentEntry`，只包含 `spec + state + capacity +
+  usage`。`state` 是明确的 `Accepting/Quiesced/Removed`，不再增加含义重叠的通用
+  包装层。
+- `CapacityHandle::Range` 表示同步区间分配能力，Memory/NoF 使用独立 allocator，
+  CXL entry 从 `ResourceRegistry` 绑定同一个 arena allocator；
+  `CapacityHandle::LocalSsd` 保存 heartbeat capacity、offload enable、pending 和
+  committed bytes。
+- `ResourceRegistry` 只管理确实跨 logical segment 共享的物理资源。目前就是 CXL
+  arena；最后一个 CXL entry 移除时才解除 arena 注册。Offload 不是 CXL 的子类或
+  关联对象，而是另一种 capability/workflow。
+- `PoolSnapshot` 暴露 `DirectCandidate`，只进入同步 placement；
+  `OffloadSnapshot` 暴露 `OffloadTarget`，只进入异步 offload。两条路径在类型上
+  不能混用。
+- Memory 和 NoF descriptor 共用 `RangeDescriptor` payload，由外层 variant 标识
+  replica class；LocalSSD descriptor 保留独立结构，因为对象 endpoint 只能在
+  offload 完成时确定。
 - direct allocation 返回 `Reservation`；LocalSSD admission 返回
   `OffloadPermit`。permit drop/`abort` 归还 pending capacity，带对象级 endpoint
   的 `commit` 将其转换为 `LocalSsdLease`，lease drop 归还 committed capacity。
-- `ReplicaLease` 持有上述 RAII handle，所以对象发布失败、过期回收和 segment
-  remove 都不需要另建一套易泄漏的容量记账。
+- `UsageToken` 只由真正占用资源的 reservation/permit/lease 持有。
+  `active_allocations` 不是上层 object handle 数；object handle 只是间接让
+  `ReplicaLease` 存活。普通 `SegmentHandle` 和 snapshot 不阻止 segment remove。
 
 核心关系如下：
 
 ```text
-SegmentSpec (immutable mount facts)
-        |
-        v
-Catalog + lifecycle -----> SegmentCandidate
-        |                         |
-        |                         +--> PoolSnapshot --> reserve --> Reservation
-        |                         |
-        |                         +--> OffloadSnapshot --> admit
-        |                                                |
-        |                                   abort/drop <--+--> commit(endpoint)
-        |                                                        |
-        +------------------------------------------------> LocalSsdLease
-                                                                  |
-                                                                  v
-                                                            ReplicaLease
+Catalog
+├── segments[id] ──> SegmentEntry(spec, state, capacity, usage)
+│                    ├── Range ─────> DirectCandidate ──> Reservation
+│                    └── LocalSsd ──> OffloadTarget ────> OffloadPermit
+│                                                          ├── abort/drop
+│                                                          └── commit(endpoint)
+│                                                              └── LocalSsdLease
+└── resources[CxlArenaId] ──> shared ByteAllocator
+                    ▲                         ▲
+                    └── CXL entry A           └── CXL entry B
+
+Reservation / LocalSsdLease ──> ReplicaLease ──> Object
 ```
 
 ## 新增后端时的约束
 
-新增 segment 类型时按语义回答下面的问题，不要直接给 `SegmentSpec` 增加一组
-可选字段：
+新增 segment 类型时按语义回答下面的问题；给私有 configuration 增加一个
+variant 和受控构造函数，不要给 `SegmentSpec` 增加一组公开的可选字段：
 
 1. 哪些字段是不可变挂载事实，哪些是 heartbeat 或任务运行态？
 2. 它产出哪个 `ReplicaClass`，物理容量由哪个 `SegmentResourceId` 唯一标识？
 3. 它是 direct reservation、异步 admission，还是新的工作流？
-4. 多个 logical segment 是否共享 allocator；若共享，生命周期计数是否仍需逐
-   logical segment 维护？
+4. 多个 logical segment 是否共享 allocator；若共享，active allocation 是否仍
+   需逐 logical segment 维护？
 5. descriptor 的字段在挂载、分配还是完成阶段才能确定？
 6. 失败、取消、对象回收和 segment remove 时，哪个 RAII handle 负责归还资源？
 
-只有工作流相同的后端才复用 backend capability。具体 kind 的验证和资源冲突
-规则留在 attach 边界；placement 不通过 protocol string 猜测后端类型。
+只有容量和工作流都相同的后端才复用 capability。具体 kind 的验证和资源冲突
+规则留在 attach 边界；共享资源的 bind/unbind 留在 `ResourceRegistry`；placement
+不通过 protocol string 猜测后端类型。

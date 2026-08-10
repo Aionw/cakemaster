@@ -1,12 +1,11 @@
 use super::descriptor::{LocalSsdDescriptor, LocalSsdDescriptorRef};
 use super::error::LocalSsdError;
 use super::identity::SegmentId;
-use super::reservation::ReservationCounter;
 use super::spec::SegmentSpec;
+use super::usage::UsageToken;
 use parking_lot::Mutex;
 use std::fmt;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
 #[derive(Clone)]
 pub(crate) struct LocalSsdCapacity {
@@ -49,13 +48,13 @@ pub struct LocalSsdStats {
 
 pub struct OffloadPermit {
     allocation: Option<LocalSsdAllocation>,
-    counter: Option<ReservationCounter>,
+    usage: Option<UsageToken>,
     segment: Arc<SegmentSpec>,
 }
 
 pub struct LocalSsdLease {
     allocation: LocalSsdAllocation,
-    _counter: ReservationCounter,
+    _usage: UsageToken,
     segment: Arc<SegmentSpec>,
     transport_endpoint: Arc<str>,
 }
@@ -156,12 +155,12 @@ impl Drop for LocalSsdAllocation {
 impl OffloadPermit {
     pub(crate) fn new(
         allocation: LocalSsdAllocation,
-        live: Arc<AtomicU64>,
+        usage: UsageToken,
         segment: Arc<SegmentSpec>,
     ) -> Self {
         Self {
             allocation: Some(allocation),
-            counter: Some(ReservationCounter::acquire(live)),
+            usage: Some(usage),
             segment,
         }
     }
@@ -192,7 +191,7 @@ impl OffloadPermit {
         allocation.commit();
         Ok(LocalSsdLease {
             allocation,
-            _counter: self.counter.take().expect("live permits contain a counter"),
+            _usage: self.usage.take().expect("live permits contain usage"),
             segment: self.segment.clone(),
             transport_endpoint,
         })
@@ -227,12 +226,8 @@ impl LocalSsdLease {
     }
 
     pub fn descriptor(&self) -> LocalSsdDescriptorRef<'_> {
-        let spec = self
-            .segment
-            .local_ssd()
-            .expect("LocalSSD leases retain a LocalSSD segment");
         LocalSsdDescriptorRef::new(
-            spec.identity().owner(),
+            self.segment.identity().owner(),
             self.bytes(),
             self.transport_endpoint(),
         )

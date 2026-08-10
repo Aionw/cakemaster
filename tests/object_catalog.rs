@@ -3,16 +3,15 @@ use cakemaster::object::error::{
 };
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
-    LocalSsdReplica, MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit,
+    DirectReplica, LocalSsdReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit,
     ObjectContent, ObjectIdentity, ObjectLookup, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
 };
 use cakemaster::segment::placement::{
     AllocationSpec, PlacementRequest, ReplicaAllocator, ReplicaPolicy,
 };
 use cakemaster::segment::{
-    ClientId, LocalSsdSegmentSpec, MemoryRegion, MemorySegmentSpec, NofSegmentSpec, ReplicaClass,
-    SegmentId, SegmentIdentity, SegmentPool, SegmentPoolConfig, TransportEndpoint,
-    TransportProtocol,
+    ClientId, MemoryRegion, ReplicaClass, SegmentId, SegmentIdentity, SegmentPool,
+    SegmentPoolConfig, SegmentSpec, TransportEndpoint, TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
@@ -23,7 +22,7 @@ const SEGMENT_ID: SegmentId = SegmentId::new(9, 1);
 
 fn pool(capacity: u64, allocator_nodes: u32) -> Arc<SegmentPool> {
     let pool = Arc::new(SegmentPool::with_config(SegmentPoolConfig::new(allocator_nodes)).unwrap());
-    pool.attach(MemorySegmentSpec::new(
+    pool.attach(SegmentSpec::memory(
         SegmentIdentity::new(SEGMENT_ID, OWNER, "catalog-memory"),
         MemoryRegion::new(0x2_0000_0000, capacity),
         TransportEndpoint::new(TransportProtocol::Tcp, "127.0.0.1:12345"),
@@ -41,7 +40,7 @@ fn owner() -> WriteOwner {
 }
 
 fn replica(pool: &SegmentPool, bytes: u64) -> ReplicaSet {
-    ReplicaSet::one(ReplicaLease::Memory(MemoryReplica::new(
+    ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
         ReplicaId::new(1),
         pool.reserve_on(SEGMENT_ID, bytes).unwrap(),
     )))
@@ -68,11 +67,11 @@ fn replica_set_preserves_inline_and_multiple_replica_views() {
     drop(inline);
 
     let multiple = ReplicaSet::new([
-        ReplicaLease::Memory(MemoryReplica::new(
+        ReplicaLease::Direct(DirectReplica::new(
             ReplicaId::new(1),
             pool.reserve_on(SEGMENT_ID, 1024).unwrap(),
         )),
-        ReplicaLease::Memory(MemoryReplica::new(
+        ReplicaLease::Direct(DirectReplica::new(
             ReplicaId::new(2),
             pool.reserve_on(SEGMENT_ID, 2048).unwrap(),
         )),
@@ -81,14 +80,14 @@ fn replica_set_preserves_inline_and_multiple_replica_views() {
     assert_eq!(multiple.reserved_bytes(), 3072);
     assert_eq!(multiple.replicas()[1].id(), ReplicaId::new(2));
     drop(multiple);
-    assert_eq!(pool.stats(SEGMENT_ID).unwrap().reservations.live, 0);
+    assert_eq!(pool.stats(SEGMENT_ID).unwrap().usage.active_allocations, 0);
 }
 
 #[test]
 fn replica_set_preserves_nof_reservations_as_nof_replicas() {
     let pool = pool(1 << 20, 64);
     let nof_id = SegmentId::new(9, 2);
-    pool.attach(NofSegmentSpec::new(
+    pool.attach(SegmentSpec::nof(
         SegmentIdentity::new(nof_id, OWNER, "catalog-nof"),
         MemoryRegion::new(0, 1 << 20),
         "nvme://10.0.0.1/nqn.1",
@@ -106,7 +105,7 @@ fn replica_set_preserves_nof_reservations_as_nof_replicas() {
     assert_eq!(nof.segment_id(), nof_id);
     assert_eq!(nof.descriptor().region().base(), 0);
     drop(replicas);
-    assert_eq!(pool.stats(nof_id).unwrap().reservations.live, 0);
+    assert_eq!(pool.stats(nof_id).unwrap().usage.active_allocations, 0);
 }
 
 #[test]
@@ -114,13 +113,13 @@ fn pending_object_reclamation_releases_local_ssd_capacity() {
     let pool = pool(1 << 20, 64);
     let local_id = SegmentId::new(9, 3);
     let candidate = pool
-        .attach(LocalSsdSegmentSpec::new(
+        .attach(SegmentSpec::local_ssd(
             SegmentIdentity::new(local_id, OWNER, "catalog-local-ssd"),
             true,
         ))
         .unwrap()
-        .candidate()
-        .clone();
+        .offload_target()
+        .expect("LocalSSD attachment must expose an offload target");
     pool.report_local_ssd_capacity(OWNER, local_id, 1 << 20)
         .unwrap();
     let lease = pool
@@ -158,7 +157,7 @@ fn pending_object_reclamation_releases_local_ssd_capacity() {
     assert_eq!(report.expired_pending, 1);
     assert_eq!(report.reclaimed_objects, 1);
     assert_eq!(candidate.local_ssd_stats().unwrap().committed_bytes, 0);
-    assert_eq!(candidate.stats().reservations.live, 0);
+    assert_eq!(candidate.stats().usage.active_allocations, 0);
 }
 
 #[test]
@@ -249,7 +248,7 @@ fn publish_lookup_remove_and_reclaim_preserve_lease_and_ownership() {
     let report = catalog.collect_step(CatalogTick::new(11), CollectBudget::new(0, 8, 0));
     assert_eq!(report.reclaimed_objects, 1);
     assert_eq!(report.reclaimed_bytes, 4096);
-    assert_eq!(pool.stats(SEGMENT_ID).unwrap().reservations.live, 0);
+    assert_eq!(pool.stats(SEGMENT_ID).unwrap().usage.active_allocations, 0);
     assert_eq!(catalog.stats().published_objects, 0);
     assert_eq!(catalog.stats().retired_bytes, 0);
 
@@ -280,7 +279,7 @@ fn pending_timeout_reclaims_memory_without_a_batch_pause() {
     assert_eq!(report.reclaimed_objects, 1);
     assert_eq!(catalog.stats().pending_objects, 0);
     assert_eq!(catalog.stats().retired_bytes, 0);
-    assert_eq!(pool.stats(SEGMENT_ID).unwrap().reservations.live, 0);
+    assert_eq!(pool.stats(SEGMENT_ID).unwrap().usage.active_allocations, 0);
     assert!(matches!(
         catalog.get(object.as_lookup(), CatalogTick::new(5)),
         Err(LookupError::NotFound)
@@ -309,10 +308,10 @@ fn pending_expiration_has_no_future_deadline_head_of_line_blocking() {
     assert_eq!(report.expired_pending, 1);
     assert_eq!(report.reclaimed_objects, 1);
     assert_eq!(catalog.stats().pending_objects, 1);
-    assert_eq!(pool.stats(SEGMENT_ID).unwrap().reservations.live, 1);
+    assert_eq!(pool.stats(SEGMENT_ID).unwrap().usage.active_allocations, 1);
 
     drop(catalog);
-    assert_eq!(pool.stats(SEGMENT_ID).unwrap().reservations.live, 0);
+    assert_eq!(pool.stats(SEGMENT_ID).unwrap().usage.active_allocations, 0);
 }
 
 #[test]
@@ -333,7 +332,7 @@ fn invalid_staging_rolls_back_claim_and_reservation_by_raii() {
             capacity_bytes: 1024,
         }) if replica == ReplicaId::new(1)
     ));
-    assert_eq!(pool.stats(SEGMENT_ID).unwrap().reservations.live, 0);
+    assert_eq!(pool.stats(SEGMENT_ID).unwrap().usage.active_allocations, 0);
     assert_eq!(catalog.stats().claims, 0);
     assert!(
         catalog
@@ -394,13 +393,13 @@ fn reclamation_promotes_recent_objects_and_defers_pinned_resources() {
     let report = catalog.collect_step(CatalogTick::new(10), CollectBudget::new(8, 8, 0));
     assert_eq!(report.retired_objects, 1);
     assert_eq!(report.reclaimed_objects, 0);
-    assert_eq!(pool.stats(SEGMENT_ID).unwrap().reservations.live, 1);
+    assert_eq!(pool.stats(SEGMENT_ID).unwrap().usage.active_allocations, 1);
     assert_eq!(catalog.stats().retired_bytes, 4096);
 
     drop(pinned_hot);
     let report = catalog.collect_step(CatalogTick::new(11), CollectBudget::new(8, 8, 0));
     assert_eq!(report.reclaimed_objects, 1);
-    assert_eq!(pool.stats(SEGMENT_ID).unwrap().reservations.live, 0);
+    assert_eq!(pool.stats(SEGMENT_ID).unwrap().usage.active_allocations, 0);
 }
 
 #[test]
@@ -488,5 +487,5 @@ fn high_concurrency_put_get_and_incremental_collection_leave_no_resources() {
     assert_eq!(stats.published_objects, 0);
     assert_eq!(stats.live_bytes, 0);
     assert_eq!(stats.retired_bytes, 0);
-    assert_eq!(pool.stats(SEGMENT_ID).unwrap().reservations.live, 0);
+    assert_eq!(pool.stats(SEGMENT_ID).unwrap().usage.active_allocations, 0);
 }

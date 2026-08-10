@@ -25,81 +25,17 @@ impl MemoryRegion {
     }
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SegmentTopology {
-    host_id: Option<Arc<str>>,
-}
-
-impl SegmentTopology {
-    pub fn on_host(host_id: impl Into<Arc<str>>) -> Self {
-        Self {
-            host_id: Some(host_id.into()),
-        }
-    }
-
-    pub fn host_id(&self) -> Option<&str> {
-        self.host_id.as_deref()
-    }
-
-    pub(crate) fn host_id_arc(&self) -> Option<Arc<str>> {
-        self.host_id.clone()
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MemoryDescriptor {
-    region: MemoryRegion,
-    transport: TransportEndpoint,
-}
-
-impl MemoryDescriptor {
-    pub const fn region(&self) -> MemoryRegion {
-        self.region
-    }
-
-    pub const fn transport(&self) -> &TransportEndpoint {
-        &self.transport
-    }
-}
-
-/// Zero-copy view of a memory descriptor owned by a live reservation.
+/// Owned descriptor payload shared by Memory and NoF replicas.
 ///
-/// Allocation hot paths should use this view. Call [`Self::to_owned`] only at
-/// an ownership boundary such as an RPC queue or persistent metadata record.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct MemoryDescriptorRef<'a> {
-    region: MemoryRegion,
-    transport: &'a TransportEndpoint,
-}
-
-impl<'a> MemoryDescriptorRef<'a> {
-    pub(crate) const fn new(region: MemoryRegion, transport: &'a TransportEndpoint) -> Self {
-        Self { region, transport }
-    }
-
-    pub const fn region(self) -> MemoryRegion {
-        self.region
-    }
-
-    pub const fn transport(self) -> &'a TransportEndpoint {
-        self.transport
-    }
-
-    pub fn to_owned(self) -> MemoryDescriptor {
-        MemoryDescriptor {
-            region: self.region,
-            transport: self.transport.clone(),
-        }
-    }
-}
-
+/// The enclosing [`ReservationDescriptor`] variant carries the replica type;
+/// the range and transport payload itself is identical.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct NofDescriptor {
+pub struct RangeDescriptor {
     region: MemoryRegion,
     transport: TransportEndpoint,
 }
 
-impl NofDescriptor {
+impl RangeDescriptor {
     pub const fn region(&self) -> MemoryRegion {
         self.region
     }
@@ -109,13 +45,14 @@ impl NofDescriptor {
     }
 }
 
+/// Borrowed hot-path view of a [`RangeDescriptor`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct NofDescriptorRef<'a> {
+pub struct RangeDescriptorRef<'a> {
     region: MemoryRegion,
     transport: &'a TransportEndpoint,
 }
 
-impl<'a> NofDescriptorRef<'a> {
+impl<'a> RangeDescriptorRef<'a> {
     pub(crate) const fn new(region: MemoryRegion, transport: &'a TransportEndpoint) -> Self {
         Self { region, transport }
     }
@@ -128,8 +65,8 @@ impl<'a> NofDescriptorRef<'a> {
         self.transport
     }
 
-    pub fn to_owned(self) -> NofDescriptor {
-        NofDescriptor {
+    pub fn to_owned(self) -> RangeDescriptor {
+        RangeDescriptor {
             region: self.region,
             transport: self.transport.clone(),
         }
@@ -139,33 +76,31 @@ impl<'a> NofDescriptorRef<'a> {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ReservationDescriptor {
-    Memory(MemoryDescriptor),
-    Nof(NofDescriptor),
+    Memory(RangeDescriptor),
+    Nof(RangeDescriptor),
 }
 
 impl ReservationDescriptor {
     pub const fn region(&self) -> MemoryRegion {
         match self {
-            Self::Memory(descriptor) => descriptor.region(),
-            Self::Nof(descriptor) => descriptor.region(),
+            Self::Memory(descriptor) | Self::Nof(descriptor) => descriptor.region(),
         }
     }
 
     pub const fn transport(&self) -> &TransportEndpoint {
         match self {
-            Self::Memory(descriptor) => descriptor.transport(),
-            Self::Nof(descriptor) => descriptor.transport(),
+            Self::Memory(descriptor) | Self::Nof(descriptor) => descriptor.transport(),
         }
     }
 
-    pub const fn memory(&self) -> Option<&MemoryDescriptor> {
+    pub const fn memory(&self) -> Option<&RangeDescriptor> {
         match self {
             Self::Memory(descriptor) => Some(descriptor),
             Self::Nof(_) => None,
         }
     }
 
-    pub const fn nof(&self) -> Option<&NofDescriptor> {
+    pub const fn nof(&self) -> Option<&RangeDescriptor> {
         match self {
             Self::Memory(_) => None,
             Self::Nof(descriptor) => Some(descriptor),
@@ -176,33 +111,31 @@ impl ReservationDescriptor {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum ReservationDescriptorRef<'a> {
-    Memory(MemoryDescriptorRef<'a>),
-    Nof(NofDescriptorRef<'a>),
+    Memory(RangeDescriptorRef<'a>),
+    Nof(RangeDescriptorRef<'a>),
 }
 
 impl<'a> ReservationDescriptorRef<'a> {
     pub const fn region(self) -> MemoryRegion {
         match self {
-            Self::Memory(descriptor) => descriptor.region(),
-            Self::Nof(descriptor) => descriptor.region(),
+            Self::Memory(descriptor) | Self::Nof(descriptor) => descriptor.region(),
         }
     }
 
     pub const fn transport(self) -> &'a TransportEndpoint {
         match self {
-            Self::Memory(descriptor) => descriptor.transport(),
-            Self::Nof(descriptor) => descriptor.transport(),
+            Self::Memory(descriptor) | Self::Nof(descriptor) => descriptor.transport(),
         }
     }
 
-    pub const fn memory(self) -> Option<MemoryDescriptorRef<'a>> {
+    pub const fn memory(self) -> Option<RangeDescriptorRef<'a>> {
         match self {
             Self::Memory(descriptor) => Some(descriptor),
             Self::Nof(_) => None,
         }
     }
 
-    pub const fn nof(self) -> Option<NofDescriptorRef<'a>> {
+    pub const fn nof(self) -> Option<RangeDescriptorRef<'a>> {
         match self {
             Self::Memory(_) => None,
             Self::Nof(descriptor) => Some(descriptor),

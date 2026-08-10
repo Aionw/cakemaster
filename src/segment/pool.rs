@@ -1,20 +1,20 @@
 mod catalog;
 
-use self::catalog::{Catalog, Segment};
+use self::catalog::{Catalog, SegmentEntry};
 use super::config::{
     MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE, MIN_ALLOCATOR_NODES_PER_SEGMENT, SegmentPoolConfig,
 };
-use super::error::{AttachError, LifecycleError, LocalSsdError, PoolConfigError, ReserveError};
+use super::error::{AttachError, LocalSsdError, PoolConfigError, ReserveError, SegmentStateError};
 use super::identity::{ClientId, SegmentId};
 use super::local_ssd::{LocalSsdStats, OffloadPermit};
 use super::reservation::Reservation;
 use super::spec::{
-    CxlSegmentSpec, LocalSsdSegmentSpec, MemorySegmentSpec, NofSegmentSpec, ReplicaClass,
-    SegmentKind, SegmentMetadata, SegmentResourceId, SegmentSpec,
+    ReplicaClass, SegmentConfiguration, SegmentKind, SegmentResourceId, SegmentSpec,
 };
 use super::stats::SegmentStats;
 use parking_lot::RwLock;
 use std::fmt;
+use std::ops::Deref;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -26,62 +26,63 @@ pub struct SegmentPool {
     catalog: RwLock<Catalog>,
 }
 
+/// Metadata and runtime-state handle for one logical segment.
+///
+/// This handle does not represent an allocation and therefore never blocks
+/// removal by itself. Convert it to a capability-specific candidate before
+/// reserving capacity.
 #[derive(Clone)]
-pub struct SegmentCandidate {
+pub struct SegmentHandle {
     pool_id: u64,
-    segment: Arc<Segment>,
+    entry: Arc<SegmentEntry>,
 }
 
-impl SegmentCandidate {
+impl SegmentHandle {
     pub fn id(&self) -> SegmentId {
-        self.segment.spec().identity().id()
+        self.entry.spec().identity().id()
     }
 
     pub fn spec(&self) -> &SegmentSpec {
-        self.segment.spec()
+        self.entry.spec()
     }
 
     pub fn kind(&self) -> SegmentKind {
-        self.segment.spec().kind()
+        self.spec().kind()
     }
 
     pub fn replica_class(&self) -> ReplicaClass {
-        self.segment.spec().replica_class()
+        self.spec().replica_class()
     }
 
     pub fn resource_id(&self) -> SegmentResourceId {
-        self.segment.spec().resource_id()
-    }
-
-    pub fn memory_spec(&self) -> Option<&MemorySegmentSpec> {
-        self.segment.spec().memory()
-    }
-
-    pub fn cxl_spec(&self) -> Option<&CxlSegmentSpec> {
-        self.segment.spec().cxl()
-    }
-
-    pub fn nof_spec(&self) -> Option<&NofSegmentSpec> {
-        self.segment.spec().nof()
-    }
-
-    pub fn local_ssd_spec(&self) -> Option<&LocalSsdSegmentSpec> {
-        self.segment.spec().local_ssd()
+        self.spec().resource_id()
     }
 
     pub fn stats(&self) -> SegmentStats {
-        self.segment.stats()
+        self.entry.stats()
     }
 
     pub fn local_ssd_stats(&self) -> Option<LocalSsdStats> {
-        self.segment.local_ssd_stats()
+        self.entry.local_ssd_stats()
+    }
+
+    pub fn direct_candidate(&self) -> Option<DirectCandidate> {
+        self.entry.is_range_capacity().then(|| DirectCandidate {
+            segment: self.clone(),
+        })
+    }
+
+    pub fn offload_target(&self) -> Option<OffloadTarget> {
+        self.entry.is_local_ssd_capacity().then(|| OffloadTarget {
+            segment: self.clone(),
+        })
     }
 }
 
-impl fmt::Debug for SegmentCandidate {
+impl fmt::Debug for SegmentHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("SegmentCandidate")
+            .debug_struct("SegmentHandle")
             .field("id", &self.id())
             .field("name", &self.spec().identity().name())
             .field("stats", &self.stats())
@@ -89,11 +90,39 @@ impl fmt::Debug for SegmentCandidate {
     }
 }
 
+/// Capability token accepted by synchronous range reservation APIs.
+#[derive(Clone, Debug)]
+pub struct DirectCandidate {
+    segment: SegmentHandle,
+}
+
+impl Deref for DirectCandidate {
+    type Target = SegmentHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.segment
+    }
+}
+
+/// Capability token accepted by asynchronous LocalSSD admission APIs.
+#[derive(Clone, Debug)]
+pub struct OffloadTarget {
+    segment: SegmentHandle,
+}
+
+impl Deref for OffloadTarget {
+    type Target = SegmentHandle;
+
+    fn deref(&self) -> &Self::Target {
+        &self.segment
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PoolSnapshot {
     generation: u64,
     replica_class: ReplicaClass,
-    candidates: Arc<[SegmentCandidate]>,
+    candidates: Arc<[DirectCandidate]>,
 }
 
 impl PoolSnapshot {
@@ -105,11 +134,11 @@ impl PoolSnapshot {
         self.replica_class
     }
 
-    pub fn candidates(&self) -> &[SegmentCandidate] {
+    pub fn candidates(&self) -> &[DirectCandidate] {
         &self.candidates
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, SegmentCandidate> {
+    pub fn iter(&self) -> std::slice::Iter<'_, DirectCandidate> {
         self.candidates.iter()
     }
 
@@ -122,17 +151,10 @@ impl PoolSnapshot {
     }
 }
 
-/// A point-in-time view of LocalSSD targets eligible for asynchronous
-/// offload admission.
-///
-/// This is deliberately distinct from [`PoolSnapshot`], which is consumed by
-/// direct range placement. Keeping the snapshot types separate prevents a
-/// LocalSSD target from accidentally entering the synchronous reservation
-/// path.
 #[derive(Clone, Debug)]
 pub struct OffloadSnapshot {
     generation: u64,
-    candidates: Arc<[SegmentCandidate]>,
+    targets: Arc<[OffloadTarget]>,
 }
 
 impl OffloadSnapshot {
@@ -140,34 +162,42 @@ impl OffloadSnapshot {
         self.generation
     }
 
-    pub fn candidates(&self) -> &[SegmentCandidate] {
-        &self.candidates
+    pub fn targets(&self) -> &[OffloadTarget] {
+        &self.targets
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, SegmentCandidate> {
-        self.candidates.iter()
+    pub fn iter(&self) -> std::slice::Iter<'_, OffloadTarget> {
+        self.targets.iter()
     }
 
     pub fn len(&self) -> usize {
-        self.candidates.len()
+        self.targets.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.candidates.is_empty()
+        self.targets.is_empty()
     }
 }
 
 #[derive(Clone, Debug)]
 pub enum AttachOutcome {
-    Attached(SegmentCandidate),
-    AlreadyAttached(SegmentCandidate),
+    Attached(SegmentHandle),
+    AlreadyAttached(SegmentHandle),
 }
 
 impl AttachOutcome {
-    pub fn candidate(&self) -> &SegmentCandidate {
+    pub fn segment(&self) -> &SegmentHandle {
         match self {
-            Self::Attached(candidate) | Self::AlreadyAttached(candidate) => candidate,
+            Self::Attached(segment) | Self::AlreadyAttached(segment) => segment,
         }
+    }
+
+    pub fn direct_candidate(&self) -> Option<DirectCandidate> {
+        self.segment().direct_candidate()
+    }
+
+    pub fn offload_target(&self) -> Option<OffloadTarget> {
+        self.segment().offload_target()
     }
 
     pub const fn is_new(&self) -> bool {
@@ -199,8 +229,7 @@ impl SegmentPool {
         })
     }
 
-    pub fn attach(&self, spec: impl Into<SegmentSpec>) -> Result<AttachOutcome, AttachError> {
-        let spec = spec.into();
+    pub fn attach(&self, spec: SegmentSpec) -> Result<AttachOutcome, AttachError> {
         validate_spec(&spec)?;
         self.catalog
             .write()
@@ -219,12 +248,12 @@ impl SegmentPool {
         self.catalog.read().offload_snapshot()
     }
 
-    pub fn candidate(&self, id: SegmentId) -> Option<SegmentCandidate> {
-        self.catalog.read().candidate(id)
+    pub fn segment(&self, id: SegmentId) -> Option<SegmentHandle> {
+        self.catalog.read().segment(id)
     }
 
     pub fn stats(&self, id: SegmentId) -> Option<SegmentStats> {
-        self.candidate(id).map(|candidate| candidate.stats())
+        self.segment(id).map(|segment| segment.stats())
     }
 
     pub fn len(&self) -> usize {
@@ -238,24 +267,26 @@ impl SegmentPool {
     #[inline]
     pub fn reserve(
         &self,
-        candidate: &SegmentCandidate,
+        candidate: &DirectCandidate,
         bytes: u64,
     ) -> Result<Reservation, ReserveError> {
-        if candidate.pool_id != self.pool_id || candidate.segment.pool_id() != self.pool_id {
+        if candidate.pool_id != self.pool_id {
             return Err(ReserveError::ForeignCandidate);
         }
-        candidate.segment.reserve(bytes)
+        candidate.entry.reserve(bytes)
     }
 
     pub fn reserve_on(&self, id: SegmentId, bytes: u64) -> Result<Reservation, ReserveError> {
         if bytes == 0 {
             return Err(ReserveError::ZeroSize);
         }
-        let candidate = self.candidate(id).ok_or(ReserveError::NotFound(id))?;
+        let segment = self.segment(id).ok_or(ReserveError::NotFound(id))?;
+        let candidate = segment
+            .direct_candidate()
+            .ok_or(ReserveError::NotDirectlyAllocatable(id))?;
         self.reserve(&candidate, bytes)
     }
 
-    /// Updates the heartbeat-reported LocalSSD capacity for one client.
     pub fn report_local_ssd_capacity(
         &self,
         owner: ClientId,
@@ -267,9 +298,6 @@ impl SegmentPool {
             .report_local_ssd_capacity(owner, id, capacity_bytes)
     }
 
-    /// Applies the client's current offload heartbeat state. Disabling a
-    /// target removes it from new offload snapshots while existing permits
-    /// and leases retain their RAII accounting.
     pub fn set_local_ssd_offload_enabled(
         &self,
         owner: ClientId,
@@ -281,29 +309,26 @@ impl SegmentPool {
             .set_local_ssd_offload_enabled(owner, id, enabled)
     }
 
-    /// Reserves reported LocalSSD capacity while an asynchronous offload is
-    /// in flight. Dropping the permit aborts the admission; committing it
-    /// returns a lease suitable for publication in an object replica set.
     pub fn admit_offload(
         &self,
-        candidate: &SegmentCandidate,
+        target: &OffloadTarget,
         bytes: u64,
     ) -> Result<OffloadPermit, LocalSsdError> {
-        if candidate.pool_id != self.pool_id || candidate.segment.pool_id() != self.pool_id {
+        if target.pool_id != self.pool_id {
             return Err(LocalSsdError::ForeignCandidate);
         }
-        candidate.segment.admit_offload(bytes)
+        target.entry.admit_offload(bytes)
     }
 
-    pub fn quiesce(&self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
+    pub fn quiesce(&self, owner: ClientId, id: SegmentId) -> Result<(), SegmentStateError> {
         self.catalog.write().quiesce(owner, id)
     }
 
-    pub fn reactivate(&self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
+    pub fn reactivate(&self, owner: ClientId, id: SegmentId) -> Result<(), SegmentStateError> {
         self.catalog.write().reactivate(owner, id)
     }
 
-    pub fn remove(&self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
+    pub fn remove(&self, owner: ClientId, id: SegmentId) -> Result<(), SegmentStateError> {
         self.catalog.write().remove(owner, id)
     }
 }
@@ -315,62 +340,42 @@ impl Default for SegmentPool {
 }
 
 fn validate_spec(spec: &SegmentSpec) -> Result<(), AttachError> {
-    match spec {
-        SegmentSpec::Memory(spec) => validate_memory_spec(spec),
-        SegmentSpec::Cxl(spec) => validate_cxl_spec(spec),
-        SegmentSpec::Nof(spec) => validate_nof_spec(spec),
-        SegmentSpec::LocalSsd(spec) => validate_local_ssd_spec(spec),
-    }
-}
-
-fn validate_memory_spec(spec: &MemorySegmentSpec) -> Result<(), AttachError> {
-    validate_metadata(spec.metadata())?;
-    if matches!(spec.transport().protocol().as_str(), "cxl" | "nvmeof") {
-        return Err(AttachError::IncompatibleTransportProtocol {
-            kind: SegmentKind::Memory,
-            protocol: spec.transport().protocol().clone(),
-        });
-    }
-    if spec.region().base() == 0 {
-        return Err(AttachError::ZeroBaseAddress);
-    }
-    validate_direct_range(spec.region(), spec.transport())
-}
-
-fn validate_nof_spec(spec: &NofSegmentSpec) -> Result<(), AttachError> {
-    validate_metadata(spec.metadata())?;
-    validate_direct_range(spec.region(), spec.transport())
-}
-
-fn validate_cxl_spec(spec: &CxlSegmentSpec) -> Result<(), AttachError> {
-    validate_metadata(spec.metadata())?;
-    if spec.arena().id().as_str().is_empty() {
-        return Err(AttachError::EmptyCxlArenaId);
-    }
-    if spec.arena().capacity_bytes() == 0 {
-        return Err(AttachError::ZeroSize);
-    }
-    Ok(())
-}
-
-fn validate_local_ssd_spec(spec: &LocalSsdSegmentSpec) -> Result<(), AttachError> {
-    validate_metadata(spec.metadata())
-}
-
-fn validate_metadata(metadata: &SegmentMetadata) -> Result<(), AttachError> {
-    if metadata.identity().id().is_nil() {
+    if spec.identity().id().is_nil() {
         return Err(AttachError::NilSegmentId);
     }
-    if metadata.identity().owner().is_nil() {
+    if spec.identity().owner().is_nil() {
         return Err(AttachError::NilOwnerId);
     }
-    if metadata.identity().name().is_empty() {
+    if spec.identity().name().is_empty() {
         return Err(AttachError::EmptyName);
     }
-    if metadata.topology().host_id().is_some_and(str::is_empty) {
-        return Err(AttachError::EmptyHostId);
+    match spec.configuration() {
+        SegmentConfiguration::Memory { region, transport } => {
+            if matches!(transport.protocol().as_str(), "cxl" | "nvmeof") {
+                return Err(AttachError::IncompatibleTransportProtocol {
+                    kind: SegmentKind::Memory,
+                    protocol: transport.protocol().clone(),
+                });
+            }
+            if region.base() == 0 {
+                return Err(AttachError::ZeroBaseAddress);
+            }
+            validate_direct_range(*region, transport)
+        }
+        SegmentConfiguration::Nof { region, transport } => {
+            validate_direct_range(*region, transport)
+        }
+        SegmentConfiguration::Cxl { arena, .. } => {
+            if arena.id().as_str().is_empty() {
+                return Err(AttachError::EmptyCxlArenaId);
+            }
+            if arena.capacity_bytes() == 0 {
+                return Err(AttachError::ZeroSize);
+            }
+            Ok(())
+        }
+        SegmentConfiguration::LocalSsd { .. } => Ok(()),
     }
-    Ok(())
 }
 
 fn validate_direct_range(

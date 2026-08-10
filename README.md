@@ -51,7 +51,7 @@ SegmentPool 对 Memory、CXL、NoF 和 LocalSSD 的领域建模与扩展约束�
 use cakemaster::object::{ObjectCatalog, ObjectCatalogConfig, ObjectIdentity};
 use cakemaster::object::error::LookupError;
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
-use cakemaster::segment::{MemorySegmentSpec, SegmentPool};
+use cakemaster::segment::{SegmentSpec, SegmentPool};
 use cakemaster::segment::placement::{PlacementRequest, ReplicaAllocator};
 ```
 

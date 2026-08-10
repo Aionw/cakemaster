@@ -1,4 +1,4 @@
-//! Segment lifecycle and capacity diagnostics.
+//! Segment operational-state and capacity diagnostics.
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SegmentState {
@@ -22,13 +22,15 @@ pub struct SegmentSpaceStats {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct SegmentReservationStats {
-    pub live: u64,
+pub struct SegmentUsageStats {
+    /// Allocations, offload permits, or committed offload leases that still
+    /// hold capacity in this segment.
+    pub active_allocations: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SegmentStats {
     pub space: SegmentSpaceStats,
-    pub reservations: SegmentReservationStats,
+    pub usage: SegmentUsageStats,
     pub state: SegmentState,
 }

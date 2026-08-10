@@ -2,8 +2,8 @@
 
 use cakemaster::segment::config::DEFAULT_MAX_ALLOCATOR_NODES_PER_SEGMENT;
 use cakemaster::segment::{
-    ClientId, MemoryRegion, MemorySegmentSpec, SegmentId, SegmentIdentity, SegmentPool,
-    SegmentPoolConfig, SegmentTopology, TransportEndpoint, TransportProtocol,
+    ClientId, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool, SegmentPoolConfig,
+    SegmentSpec, TransportEndpoint, TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
@@ -73,21 +73,18 @@ fn main() {
     let owner = ClientId::new(1, 1);
     for index in 0..segments {
         let index = index as u64;
-        pool.attach(
-            MemorySegmentSpec::new(
-                SegmentIdentity::new(
-                    SegmentId::new(1, index + 1),
-                    owner,
-                    format!("memory-{index}"),
-                ),
-                MemoryRegion::new(
-                    0x1_0000_0000 + index * (SEGMENT_CAPACITY * 2),
-                    SEGMENT_CAPACITY,
-                ),
-                TransportEndpoint::new(TransportProtocol::Tcp, "127.0.0.1:12345"),
-            )
-            .with_topology(SegmentTopology::on_host(format!("host-{index}"))),
-        )
+        pool.attach(SegmentSpec::memory(
+            SegmentIdentity::new(
+                SegmentId::new(1, index + 1),
+                owner,
+                format!("memory-{index}"),
+            ),
+            MemoryRegion::new(
+                0x1_0000_0000 + index * (SEGMENT_CAPACITY * 2),
+                SEGMENT_CAPACITY,
+            ),
+            TransportEndpoint::new(TransportProtocol::Tcp, "127.0.0.1:12345"),
+        ))
         .expect("benchmark segments must be valid");
     }
     let snapshot = pool.snapshot();
@@ -179,7 +176,7 @@ fn main() {
     for candidate in snapshot.iter() {
         let stats = candidate.stats();
         assert_eq!(stats.space.used_bytes, 0);
-        assert_eq!(stats.reservations.live, 0);
+        assert_eq!(stats.usage.active_allocations, 0);
         assert_eq!(stats.space.available_bytes, stats.space.capacity_bytes);
     }
 }

@@ -2,12 +2,12 @@
 
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
-    MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
+    DirectReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
     ObjectIdentity, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
 };
 use cakemaster::segment::{
-    ClientId, MemoryRegion, MemorySegmentSpec, SegmentId, SegmentIdentity, SegmentPool,
-    SegmentPoolConfig, TransportEndpoint, TransportProtocol,
+    ClientId, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool, SegmentPoolConfig,
+    SegmentSpec, TransportEndpoint, TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -107,14 +107,14 @@ fn run_once(arguments: Arguments) -> EvictResult {
     let pool = SegmentPool::with_config(SegmentPoolConfig::new(max_allocator_nodes))
         .expect("allocator node limit must be valid");
     let candidate = pool
-        .attach(MemorySegmentSpec::new(
+        .attach(SegmentSpec::memory(
             SegmentIdentity::new(SegmentId::new(1, 1), OWNER, "batch_evict_bench_segment"),
             MemoryRegion::new(SEGMENT_BASE, segment_size),
             TransportEndpoint::new(TransportProtocol::Tcp, "127.0.0.1:12345"),
         ))
         .expect("benchmark segment must be valid")
-        .candidate()
-        .clone();
+        .direct_candidate()
+        .expect("memory segment must be directly allocatable");
     let catalog = Arc::new(
         ObjectCatalog::with_config(
             ObjectCatalogConfig::new(arguments.num_objects)
@@ -143,7 +143,7 @@ fn run_once(arguments: Arguments) -> EvictResult {
             .expect("benchmark keys are unique")
             .stage(
                 ObjectContent::new(OBJECT_BYTES),
-                ReplicaSet::one(ReplicaLease::Memory(MemoryReplica::new(
+                ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
                     ReplicaId::new(1),
                     reservation,
                 ))),

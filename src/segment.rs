@@ -13,19 +13,21 @@ mod reservation;
 mod spec;
 pub mod stats;
 mod transport;
+mod usage;
 
 pub use config::SegmentPoolConfig;
 pub use descriptor::{
-    LocalSsdDescriptor, LocalSsdDescriptorRef, MemoryDescriptor, MemoryDescriptorRef, MemoryRegion,
-    NofDescriptor, NofDescriptorRef, ReservationDescriptor, ReservationDescriptorRef,
-    SegmentTopology,
+    LocalSsdDescriptor, LocalSsdDescriptorRef, MemoryRegion, RangeDescriptor, RangeDescriptorRef,
+    ReservationDescriptor, ReservationDescriptorRef,
 };
 pub use identity::{ClientId, SegmentId, SegmentIdentity};
 pub use local_ssd::{LocalSsdLease, LocalSsdStats, OffloadPermit};
-pub use pool::{AttachOutcome, OffloadSnapshot, PoolSnapshot, SegmentCandidate, SegmentPool};
+pub use pool::{
+    AttachOutcome, DirectCandidate, OffloadSnapshot, OffloadTarget, PoolSnapshot, SegmentHandle,
+    SegmentPool,
+};
 pub use reservation::Reservation;
 pub use spec::{
-    CxlArenaId, CxlArenaSpec, CxlSegmentSpec, LocalSsdSegmentSpec, MemorySegmentSpec,
-    NofSegmentSpec, ReplicaClass, SegmentKind, SegmentMetadata, SegmentResourceId, SegmentSpec,
+    CxlArenaId, CxlArenaSpec, ReplicaClass, SegmentKind, SegmentResourceId, SegmentSpec,
 };
 pub use transport::{TransportEndpoint, TransportProtocol};

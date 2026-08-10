@@ -1,60 +1,72 @@
-use super::{AttachOutcome, OffloadSnapshot, PoolSnapshot, SegmentCandidate};
+use super::{
+    AttachOutcome, DirectCandidate, OffloadSnapshot, OffloadTarget, PoolSnapshot, SegmentHandle,
+};
 use crate::segment::descriptor::MemoryRegion;
-use crate::segment::error::{AttachError, LifecycleError, LocalSsdError, ReserveError};
+use crate::segment::error::{AttachError, LocalSsdError, ReserveError, SegmentStateError};
 use crate::segment::identity::{ClientId, SegmentId};
 use crate::segment::local_ssd::{AdmissionFailure, LocalSsdCapacity, LocalSsdStats, OffloadPermit};
 use crate::segment::offset_allocator::ByteAllocator;
-use crate::segment::reservation::{Reservation, ReservationCounter};
-use crate::segment::spec::{CxlArenaId, CxlArenaSpec, ReplicaClass, SegmentSpec};
-use crate::segment::stats::{
-    SegmentReservationStats, SegmentSpaceStats, SegmentState, SegmentStats,
+use crate::segment::reservation::Reservation;
+use crate::segment::spec::{
+    CxlArenaId, CxlArenaSpec, ReplicaClass, SegmentConfiguration, SegmentSpec,
 };
+use crate::segment::stats::{SegmentSpaceStats, SegmentState, SegmentStats, SegmentUsageStats};
+use crate::segment::usage::UsageTracker;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub(super) struct Catalog {
     pool_id: u64,
-    generation: u64,
-    segments: HashMap<SegmentId, Arc<Segment>>,
-    cxl_arenas: HashMap<CxlArenaId, CxlArena>,
-    allocatable: HashMap<ReplicaClass, Arc<[SegmentCandidate]>>,
-    offload_targets: Arc<[SegmentCandidate]>,
+    segments: HashMap<SegmentId, Arc<SegmentEntry>>,
+    resources: ResourceRegistry,
+    indexes: CandidateIndexes,
 }
 
-struct CxlArena {
+#[derive(Default)]
+struct ResourceRegistry {
+    cxl_arenas: HashMap<CxlArenaId, CxlArenaResource>,
+}
+
+struct CxlArenaResource {
     spec: CxlArenaSpec,
-    allocator: ByteAllocator,
+    capacity: ByteAllocator,
+    attached_segments: usize,
 }
 
-pub(super) struct Segment {
-    pool_id: u64,
+#[derive(Default)]
+struct CandidateIndexes {
+    direct_generation: u64,
+    direct: HashMap<ReplicaClass, Arc<[DirectCandidate]>>,
+    offload_generation: u64,
+    offload: Arc<[OffloadTarget]>,
+}
+
+pub(super) struct SegmentEntry {
     spec: Arc<SegmentSpec>,
-    phase: Mutex<SegmentState>,
-    backend: SegmentBackend,
-    live_reservations: Arc<AtomicU64>,
-    accepting: AtomicBool,
+    state: Mutex<SegmentState>,
+    capacity: CapacityHandle,
+    usage: UsageTracker,
 }
 
-enum SegmentBackend {
-    Direct(ByteAllocator),
+enum CapacityHandle {
+    Range(ByteAllocator),
     LocalSsd(LocalSsdCapacity),
 }
 
-struct CatalogMutation<'a> {
-    catalog: &'a mut Catalog,
+#[derive(Clone, Copy)]
+enum CandidateCapability {
+    Direct(ReplicaClass),
+    Offload,
 }
 
 impl Catalog {
     pub(super) fn new(pool_id: u64) -> Self {
         Self {
             pool_id,
-            generation: 0,
             segments: HashMap::new(),
-            cxl_arenas: HashMap::new(),
-            allocatable: HashMap::new(),
-            offload_targets: Arc::from([]),
+            resources: ResourceRegistry::default(),
+            indexes: CandidateIndexes::default(),
         }
     }
 
@@ -63,7 +75,7 @@ impl Catalog {
         spec: SegmentSpec,
         max_allocator_nodes: u32,
     ) -> Result<AttachOutcome, AttachError> {
-        if let Some(existing) = self.candidate(spec.identity().id()) {
+        if let Some(existing) = self.segment(spec.identity().id()) {
             return if existing.spec() == &spec {
                 Ok(AttachOutcome::AlreadyAttached(existing))
             } else {
@@ -72,18 +84,21 @@ impl Catalog {
         }
 
         self.validate_resource_conflicts(&spec)?;
-
-        let backend = self.backend_for(&spec, max_allocator_nodes)?;
-        let candidate = self.mutation().insert(spec, backend);
-        Ok(AttachOutcome::Attached(candidate))
+        let capacity = self.resources.bind(&spec, max_allocator_nodes)?;
+        let entry = Arc::new(SegmentEntry::new(Arc::new(spec), capacity));
+        let segment = self.handle(entry.clone());
+        self.segments.insert(segment.id(), entry);
+        self.rebuild_indexes();
+        Ok(AttachOutcome::Attached(segment))
     }
 
     pub(super) fn snapshot(&self, replica_class: ReplicaClass) -> PoolSnapshot {
         PoolSnapshot {
-            generation: self.generation,
+            generation: self.indexes.direct_generation,
             replica_class,
             candidates: self
-                .allocatable
+                .indexes
+                .direct
                 .get(&replica_class)
                 .cloned()
                 .unwrap_or_else(|| Arc::from([])),
@@ -92,16 +107,16 @@ impl Catalog {
 
     pub(super) fn offload_snapshot(&self) -> OffloadSnapshot {
         OffloadSnapshot {
-            generation: self.generation,
-            candidates: self.offload_targets.clone(),
+            generation: self.indexes.offload_generation,
+            targets: self.indexes.offload.clone(),
         }
     }
 
-    pub(super) fn candidate(&self, id: SegmentId) -> Option<SegmentCandidate> {
-        self.segments.get(&id).map(|segment| SegmentCandidate {
-            pool_id: self.pool_id,
-            segment: segment.clone(),
-        })
+    pub(super) fn segment(&self, id: SegmentId) -> Option<SegmentHandle> {
+        self.segments
+            .get(&id)
+            .cloned()
+            .map(|entry| self.handle(entry))
     }
 
     pub(super) fn len(&self) -> usize {
@@ -114,7 +129,7 @@ impl Catalog {
         id: SegmentId,
         capacity_bytes: u64,
     ) -> Result<(), LocalSsdError> {
-        self.owned_local_ssd_segment(owner, id)?
+        self.owned_local_ssd_entry(owner, id)?
             .report_local_ssd_capacity(capacity_bytes)
     }
 
@@ -124,39 +139,86 @@ impl Catalog {
         id: SegmentId,
         enabled: bool,
     ) -> Result<(), LocalSsdError> {
-        self.owned_local_ssd_segment(owner, id)?
+        self.owned_local_ssd_entry(owner, id)?
             .set_local_ssd_offload_enabled(enabled)?;
-        self.rebuild_snapshot();
+        self.rebuild_indexes();
         Ok(())
     }
 
-    pub(super) fn quiesce(&mut self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
-        self.mutation().quiesce(owner, id)
+    pub(super) fn quiesce(
+        &mut self,
+        owner: ClientId,
+        id: SegmentId,
+    ) -> Result<(), SegmentStateError> {
+        self.owned_entry(owner, id)?.quiesce();
+        self.rebuild_indexes();
+        Ok(())
     }
 
     pub(super) fn reactivate(
         &mut self,
         owner: ClientId,
         id: SegmentId,
-    ) -> Result<(), LifecycleError> {
-        self.mutation().reactivate(owner, id)
+    ) -> Result<(), SegmentStateError> {
+        self.owned_entry(owner, id)?.reactivate();
+        self.rebuild_indexes();
+        Ok(())
     }
 
-    pub(super) fn remove(&mut self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
-        self.mutation().remove(owner, id)
+    pub(super) fn remove(
+        &mut self,
+        owner: ClientId,
+        id: SegmentId,
+    ) -> Result<(), SegmentStateError> {
+        let entry = self.owned_entry(owner, id)?;
+        entry.prepare_remove()?;
+        let removed = self
+            .segments
+            .remove(&id)
+            .expect("owned entries remain registered while the catalog is write-locked");
+        self.resources.unbind(removed.spec());
+        self.rebuild_indexes();
+        Ok(())
     }
 
-    fn owned_local_ssd_segment(
+    fn handle(&self, entry: Arc<SegmentEntry>) -> SegmentHandle {
+        SegmentHandle {
+            pool_id: self.pool_id,
+            entry,
+        }
+    }
+
+    fn owned_entry(
         &self,
         owner: ClientId,
         id: SegmentId,
-    ) -> Result<Arc<Segment>, LocalSsdError> {
-        let segment = self
+    ) -> Result<Arc<SegmentEntry>, SegmentStateError> {
+        let entry = self
+            .segments
+            .get(&id)
+            .cloned()
+            .ok_or(SegmentStateError::NotFound(id))?;
+        if entry.spec.identity().owner() != owner {
+            return Err(SegmentStateError::OwnerMismatch {
+                segment: id,
+                expected: entry.spec.identity().owner(),
+                actual: owner,
+            });
+        }
+        Ok(entry)
+    }
+
+    fn owned_local_ssd_entry(
+        &self,
+        owner: ClientId,
+        id: SegmentId,
+    ) -> Result<Arc<SegmentEntry>, LocalSsdError> {
+        let entry = self
             .segments
             .get(&id)
             .cloned()
             .ok_or(LocalSsdError::NotFound(id))?;
-        let expected = segment.spec.identity().owner();
+        let expected = entry.spec.identity().owner();
         if expected != owner {
             return Err(LocalSsdError::OwnerMismatch {
                 segment: id,
@@ -164,238 +226,205 @@ impl Catalog {
                 actual: owner,
             });
         }
-        if !matches!(&segment.backend, SegmentBackend::LocalSsd(_)) {
+        if !entry.is_local_ssd_capacity() {
             return Err(LocalSsdError::NotLocalSsd(id));
         }
-        Ok(segment)
+        Ok(entry)
     }
 
     fn validate_resource_conflicts(&self, spec: &SegmentSpec) -> Result<(), AttachError> {
-        match spec {
-            SegmentSpec::Memory(spec) => {
-                let end = spec.region().end().ok_or(AttachError::AddressOverflow)?;
-                if let Some(existing) = self.segments.values().find_map(|segment| {
-                    let existing = segment.spec.memory()?;
-                    (existing.identity().owner() == spec.identity().owner()
-                        && existing.transport() == spec.transport()
-                        && spec.region().base()
-                            < existing
-                                .region()
-                                .end()
-                                .expect("attached segments are valid")
-                        && existing.region().base() < end)
-                        .then(|| existing.identity().id())
+        match spec.configuration() {
+            SegmentConfiguration::Memory { region, transport } => {
+                let end = region.end().ok_or(AttachError::AddressOverflow)?;
+                if let Some(existing) = self.segments.values().find_map(|entry| {
+                    let SegmentConfiguration::Memory {
+                        region: existing_region,
+                        transport: existing_transport,
+                    } = entry.spec.configuration()
+                    else {
+                        return None;
+                    };
+                    (entry.spec.identity().owner() == spec.identity().owner()
+                        && existing_transport == transport
+                        && region.base()
+                            < existing_region.end().expect("attached segments are valid")
+                        && existing_region.base() < end)
+                        .then(|| entry.spec.identity().id())
                 }) {
                     return Err(AttachError::OverlappingAddressRange { existing });
                 }
             }
-            SegmentSpec::Nof(spec) => {
-                if let Some(existing) = self.segments.values().find_map(|segment| {
-                    let existing = segment.spec.nof()?;
-                    (existing.transport() == spec.transport()).then(|| existing.identity().id())
+            SegmentConfiguration::Nof { transport, .. } => {
+                if let Some(existing) = self.segments.values().find_map(|entry| {
+                    let SegmentConfiguration::Nof {
+                        transport: existing_transport,
+                        ..
+                    } = entry.spec.configuration()
+                    else {
+                        return None;
+                    };
+                    (existing_transport == transport).then(|| entry.spec.identity().id())
                 }) {
                     return Err(AttachError::DuplicateNofEndpoint { existing });
                 }
             }
-            SegmentSpec::Cxl(_) => {}
-            SegmentSpec::LocalSsd(spec) => {
-                if let Some(existing) = self.segments.values().find_map(|segment| {
-                    let existing = segment.spec.local_ssd()?;
-                    (existing.identity().owner() == spec.identity().owner())
-                        .then(|| existing.identity().id())
+            SegmentConfiguration::LocalSsd { .. } => {
+                if let Some(existing) = self.segments.values().find_map(|entry| {
+                    matches!(
+                        entry.spec.configuration(),
+                        SegmentConfiguration::LocalSsd { .. }
+                    )
+                    .then(|| entry.spec.identity())
+                    .filter(|identity| identity.owner() == spec.identity().owner())
+                    .map(|identity| identity.id())
                 }) {
                     return Err(AttachError::DuplicateLocalSsdOwner { existing });
                 }
             }
+            SegmentConfiguration::Cxl { .. } => {}
         }
         Ok(())
     }
 
-    fn backend_for(
+    fn rebuild_indexes(&mut self) {
+        let mut direct: HashMap<_, Vec<_>> = HashMap::new();
+        let mut offload = Vec::new();
+
+        for entry in self.segments.values() {
+            let Some(capability) = entry.candidate_capability() else {
+                continue;
+            };
+            let segment = self.handle(entry.clone());
+            match capability {
+                CandidateCapability::Direct(replica_class) => direct
+                    .entry(replica_class)
+                    .or_default()
+                    .push(DirectCandidate { segment }),
+                CandidateCapability::Offload => offload.push(OffloadTarget { segment }),
+            }
+        }
+
+        for candidates in direct.values_mut() {
+            candidates.sort_unstable_by_key(|candidate| candidate.id());
+        }
+        offload.sort_unstable_by_key(|target| target.id());
+
+        if !same_direct_index(&direct, &self.indexes.direct) {
+            self.indexes.direct = direct
+                .into_iter()
+                .map(|(class, candidates)| (class, Arc::from(candidates)))
+                .collect();
+            self.indexes.direct_generation = self.indexes.direct_generation.wrapping_add(1);
+        }
+        if !same_offload_index(&offload, &self.indexes.offload) {
+            self.indexes.offload = Arc::from(offload);
+            self.indexes.offload_generation = self.indexes.offload_generation.wrapping_add(1);
+        }
+    }
+}
+
+impl ResourceRegistry {
+    fn bind(
         &mut self,
         spec: &SegmentSpec,
         max_allocator_nodes: u32,
-    ) -> Result<SegmentBackend, AttachError> {
-        if let SegmentSpec::LocalSsd(local_ssd) = spec {
-            return Ok(SegmentBackend::LocalSsd(LocalSsdCapacity::new(
-                local_ssd.initial_offload_enabled(),
-            )));
-        }
+    ) -> Result<CapacityHandle, AttachError> {
+        match spec.configuration() {
+            SegmentConfiguration::Cxl { arena, .. } => {
+                if let Some(resource) = self.cxl_arenas.get_mut(arena.id()) {
+                    if &resource.spec != arena {
+                        return Err(AttachError::ConflictingCxlArena {
+                            arena: arena.id().clone(),
+                        });
+                    }
+                    resource.attached_segments += 1;
+                    return Ok(CapacityHandle::Range(resource.capacity.clone()));
+                }
 
-        let SegmentSpec::Cxl(cxl) = spec else {
-            let region = spec
-                .direct_region()
-                .expect("non-LocalSSD segments have a direct byte range");
-            return Ok(SegmentBackend::Direct(ByteAllocator::new(
-                region.size(),
-                max_allocator_nodes,
-            )));
-        };
-
-        if let Some(arena) = self.cxl_arenas.get(cxl.arena().id()) {
-            if &arena.spec != cxl.arena() {
-                return Err(AttachError::ConflictingCxlArena {
-                    arena: cxl.arena().id().clone(),
-                });
+                let capacity = ByteAllocator::new(arena.capacity_bytes(), max_allocator_nodes);
+                self.cxl_arenas.insert(
+                    arena.id().clone(),
+                    CxlArenaResource {
+                        spec: arena.clone(),
+                        capacity: capacity.clone(),
+                        attached_segments: 1,
+                    },
+                );
+                Ok(CapacityHandle::Range(capacity))
             }
-            return Ok(SegmentBackend::Direct(arena.allocator.clone()));
+            SegmentConfiguration::LocalSsd {
+                initial_offload_enabled,
+            } => Ok(CapacityHandle::LocalSsd(LocalSsdCapacity::new(
+                *initial_offload_enabled,
+            ))),
+            SegmentConfiguration::Memory { region, .. }
+            | SegmentConfiguration::Nof { region, .. } => Ok(CapacityHandle::Range(
+                ByteAllocator::new(region.size(), max_allocator_nodes),
+            )),
         }
-
-        let allocator = ByteAllocator::new(cxl.arena().capacity_bytes(), max_allocator_nodes);
-        self.cxl_arenas.insert(
-            cxl.arena().id().clone(),
-            CxlArena {
-                spec: cxl.arena().clone(),
-                allocator: allocator.clone(),
-            },
-        );
-        Ok(SegmentBackend::Direct(allocator))
     }
 
-    fn mutation(&mut self) -> CatalogMutation<'_> {
-        CatalogMutation { catalog: self }
-    }
-
-    fn rebuild_snapshot(&mut self) {
-        let mut candidates_by_class: HashMap<_, Vec<_>> = HashMap::new();
-        let mut offload_targets = Vec::new();
-        for segment in self
-            .segments
-            .values()
-            .filter(|segment| segment.accepting.load(Ordering::Acquire))
-        {
-            let candidate = SegmentCandidate {
-                pool_id: self.pool_id,
-                segment: segment.clone(),
-            };
-            match &segment.backend {
-                SegmentBackend::LocalSsd(capacity) if capacity.offload_enabled() => {
-                    offload_targets.push(candidate);
-                }
-                SegmentBackend::LocalSsd(_) => {}
-                SegmentBackend::Direct(_) => {
-                    candidates_by_class
-                        .entry(segment.spec.replica_class())
-                        .or_default()
-                        .push(candidate);
-                }
-            }
-        }
-        for candidates in candidates_by_class.values_mut() {
-            candidates.sort_unstable_by_key(SegmentCandidate::id);
-        }
-        offload_targets.sort_unstable_by_key(SegmentCandidate::id);
-
-        let unchanged = candidates_by_class.len() == self.allocatable.len()
-            && candidates_by_class
-                .iter()
-                .all(|(replica_class, candidates)| {
-                    self.allocatable.get(replica_class).is_some_and(|current| {
-                        candidates.len() == current.len()
-                            && candidates
-                                .iter()
-                                .zip(current.iter())
-                                .all(|(candidate, current)| {
-                                    Arc::ptr_eq(&candidate.segment, &current.segment)
-                                })
-                    })
-                })
-            && same_candidates(&offload_targets, &self.offload_targets);
-        if unchanged {
+    fn unbind(&mut self, spec: &SegmentSpec) {
+        let Some(arena) = spec.cxl_arena() else {
             return;
-        }
-        self.allocatable = candidates_by_class
-            .into_iter()
-            .map(|(replica_class, candidates)| (replica_class, Arc::from(candidates)))
-            .collect();
-        self.offload_targets = Arc::from(offload_targets);
-        self.generation = self.generation.wrapping_add(1);
-    }
-}
-
-impl CatalogMutation<'_> {
-    fn insert(&mut self, spec: SegmentSpec, backend: SegmentBackend) -> SegmentCandidate {
-        let spec = Arc::new(spec);
-        let segment = Arc::new(Segment::new(self.catalog.pool_id, spec, backend));
-        let candidate = SegmentCandidate {
-            pool_id: self.catalog.pool_id,
-            segment: segment.clone(),
         };
-        let id = segment.spec.identity().id();
-        self.catalog.segments.insert(id, segment);
-        candidate
-    }
-
-    fn quiesce(&mut self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
-        let segment = self.owned_segment(owner, id)?;
-        segment.quiesce();
-        Ok(())
-    }
-
-    fn reactivate(&mut self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
-        let segment = self.owned_segment(owner, id)?;
-        segment.reactivate();
-        Ok(())
-    }
-
-    fn remove(&mut self, owner: ClientId, id: SegmentId) -> Result<(), LifecycleError> {
-        let segment = self.owned_segment(owner, id)?;
-        segment.prepare_remove()?;
-        self.catalog.segments.remove(&id);
-        Ok(())
-    }
-
-    fn owned_segment(
-        &self,
-        owner: ClientId,
-        id: SegmentId,
-    ) -> Result<Arc<Segment>, LifecycleError> {
-        let segment = self
-            .catalog
-            .segments
-            .get(&id)
-            .cloned()
-            .ok_or(LifecycleError::NotFound(id))?;
-        if segment.spec.identity().owner() != owner {
-            return Err(LifecycleError::OwnerMismatch {
-                segment: id,
-                expected: segment.spec.identity().owner(),
-                actual: owner,
-            });
+        let remove = {
+            let resource = self
+                .cxl_arenas
+                .get_mut(arena.id())
+                .expect("attached CXL segments retain a registered arena");
+            resource.attached_segments = resource
+                .attached_segments
+                .checked_sub(1)
+                .expect("CXL arena attachment accounting remains balanced");
+            resource.attached_segments == 0
+        };
+        if remove {
+            self.cxl_arenas.remove(arena.id());
         }
-        Ok(segment)
     }
 }
 
-impl Drop for CatalogMutation<'_> {
-    fn drop(&mut self) {
-        self.catalog.rebuild_snapshot();
-    }
-}
-
-impl Segment {
-    fn new(pool_id: u64, spec: Arc<SegmentSpec>, backend: SegmentBackend) -> Self {
+impl SegmentEntry {
+    fn new(spec: Arc<SegmentSpec>, capacity: CapacityHandle) -> Self {
         Self {
-            pool_id,
             spec,
-            phase: Mutex::new(SegmentState::Accepting),
-            backend,
-            live_reservations: Arc::new(AtomicU64::new(0)),
-            accepting: AtomicBool::new(true),
+            state: Mutex::new(SegmentState::Accepting),
+            capacity,
+            usage: UsageTracker::new(),
         }
-    }
-
-    pub(super) const fn pool_id(&self) -> u64 {
-        self.pool_id
     }
 
     pub(super) fn spec(&self) -> &SegmentSpec {
         &self.spec
     }
 
+    pub(super) const fn is_range_capacity(&self) -> bool {
+        matches!(&self.capacity, CapacityHandle::Range(_))
+    }
+
+    pub(super) const fn is_local_ssd_capacity(&self) -> bool {
+        matches!(&self.capacity, CapacityHandle::LocalSsd(_))
+    }
+
+    fn candidate_capability(&self) -> Option<CandidateCapability> {
+        if !self.state.lock().is_accepting() {
+            return None;
+        }
+        match &self.capacity {
+            CapacityHandle::Range(_) => {
+                Some(CandidateCapability::Direct(self.spec.replica_class()))
+            }
+            CapacityHandle::LocalSsd(capacity) if capacity.offload_enabled() => {
+                Some(CandidateCapability::Offload)
+            }
+            CapacityHandle::LocalSsd(_) => None,
+        }
+    }
+
     #[inline]
-    pub(super) fn reserve(self: &Arc<Self>, bytes: u64) -> Result<Reservation, ReserveError> {
-        let SegmentBackend::Direct(allocator) = &self.backend else {
+    pub(super) fn reserve(&self, bytes: u64) -> Result<Reservation, ReserveError> {
+        let CapacityHandle::Range(capacity) = &self.capacity else {
             return Err(ReserveError::NotDirectlyAllocatable(
                 self.spec.identity().id(),
             ));
@@ -403,38 +432,31 @@ impl Segment {
         if bytes == 0 {
             return Err(ReserveError::ZeroSize);
         }
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(ReserveError::NotAccepting(self.spec.identity().id()));
-        }
-        if !allocator.may_satisfy(bytes) {
+        if !capacity.may_satisfy(bytes) {
             return Err(ReserveError::OutOfSpace(self.spec.identity().id()));
         }
 
-        let phase = self.phase.lock();
-        if *phase != SegmentState::Accepting {
+        let state = self.state.lock();
+        if !state.is_accepting() {
             return Err(ReserveError::NotAccepting(self.spec.identity().id()));
         }
-
-        let allocation = allocator
+        let allocation = capacity
             .allocate_after_precheck(bytes)
             .ok_or(ReserveError::OutOfSpace(self.spec.identity().id()))?;
-        let buffer_address = match self
+        let buffer_address = self
             .spec
             .direct_region()
-            .expect("direct backends have a byte range")
+            .expect("range capacity retains a direct byte range")
             .base()
             .checked_add(allocation.offset())
-        {
-            Some(address) => address,
-            None => return Err(ReserveError::AddressOverflow(self.spec.identity().id())),
-        };
-        let counter = ReservationCounter::acquire(self.live_reservations.clone());
-        drop(phase);
+            .ok_or(ReserveError::AddressOverflow(self.spec.identity().id()))?;
+        let usage = self.usage.acquire();
+        drop(state);
 
         Ok(Reservation {
             allocation,
             segment: self.spec.clone(),
-            _counter: counter,
+            _usage: usage,
             region: MemoryRegion::new(buffer_address, bytes),
         })
     }
@@ -443,7 +465,7 @@ impl Segment {
         &self,
         capacity_bytes: u64,
     ) -> Result<(), LocalSsdError> {
-        let SegmentBackend::LocalSsd(capacity) = &self.backend else {
+        let CapacityHandle::LocalSsd(capacity) = &self.capacity else {
             return Err(LocalSsdError::NotLocalSsd(self.spec.identity().id()));
         };
         capacity.report(capacity_bytes);
@@ -451,30 +473,24 @@ impl Segment {
     }
 
     pub(super) fn set_local_ssd_offload_enabled(&self, enabled: bool) -> Result<(), LocalSsdError> {
-        let SegmentBackend::LocalSsd(capacity) = &self.backend else {
+        let CapacityHandle::LocalSsd(capacity) = &self.capacity else {
             return Err(LocalSsdError::NotLocalSsd(self.spec.identity().id()));
         };
         capacity.set_offload_enabled(enabled);
         Ok(())
     }
 
-    pub(super) fn admit_offload(
-        self: &Arc<Self>,
-        bytes: u64,
-    ) -> Result<OffloadPermit, LocalSsdError> {
+    pub(super) fn admit_offload(&self, bytes: u64) -> Result<OffloadPermit, LocalSsdError> {
         let id = self.spec.identity().id();
-        let SegmentBackend::LocalSsd(capacity) = &self.backend else {
+        let CapacityHandle::LocalSsd(capacity) = &self.capacity else {
             return Err(LocalSsdError::NotLocalSsd(id));
         };
         if bytes == 0 {
             return Err(LocalSsdError::ZeroSize);
         }
-        if !self.accepting.load(Ordering::Acquire) {
-            return Err(LocalSsdError::NotAccepting(id));
-        }
 
-        let phase = self.phase.lock();
-        if *phase != SegmentState::Accepting {
+        let state = self.state.lock();
+        if !state.is_accepting() {
             return Err(LocalSsdError::NotAccepting(id));
         }
         let allocation = capacity.admit(bytes).map_err(|error| match error {
@@ -482,52 +498,45 @@ impl Segment {
             AdmissionFailure::CapacityNotReported => LocalSsdError::CapacityNotReported(id),
             AdmissionFailure::OutOfSpace => LocalSsdError::OutOfSpace(id),
         })?;
-        let permit = OffloadPermit::new(
-            allocation,
-            self.live_reservations.clone(),
-            self.spec.clone(),
-        );
-        drop(phase);
+        let permit = OffloadPermit::new(allocation, self.usage.acquire(), self.spec.clone());
+        drop(state);
         Ok(permit)
     }
 
     pub(super) fn local_ssd_stats(&self) -> Option<LocalSsdStats> {
-        match &self.backend {
-            SegmentBackend::Direct(_) => None,
-            SegmentBackend::LocalSsd(capacity) => Some(capacity.stats()),
+        match &self.capacity {
+            CapacityHandle::Range(_) => None,
+            CapacityHandle::LocalSsd(capacity) => Some(capacity.stats()),
         }
     }
 
     fn quiesce(&self) {
-        let mut phase = self.phase.lock();
-        if *phase == SegmentState::Accepting {
-            *phase = SegmentState::Quiesced;
-            self.accepting.store(false, Ordering::Release);
+        let mut state = self.state.lock();
+        if state.is_accepting() {
+            *state = SegmentState::Quiesced;
         }
     }
 
     fn reactivate(&self) {
-        let mut phase = self.phase.lock();
-        if *phase == SegmentState::Quiesced {
-            *phase = SegmentState::Accepting;
-            self.accepting.store(true, Ordering::Release);
+        let mut state = self.state.lock();
+        if *state == SegmentState::Quiesced {
+            *state = SegmentState::Accepting;
         }
     }
 
-    fn prepare_remove(&self) -> Result<(), LifecycleError> {
-        let mut phase = self.phase.lock();
-        let live_allocations = self.live_reservations.load(Ordering::Acquire);
-        match *phase {
+    fn prepare_remove(&self) -> Result<(), SegmentStateError> {
+        let mut state = self.state.lock();
+        let active_allocations = self.usage.active_allocations();
+        match *state {
             SegmentState::Accepting => {
-                Err(LifecycleError::StillAccepting(self.spec.identity().id()))
+                Err(SegmentStateError::StillAccepting(self.spec.identity().id()))
             }
-            SegmentState::Quiesced if live_allocations != 0 => Err(LifecycleError::Busy {
+            SegmentState::Quiesced if active_allocations != 0 => Err(SegmentStateError::Busy {
                 segment: self.spec.identity().id(),
-                live_allocations,
+                active_allocations,
             }),
             SegmentState::Quiesced => {
-                *phase = SegmentState::Removed;
-                self.accepting.store(false, Ordering::Release);
+                *state = SegmentState::Removed;
                 Ok(())
             }
             SegmentState::Removed => Ok(()),
@@ -535,10 +544,10 @@ impl Segment {
     }
 
     pub(super) fn stats(&self) -> SegmentStats {
-        let state = *self.phase.lock();
-        let space = match &self.backend {
-            SegmentBackend::Direct(allocator) => {
-                let stats = allocator.stats();
+        let state = *self.state.lock();
+        let space = match &self.capacity {
+            CapacityHandle::Range(capacity) => {
+                let stats = capacity.stats();
                 SegmentSpaceStats {
                     capacity_bytes: stats.capacity,
                     used_bytes: stats.used_bytes,
@@ -546,7 +555,7 @@ impl Segment {
                     largest_free_region_bytes: stats.largest_free_region,
                 }
             }
-            SegmentBackend::LocalSsd(capacity) => {
+            CapacityHandle::LocalSsd(capacity) => {
                 let stats = capacity.stats();
                 SegmentSpaceStats {
                     capacity_bytes: stats.capacity_bytes,
@@ -558,18 +567,34 @@ impl Segment {
         };
         SegmentStats {
             space,
-            reservations: SegmentReservationStats {
-                live: self.live_reservations.load(Ordering::Acquire),
+            usage: SegmentUsageStats {
+                active_allocations: self.usage.active_allocations(),
             },
             state,
         }
     }
 }
 
-fn same_candidates(left: &[SegmentCandidate], right: &[SegmentCandidate]) -> bool {
+fn same_direct_index(
+    left: &HashMap<ReplicaClass, Vec<DirectCandidate>>,
+    right: &HashMap<ReplicaClass, Arc<[DirectCandidate]>>,
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(class, candidates)| {
+            right.get(class).is_some_and(|current| {
+                candidates.len() == current.len()
+                    && candidates
+                        .iter()
+                        .zip(current.iter())
+                        .all(|(left, right)| Arc::ptr_eq(&left.entry, &right.entry))
+            })
+        })
+}
+
+fn same_offload_index(left: &[OffloadTarget], right: &[OffloadTarget]) -> bool {
     left.len() == right.len()
         && left
             .iter()
             .zip(right.iter())
-            .all(|(left, right)| Arc::ptr_eq(&left.segment, &right.segment))
+            .all(|(left, right)| Arc::ptr_eq(&left.entry, &right.entry))
 }

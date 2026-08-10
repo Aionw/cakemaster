@@ -24,7 +24,5 @@ pub use catalog::{ObjectCatalog, ObjectHandle, ObjectRead, PutClaim, PutTicket};
 pub use config::ObjectCatalogConfig;
 pub use content::{ObjectContent, ObjectKind};
 pub use identity::{NamespaceId, ObjectIdentity, ObjectKey, ObjectLookup};
-pub use replica::{
-    LocalSsdReplica, MemoryReplica, NofReplica, ReplicaId, ReplicaLease, ReplicaSet,
-};
+pub use replica::{DirectReplica, LocalSsdReplica, ReplicaId, ReplicaLease, ReplicaSet};
 pub use write::{ObjectCommit, WriteId, WriteOwner};

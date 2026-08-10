@@ -1,6 +1,6 @@
 use super::error::ReserveError;
-use super::identity::SegmentId;
-use super::pool::{PoolSnapshot, SegmentCandidate, SegmentPool};
+use super::identity::{ClientId, SegmentId};
+use super::pool::{DirectCandidate, PoolSnapshot, SegmentPool};
 use super::reservation::Reservation;
 use super::spec::{ReplicaClass, SegmentKind, SegmentResourceId};
 use super::stats::SegmentStats;
@@ -20,7 +20,7 @@ pub enum FailureDomain {
     #[default]
     Segment,
     Resource,
-    Host,
+    Owner,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -169,14 +169,14 @@ impl PlacementRequest {
 }
 
 pub trait PlacementPolicy: Send + Sync {
-    fn order(&self, snapshot: &PoolSnapshot, request: &PlacementRequest) -> Vec<SegmentCandidate>;
+    fn order(&self, snapshot: &PoolSnapshot, request: &PlacementRequest) -> Vec<DirectCandidate>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FreeCapacityPolicy;
 
 impl PlacementPolicy for FreeCapacityPolicy {
-    fn order(&self, snapshot: &PoolSnapshot, request: &PlacementRequest) -> Vec<SegmentCandidate> {
+    fn order(&self, snapshot: &PoolSnapshot, request: &PlacementRequest) -> Vec<DirectCandidate> {
         let mut candidates: Vec<_> = snapshot
             .iter()
             .filter_map(|candidate| {
@@ -337,28 +337,24 @@ pub enum PlacementError {
 enum DomainKey {
     Segment(SegmentId),
     Resource(SegmentResourceId),
-    Host(Arc<str>),
-    SegmentWithoutHost(SegmentId),
+    Owner(ClientId),
 }
 
 struct RankedCandidate {
-    candidate: SegmentCandidate,
+    candidate: DirectCandidate,
     stats: SegmentStats,
     preference: usize,
 }
 
-fn domain_key(candidate: &SegmentCandidate, domain: FailureDomain) -> DomainKey {
+fn domain_key(candidate: &DirectCandidate, domain: FailureDomain) -> DomainKey {
     match domain {
         FailureDomain::Segment => DomainKey::Segment(candidate.id()),
         FailureDomain::Resource => DomainKey::Resource(candidate.resource_id()),
-        FailureDomain::Host => candidate.spec().topology().host_id_arc().map_or_else(
-            || DomainKey::SegmentWithoutHost(candidate.id()),
-            DomainKey::Host,
-        ),
+        FailureDomain::Owner => DomainKey::Owner(candidate.spec().identity().owner()),
     }
 }
 
-fn preference_rank(request: &PlacementRequest, candidate: &SegmentCandidate) -> usize {
+fn preference_rank(request: &PlacementRequest, candidate: &DirectCandidate) -> usize {
     request
         .constraints
         .preferred_names

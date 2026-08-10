@@ -1,7 +1,7 @@
 use crate::segment::placement::ReservationSet;
 use crate::segment::{
-    LocalSsdDescriptor, LocalSsdDescriptorRef, LocalSsdLease, MemoryDescriptor,
-    MemoryDescriptorRef, NofDescriptor, NofDescriptorRef, ReplicaClass, Reservation, SegmentId,
+    LocalSsdDescriptor, LocalSsdDescriptorRef, LocalSsdLease, ReplicaClass, Reservation,
+    ReservationDescriptor, ReservationDescriptorRef, SegmentId,
 };
 use std::fmt;
 
@@ -18,17 +18,17 @@ impl ReplicaId {
     }
 }
 
-pub struct MemoryReplica {
+pub struct DirectReplica {
     id: ReplicaId,
     reservation: Reservation,
 }
 
-impl MemoryReplica {
+impl DirectReplica {
     pub fn new(id: ReplicaId, reservation: Reservation) -> Self {
-        assert_eq!(
+        assert_ne!(
             reservation.replica_class(),
-            ReplicaClass::Memory,
-            "MemoryReplica requires a memory reservation"
+            ReplicaClass::LocalSsd,
+            "DirectReplica requires a direct reservation"
         );
         Self { id, reservation }
     }
@@ -41,63 +41,8 @@ impl MemoryReplica {
         self.reservation.segment_id()
     }
 
-    pub const fn reserved_bytes(&self) -> u64 {
-        self.reservation.reserved_bytes()
-    }
-
-    pub const fn capacity_bytes(&self) -> u64 {
-        self.reservation.requested_bytes()
-    }
-
-    pub fn descriptor(&self) -> MemoryDescriptorRef<'_> {
-        self.reservation
-            .descriptor()
-            .memory()
-            .expect("MemoryReplica requires a memory reservation")
-    }
-
-    pub fn owned_descriptor(&self) -> MemoryDescriptor {
-        self.descriptor().to_owned()
-    }
-
-    pub(crate) fn into_reservation(self) -> Reservation {
-        self.reservation
-    }
-}
-
-impl fmt::Debug for MemoryReplica {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("MemoryReplica")
-            .field("id", &self.id)
-            .field("segment_id", &self.segment_id())
-            .field("reserved_bytes", &self.reserved_bytes())
-            .field("descriptor", &self.descriptor())
-            .finish()
-    }
-}
-
-pub struct NofReplica {
-    id: ReplicaId,
-    reservation: Reservation,
-}
-
-impl NofReplica {
-    pub fn new(id: ReplicaId, reservation: Reservation) -> Self {
-        assert_eq!(
-            reservation.replica_class(),
-            ReplicaClass::Nof,
-            "NofReplica requires a NoF reservation"
-        );
-        Self { id, reservation }
-    }
-
-    pub const fn id(&self) -> ReplicaId {
-        self.id
-    }
-
-    pub fn segment_id(&self) -> SegmentId {
-        self.reservation.segment_id()
+    pub fn replica_class(&self) -> ReplicaClass {
+        self.reservation.replica_class()
     }
 
     pub const fn reserved_bytes(&self) -> u64 {
@@ -108,15 +53,12 @@ impl NofReplica {
         self.reservation.requested_bytes()
     }
 
-    pub fn descriptor(&self) -> NofDescriptorRef<'_> {
-        self.reservation
-            .descriptor()
-            .nof()
-            .expect("NofReplica requires a NoF reservation")
+    pub fn descriptor(&self) -> ReservationDescriptorRef<'_> {
+        self.reservation.descriptor()
     }
 
-    pub fn owned_descriptor(&self) -> NofDescriptor {
-        self.descriptor().to_owned()
+    pub fn owned_descriptor(&self) -> ReservationDescriptor {
+        self.reservation.owned_descriptor()
     }
 
     pub(crate) fn into_reservation(self) -> Reservation {
@@ -124,12 +66,13 @@ impl NofReplica {
     }
 }
 
-impl fmt::Debug for NofReplica {
+impl fmt::Debug for DirectReplica {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("NofReplica")
+            .debug_struct("DirectReplica")
             .field("id", &self.id)
             .field("segment_id", &self.segment_id())
+            .field("replica_class", &self.replica_class())
             .field("reserved_bytes", &self.reserved_bytes())
             .field("descriptor", &self.descriptor())
             .finish()
@@ -190,61 +133,65 @@ impl fmt::Debug for LocalSsdReplica {
 #[derive(Debug)]
 #[non_exhaustive]
 pub enum ReplicaLease {
-    Memory(MemoryReplica),
-    Nof(NofReplica),
+    Direct(DirectReplica),
     LocalSsd(LocalSsdReplica),
 }
 
 impl ReplicaLease {
     pub const fn id(&self) -> ReplicaId {
         match self {
-            Self::Memory(replica) => replica.id(),
-            Self::Nof(replica) => replica.id(),
+            Self::Direct(replica) => replica.id(),
             Self::LocalSsd(replica) => replica.id(),
         }
     }
 
     pub fn segment_id(&self) -> SegmentId {
         match self {
-            Self::Memory(replica) => replica.segment_id(),
-            Self::Nof(replica) => replica.segment_id(),
+            Self::Direct(replica) => replica.segment_id(),
             Self::LocalSsd(replica) => replica.segment_id(),
         }
     }
 
     pub const fn reserved_bytes(&self) -> u64 {
         match self {
-            Self::Memory(replica) => replica.reserved_bytes(),
-            Self::Nof(replica) => replica.reserved_bytes(),
+            Self::Direct(replica) => replica.reserved_bytes(),
             Self::LocalSsd(replica) => replica.reserved_bytes(),
         }
     }
 
     pub const fn capacity_bytes(&self) -> u64 {
         match self {
-            Self::Memory(replica) => replica.capacity_bytes(),
-            Self::Nof(replica) => replica.capacity_bytes(),
+            Self::Direct(replica) => replica.capacity_bytes(),
             Self::LocalSsd(replica) => replica.capacity_bytes(),
         }
     }
 
-    pub fn memory(&self) -> Option<&MemoryReplica> {
+    pub fn direct(&self) -> Option<&DirectReplica> {
         match self {
-            Self::Memory(replica) => Some(replica),
-            Self::Nof(_) | Self::LocalSsd(_) => None,
+            Self::Direct(replica) => Some(replica),
+            Self::LocalSsd(_) => None,
         }
     }
 
-    pub fn nof(&self) -> Option<&NofReplica> {
+    pub fn memory(&self) -> Option<&DirectReplica> {
         match self {
-            Self::Memory(_) | Self::LocalSsd(_) => None,
-            Self::Nof(replica) => Some(replica),
+            Self::Direct(replica) if replica.replica_class() == ReplicaClass::Memory => {
+                Some(replica)
+            }
+            Self::Direct(_) | Self::LocalSsd(_) => None,
+        }
+    }
+
+    pub fn nof(&self) -> Option<&DirectReplica> {
+        match self {
+            Self::Direct(replica) if replica.replica_class() == ReplicaClass::Nof => Some(replica),
+            Self::Direct(_) | Self::LocalSsd(_) => None,
         }
     }
 
     pub fn local_ssd(&self) -> Option<&LocalSsdReplica> {
         match self {
-            Self::Memory(_) | Self::Nof(_) => None,
+            Self::Direct(_) => None,
             Self::LocalSsd(replica) => Some(replica),
         }
     }
@@ -302,18 +249,7 @@ impl ReplicaSet {
                 .enumerate()
                 .map(|(index, reservation)| {
                     let id = u32::try_from(index + 1).expect("replica count exceeds u32::MAX");
-                    match reservation.replica_class() {
-                        ReplicaClass::Memory => ReplicaLease::Memory(MemoryReplica::new(
-                            ReplicaId::new(id),
-                            reservation,
-                        )),
-                        ReplicaClass::Nof => {
-                            ReplicaLease::Nof(NofReplica::new(ReplicaId::new(id), reservation))
-                        }
-                        ReplicaClass::LocalSsd => {
-                            unreachable!("LocalSSD leases are not direct reservations")
-                        }
-                    }
+                    ReplicaLease::Direct(DirectReplica::new(ReplicaId::new(id), reservation))
                 }),
         )
     }
@@ -371,8 +307,7 @@ impl ReplicaReclaimBatch {
 
     fn push(&mut self, replica: ReplicaLease) {
         match replica {
-            ReplicaLease::Memory(replica) => self.direct.push(replica.into_reservation()),
-            ReplicaLease::Nof(replica) => self.direct.push(replica.into_reservation()),
+            ReplicaLease::Direct(replica) => self.direct.push(replica.into_reservation()),
             ReplicaLease::LocalSsd(replica) => self.local_ssd.push(replica.into_lease()),
         }
     }

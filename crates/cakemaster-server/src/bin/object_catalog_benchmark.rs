@@ -2,13 +2,13 @@
 
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
-    MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
+    DirectReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
     ObjectIdentity, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
 };
 use cakemaster::segment::config::DEFAULT_MAX_ALLOCATOR_NODES_PER_SEGMENT;
 use cakemaster::segment::{
-    ClientId, MemoryRegion, MemorySegmentSpec, PoolSnapshot, SegmentId, SegmentIdentity,
-    SegmentPool, SegmentPoolConfig, TransportEndpoint, TransportProtocol,
+    ClientId, MemoryRegion, PoolSnapshot, SegmentId, SegmentIdentity, SegmentPool,
+    SegmentPoolConfig, SegmentSpec, TransportEndpoint, TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -222,7 +222,7 @@ fn run_worker(
     operations: usize,
     put_keys: Vec<ObjectIdentity>,
     pool: Arc<SegmentPool>,
-    candidate: cakemaster::segment::SegmentCandidate,
+    candidate: cakemaster::segment::DirectCandidate,
     catalog: Arc<ObjectCatalog>,
     hot_keys: Arc<[ObjectIdentity]>,
     tick: Arc<AtomicU64>,
@@ -248,7 +248,7 @@ fn run_worker(
                 .expect("benchmark keys are unique")
                 .stage(
                     ObjectContent::new(OBJECT_BYTES),
-                    ReplicaSet::one(ReplicaLease::Memory(MemoryReplica::new(
+                    ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
                         ReplicaId::new(1),
                         reservation,
                     ))),
@@ -327,7 +327,7 @@ fn build_pool(segments: usize) -> Arc<SegmentPool> {
     );
     for index in 0..segments {
         let index = index as u64;
-        pool.attach(MemorySegmentSpec::new(
+        pool.attach(SegmentSpec::memory(
             SegmentIdentity::new(
                 SegmentId::new(1, index + 1),
                 OWNER,
@@ -361,7 +361,7 @@ fn preload_hot_objects(
             .unwrap()
             .stage(
                 ObjectContent::new(OBJECT_BYTES),
-                ReplicaSet::one(ReplicaLease::Memory(MemoryReplica::new(
+                ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
                     ReplicaId::new(1),
                     reservation,
                 ))),

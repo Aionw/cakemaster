@@ -2,12 +2,12 @@
 
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
-    MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
+    DirectReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
     ObjectIdentity, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
 };
 use cakemaster::segment::{
-    ClientId, MemoryRegion, MemorySegmentSpec, SegmentCandidate, SegmentId, SegmentIdentity,
-    SegmentPool, SegmentPoolConfig, TransportEndpoint, TransportProtocol,
+    ClientId, DirectCandidate, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool,
+    SegmentPoolConfig, SegmentSpec, TransportEndpoint, TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -96,7 +96,7 @@ fn run_once(arguments: Arguments) -> BenchmarkResult {
             .expect("allocator node count must be valid"),
     );
     let candidate = pool
-        .attach(MemorySegmentSpec::new(
+        .attach(SegmentSpec::memory(
             SegmentIdentity::new(
                 SegmentId::new(1, 1),
                 OWNER,
@@ -106,8 +106,8 @@ fn run_once(arguments: Arguments) -> BenchmarkResult {
             TransportEndpoint::new(TransportProtocol::Tcp, "127.0.0.1:12345"),
         ))
         .expect("benchmark segment must be valid")
-        .candidate()
-        .clone();
+        .direct_candidate()
+        .expect("memory segment must be directly allocatable");
     let catalog = Arc::new(
         ObjectCatalog::with_config(
             ObjectCatalogConfig::new(expected_objects)
@@ -225,7 +225,7 @@ fn run_worker(
     put_keys: Vec<ObjectIdentity>,
     catalog: Arc<ObjectCatalog>,
     pool: Arc<SegmentPool>,
-    candidate: SegmentCandidate,
+    candidate: DirectCandidate,
     hot_keys: Arc<[ObjectIdentity]>,
     pressure_started: Arc<AtomicBool>,
     start: Arc<AtomicBool>,
@@ -260,7 +260,7 @@ fn run_worker(
                     match catalog.claim_put(identity, WriteOwner::new(OWNER), CatalogTick::ZERO) {
                         Ok(claim) => match claim.stage(
                             ObjectContent::new(OBJECT_BYTES),
-                            ReplicaSet::one(ReplicaLease::Memory(MemoryReplica::new(
+                            ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
                                 ReplicaId::new(1),
                                 reservation,
                             ))),
@@ -334,7 +334,7 @@ fn run_worker(
 fn run_collector(
     arguments: Arguments,
     catalog: Arc<ObjectCatalog>,
-    candidate: SegmentCandidate,
+    candidate: DirectCandidate,
     pressure_started: Arc<AtomicBool>,
     workload_running: Arc<AtomicBool>,
     start: Arc<AtomicBool>,
@@ -415,7 +415,7 @@ fn run_collector(
 fn preload_objects(
     catalog: &ObjectCatalog,
     pool: &SegmentPool,
-    candidate: &SegmentCandidate,
+    candidate: &DirectCandidate,
     count: usize,
     hot_objects: usize,
 ) -> Vec<ObjectIdentity> {
@@ -436,7 +436,7 @@ fn preload_objects(
             .expect("prefill keys are unique")
             .stage(
                 ObjectContent::new(OBJECT_BYTES),
-                ReplicaSet::one(ReplicaLease::Memory(MemoryReplica::new(
+                ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
                     ReplicaId::new(1),
                     reservation,
                 ))),
@@ -558,7 +558,7 @@ fn segment_size_for(arguments: Arguments) -> u64 {
     ((needed as f64) / arguments.initial_used_ratio).ceil() as u64
 }
 
-fn used_ratio(candidate: &SegmentCandidate) -> f64 {
+fn used_ratio(candidate: &DirectCandidate) -> f64 {
     let space = candidate.stats().space;
     space.used_bytes as f64 / space.capacity_bytes as f64
 }

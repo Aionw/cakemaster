@@ -50,8 +50,6 @@ pub enum AttachError {
         kind: SegmentKind,
         protocol: TransportProtocol,
     },
-    #[error("host id must not be empty when present")]
-    EmptyHostId,
     #[error("segment size must not be zero")]
     ZeroSize,
     #[error("segment address range overflows u64")]
@@ -71,7 +69,7 @@ pub enum AttachError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum LifecycleError {
+pub enum SegmentStateError {
     #[error("segment {0} was not found")]
     NotFound(SegmentId),
     #[error("segment {segment} belongs to client {expected}, not {actual}")]
@@ -82,10 +80,10 @@ pub enum LifecycleError {
     },
     #[error("segment {0} must be quiesced before removal")]
     StillAccepting(SegmentId),
-    #[error("segment {segment} still has {live_allocations} live allocations")]
+    #[error("segment {segment} still has {active_allocations} active allocations")]
     Busy {
         segment: SegmentId,
-        live_allocations: u64,
+        active_allocations: u64,
     },
 }
 
