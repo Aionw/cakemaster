@@ -14,6 +14,7 @@ pub enum TransportProtocol {
     Tcp,
     Rdma,
     Cxl,
+    NvmeOf,
     Custom(Arc<str>),
 }
 
@@ -23,6 +24,7 @@ impl TransportProtocol {
             Self::Tcp => "tcp",
             Self::Rdma => "rdma",
             Self::Cxl => "cxl",
+            Self::NvmeOf => "nvmeof",
             Self::Custom(protocol) => protocol,
         }
     }
@@ -50,6 +52,7 @@ impl FromStr for TransportProtocol {
             "tcp" => Self::Tcp,
             "rdma" => Self::Rdma,
             "cxl" => Self::Cxl,
+            "nvmeof" => Self::NvmeOf,
             custom => Self::Custom(Arc::from(custom)),
         })
     }

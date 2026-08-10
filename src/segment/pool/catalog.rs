@@ -55,9 +55,7 @@ impl Catalog {
             };
         }
 
-        if let Some(existing) = self.overlapping_segment(&spec)? {
-            return Err(AttachError::OverlappingAddressRange { existing });
-        }
+        self.validate_resource_conflicts(&spec)?;
 
         let candidate = self.mutation().insert(spec, max_allocator_nodes);
         Ok(AttachOutcome::Attached(candidate))
@@ -102,26 +100,35 @@ impl Catalog {
         self.mutation().remove(owner, id)
     }
 
-    fn overlapping_segment(&self, spec: &SegmentSpec) -> Result<Option<SegmentId>, AttachError> {
-        let spec = spec
-            .memory()
-            .expect("memory is the only attached segment backend");
-        let end = spec.region().end().ok_or(AttachError::AddressOverflow)?;
-        Ok(self.segments.values().find_map(|segment| {
-            let existing = segment
-                .spec
-                .memory()
-                .expect("memory is the only attached segment backend");
-            (existing.identity().owner() == spec.identity().owner()
-                && existing.transport() == spec.transport()
-                && spec.region().base()
-                    < existing
-                        .region()
-                        .end()
-                        .expect("attached segments are valid")
-                && existing.region().base() < end)
-                .then(|| existing.identity().id())
-        }))
+    fn validate_resource_conflicts(&self, spec: &SegmentSpec) -> Result<(), AttachError> {
+        match spec {
+            SegmentSpec::Memory(spec) => {
+                let end = spec.region().end().ok_or(AttachError::AddressOverflow)?;
+                if let Some(existing) = self.segments.values().find_map(|segment| {
+                    let existing = segment.spec.memory()?;
+                    (existing.identity().owner() == spec.identity().owner()
+                        && existing.transport() == spec.transport()
+                        && spec.region().base()
+                            < existing
+                                .region()
+                                .end()
+                                .expect("attached segments are valid")
+                        && existing.region().base() < end)
+                        .then(|| existing.identity().id())
+                }) {
+                    return Err(AttachError::OverlappingAddressRange { existing });
+                }
+            }
+            SegmentSpec::Nof(spec) => {
+                if let Some(existing) = self.segments.values().find_map(|segment| {
+                    let existing = segment.spec.nof()?;
+                    (existing.transport() == spec.transport()).then(|| existing.identity().id())
+                }) {
+                    return Err(AttachError::DuplicateNofEndpoint { existing });
+                }
+            }
+        }
+        Ok(())
     }
 
     fn mutation(&mut self) -> CatalogMutation<'_> {
@@ -238,11 +245,7 @@ impl Drop for CatalogMutation<'_> {
 
 impl Segment {
     fn new(pool_id: u64, spec: Arc<SegmentSpec>, max_allocator_nodes: u32) -> Self {
-        let capacity = spec
-            .memory()
-            .expect("memory is the only attached segment backend")
-            .region()
-            .size();
+        let capacity = spec.direct_region().size();
         let allocator = ByteAllocator::new(capacity, max_allocator_nodes);
         Self {
             pool_id,
@@ -263,10 +266,6 @@ impl Segment {
 
     #[inline]
     pub(super) fn reserve(self: &Arc<Self>, bytes: u64) -> Result<Reservation, ReserveError> {
-        let spec = self
-            .spec
-            .memory()
-            .expect("memory is the only direct segment backend");
         if bytes == 0 {
             return Err(ReserveError::ZeroSize);
         }
@@ -286,7 +285,12 @@ impl Segment {
             .allocator
             .allocate_after_precheck(bytes)
             .ok_or(ReserveError::OutOfSpace(self.spec.identity().id()))?;
-        let buffer_address = match spec.region().base().checked_add(allocation.offset()) {
+        let buffer_address = match self
+            .spec
+            .direct_region()
+            .base()
+            .checked_add(allocation.offset())
+        {
             Some(address) => address,
             None => return Err(ReserveError::AddressOverflow(self.spec.identity().id())),
         };

@@ -13,11 +13,15 @@ pub mod stats;
 mod transport;
 
 pub use config::SegmentPoolConfig;
-pub use descriptor::{MemoryDescriptor, MemoryDescriptorRef, MemoryRegion, SegmentTopology};
+pub use descriptor::{
+    MemoryDescriptor, MemoryDescriptorRef, MemoryRegion, NofDescriptor, NofDescriptorRef,
+    ReservationDescriptor, ReservationDescriptorRef, SegmentTopology,
+};
 pub use identity::{ClientId, SegmentId, SegmentIdentity};
 pub use pool::{AttachOutcome, PoolSnapshot, SegmentCandidate, SegmentPool};
 pub use reservation::Reservation;
 pub use spec::{
-    MemorySegmentSpec, ReplicaClass, SegmentKind, SegmentMetadata, SegmentResourceId, SegmentSpec,
+    MemorySegmentSpec, NofSegmentSpec, ReplicaClass, SegmentKind, SegmentMetadata,
+    SegmentResourceId, SegmentSpec,
 };
 pub use transport::{TransportEndpoint, TransportProtocol};

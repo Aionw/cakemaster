@@ -1,7 +1,10 @@
-use super::descriptor::{MemoryDescriptor, MemoryDescriptorRef, MemoryRegion};
+use super::descriptor::{
+    MemoryDescriptorRef, MemoryRegion, NofDescriptorRef, ReservationDescriptor,
+    ReservationDescriptorRef,
+};
 use super::identity::SegmentId;
 use super::offset_allocator::OffsetAllocationHandle;
-use super::spec::SegmentSpec;
+use super::spec::{ReplicaClass, SegmentSpec};
 use std::fmt;
 use std::sync::Arc;
 
@@ -14,6 +17,10 @@ pub struct Reservation {
 impl Reservation {
     pub fn segment_id(&self) -> SegmentId {
         self.segment.identity().id()
+    }
+
+    pub fn replica_class(&self) -> ReplicaClass {
+        self.segment.replica_class()
     }
 
     pub const fn offset(&self) -> u64 {
@@ -32,15 +39,18 @@ impl Reservation {
         self.region
     }
 
-    pub fn descriptor(&self) -> MemoryDescriptorRef<'_> {
-        let spec = self
-            .segment
-            .memory()
-            .expect("memory is the only direct segment backend");
-        MemoryDescriptorRef::new(self.region, spec.transport())
+    pub fn descriptor(&self) -> ReservationDescriptorRef<'_> {
+        match self.segment.as_ref() {
+            SegmentSpec::Memory(spec) => ReservationDescriptorRef::Memory(
+                MemoryDescriptorRef::new(self.region, spec.transport()),
+            ),
+            SegmentSpec::Nof(spec) => {
+                ReservationDescriptorRef::Nof(NofDescriptorRef::new(self.region, spec.transport()))
+            }
+        }
     }
 
-    pub fn owned_descriptor(&self) -> MemoryDescriptor {
+    pub fn owned_descriptor(&self) -> ReservationDescriptor {
         self.descriptor().to_owned()
     }
 

@@ -1,6 +1,6 @@
 use super::descriptor::{MemoryRegion, SegmentTopology};
 use super::identity::{SegmentId, SegmentIdentity};
-use super::transport::TransportEndpoint;
+use super::transport::{TransportEndpoint, TransportProtocol};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SegmentMetadata {
@@ -76,6 +76,57 @@ impl MemorySegmentSpec {
     }
 }
 
+/// An allocatable byte range in an NVMe-oF namespace.
+///
+/// Unlike a process memory segment, `region.base()` is a namespace offset and
+/// zero is a valid start. The transport is fixed to `nvmeof` so the storage
+/// kind cannot silently drift from its wire descriptor.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NofSegmentSpec {
+    metadata: SegmentMetadata,
+    region: MemoryRegion,
+    transport: TransportEndpoint,
+}
+
+impl NofSegmentSpec {
+    pub fn new(
+        identity: SegmentIdentity,
+        region: MemoryRegion,
+        endpoint: impl Into<std::sync::Arc<str>>,
+    ) -> Self {
+        Self {
+            metadata: SegmentMetadata::new(identity),
+            region,
+            transport: TransportEndpoint::new(TransportProtocol::NvmeOf, endpoint),
+        }
+    }
+
+    pub fn with_topology(mut self, topology: SegmentTopology) -> Self {
+        self.metadata = self.metadata.with_topology(topology);
+        self
+    }
+
+    pub const fn metadata(&self) -> &SegmentMetadata {
+        &self.metadata
+    }
+
+    pub const fn identity(&self) -> &SegmentIdentity {
+        self.metadata.identity()
+    }
+
+    pub const fn region(&self) -> MemoryRegion {
+        self.region
+    }
+
+    pub const fn transport(&self) -> &TransportEndpoint {
+        &self.transport
+    }
+
+    pub const fn topology(&self) -> &SegmentTopology {
+        self.metadata.topology()
+    }
+}
+
 /// Concrete storage implementation mounted in a [`SegmentPool`](super::SegmentPool).
 ///
 /// A segment kind describes how capacity is provided. It is deliberately
@@ -85,6 +136,7 @@ impl MemorySegmentSpec {
 #[non_exhaustive]
 pub enum SegmentKind {
     Memory,
+    Nof,
 }
 
 /// Replica family produced by a segment.
@@ -95,6 +147,7 @@ pub enum SegmentKind {
 #[non_exhaustive]
 pub enum ReplicaClass {
     Memory,
+    Nof,
 }
 
 /// Identity of the physical capacity provider behind a logical segment.
@@ -106,6 +159,7 @@ pub enum ReplicaClass {
 #[non_exhaustive]
 pub enum SegmentResourceId {
     Dedicated(SegmentId),
+    NofNamespace(TransportEndpoint),
 }
 
 /// Type-safe specification for every segment backend known to the pool.
@@ -117,18 +171,21 @@ pub enum SegmentResourceId {
 #[non_exhaustive]
 pub enum SegmentSpec {
     Memory(MemorySegmentSpec),
+    Nof(NofSegmentSpec),
 }
 
 impl SegmentSpec {
     pub const fn kind(&self) -> SegmentKind {
         match self {
             Self::Memory(_) => SegmentKind::Memory,
+            Self::Nof(_) => SegmentKind::Nof,
         }
     }
 
     pub const fn replica_class(&self) -> ReplicaClass {
         match self {
             Self::Memory(_) => ReplicaClass::Memory,
+            Self::Nof(_) => ReplicaClass::Nof,
         }
     }
 
@@ -143,18 +200,35 @@ impl SegmentSpec {
     pub fn resource_id(&self) -> SegmentResourceId {
         match self {
             Self::Memory(spec) => SegmentResourceId::Dedicated(spec.identity().id()),
+            Self::Nof(spec) => SegmentResourceId::NofNamespace(spec.transport().clone()),
         }
     }
 
     pub const fn metadata(&self) -> &SegmentMetadata {
         match self {
             Self::Memory(spec) => spec.metadata(),
+            Self::Nof(spec) => spec.metadata(),
         }
     }
 
     pub const fn memory(&self) -> Option<&MemorySegmentSpec> {
         match self {
             Self::Memory(spec) => Some(spec),
+            Self::Nof(_) => None,
+        }
+    }
+
+    pub const fn nof(&self) -> Option<&NofSegmentSpec> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Nof(spec) => Some(spec),
+        }
+    }
+
+    pub(crate) const fn direct_region(&self) -> MemoryRegion {
+        match self {
+            Self::Memory(spec) => spec.region(),
+            Self::Nof(spec) => spec.region(),
         }
     }
 }
@@ -162,5 +236,11 @@ impl SegmentSpec {
 impl From<MemorySegmentSpec> for SegmentSpec {
     fn from(spec: MemorySegmentSpec) -> Self {
         Self::Memory(spec)
+    }
+}
+
+impl From<NofSegmentSpec> for SegmentSpec {
+    fn from(spec: NofSegmentSpec) -> Self {
+        Self::Nof(spec)
     }
 }

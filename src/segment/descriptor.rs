@@ -92,3 +92,127 @@ impl<'a> MemoryDescriptorRef<'a> {
         }
     }
 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NofDescriptor {
+    region: MemoryRegion,
+    transport: TransportEndpoint,
+}
+
+impl NofDescriptor {
+    pub const fn region(&self) -> MemoryRegion {
+        self.region
+    }
+
+    pub const fn transport(&self) -> &TransportEndpoint {
+        &self.transport
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NofDescriptorRef<'a> {
+    region: MemoryRegion,
+    transport: &'a TransportEndpoint,
+}
+
+impl<'a> NofDescriptorRef<'a> {
+    pub(crate) const fn new(region: MemoryRegion, transport: &'a TransportEndpoint) -> Self {
+        Self { region, transport }
+    }
+
+    pub const fn region(self) -> MemoryRegion {
+        self.region
+    }
+
+    pub const fn transport(self) -> &'a TransportEndpoint {
+        self.transport
+    }
+
+    pub fn to_owned(self) -> NofDescriptor {
+        NofDescriptor {
+            region: self.region,
+            transport: self.transport.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ReservationDescriptor {
+    Memory(MemoryDescriptor),
+    Nof(NofDescriptor),
+}
+
+impl ReservationDescriptor {
+    pub const fn region(&self) -> MemoryRegion {
+        match self {
+            Self::Memory(descriptor) => descriptor.region(),
+            Self::Nof(descriptor) => descriptor.region(),
+        }
+    }
+
+    pub const fn transport(&self) -> &TransportEndpoint {
+        match self {
+            Self::Memory(descriptor) => descriptor.transport(),
+            Self::Nof(descriptor) => descriptor.transport(),
+        }
+    }
+
+    pub const fn memory(&self) -> Option<&MemoryDescriptor> {
+        match self {
+            Self::Memory(descriptor) => Some(descriptor),
+            Self::Nof(_) => None,
+        }
+    }
+
+    pub const fn nof(&self) -> Option<&NofDescriptor> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Nof(descriptor) => Some(descriptor),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum ReservationDescriptorRef<'a> {
+    Memory(MemoryDescriptorRef<'a>),
+    Nof(NofDescriptorRef<'a>),
+}
+
+impl<'a> ReservationDescriptorRef<'a> {
+    pub const fn region(self) -> MemoryRegion {
+        match self {
+            Self::Memory(descriptor) => descriptor.region(),
+            Self::Nof(descriptor) => descriptor.region(),
+        }
+    }
+
+    pub const fn transport(self) -> &'a TransportEndpoint {
+        match self {
+            Self::Memory(descriptor) => descriptor.transport(),
+            Self::Nof(descriptor) => descriptor.transport(),
+        }
+    }
+
+    pub const fn memory(self) -> Option<MemoryDescriptorRef<'a>> {
+        match self {
+            Self::Memory(descriptor) => Some(descriptor),
+            Self::Nof(_) => None,
+        }
+    }
+
+    pub const fn nof(self) -> Option<NofDescriptorRef<'a>> {
+        match self {
+            Self::Memory(_) => None,
+            Self::Nof(descriptor) => Some(descriptor),
+        }
+    }
+
+    pub fn to_owned(self) -> ReservationDescriptor {
+        match self {
+            Self::Memory(descriptor) => ReservationDescriptor::Memory(descriptor.to_owned()),
+            Self::Nof(descriptor) => ReservationDescriptor::Nof(descriptor.to_owned()),
+        }
+    }
+}

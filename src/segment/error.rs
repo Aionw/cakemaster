@@ -53,6 +53,8 @@ pub enum AttachError {
     ConflictingSegmentId(SegmentId),
     #[error("segment address range overlaps existing segment {existing} in the same address space")]
     OverlappingAddressRange { existing: SegmentId },
+    #[error("NVMe-oF namespace endpoint is already attached as segment {existing}")]
+    DuplicateNofEndpoint { existing: SegmentId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

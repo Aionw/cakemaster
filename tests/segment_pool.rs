@@ -7,8 +7,8 @@ use cakemaster::segment::placement::{
 };
 use cakemaster::segment::stats::SegmentState;
 use cakemaster::segment::{
-    AttachOutcome, ClientId, MemoryRegion, MemorySegmentSpec, ReplicaClass, SegmentId,
-    SegmentIdentity, SegmentKind, SegmentPool, SegmentPoolConfig, SegmentResourceId,
+    AttachOutcome, ClientId, MemoryRegion, MemorySegmentSpec, NofSegmentSpec, ReplicaClass,
+    SegmentId, SegmentIdentity, SegmentKind, SegmentPool, SegmentPoolConfig, SegmentResourceId,
     SegmentTopology, TransportEndpoint, TransportProtocol,
 };
 use std::hint::black_box;
@@ -32,11 +32,21 @@ fn spec(index: u64, name: &str, host: &str) -> MemorySegmentSpec {
     .with_topology(SegmentTopology::on_host(host))
 }
 
+fn nof_spec(index: u64, endpoint: &str, host: &str) -> NofSegmentSpec {
+    NofSegmentSpec::new(
+        SegmentIdentity::new(SegmentId::new(2, index), OWNER, "nof"),
+        MemoryRegion::new((index - 1) * (CAPACITY * 2), CAPACITY),
+        endpoint,
+    )
+    .with_topology(SegmentTopology::on_host(host))
+}
+
 #[test]
 fn protocol_is_typed_in_core_and_extensible_at_the_wire_boundary() {
     assert_eq!("tcp".parse(), Ok(TransportProtocol::Tcp));
     assert_eq!("rdma".parse(), Ok(TransportProtocol::Rdma));
     assert_eq!("cxl".parse(), Ok(TransportProtocol::Cxl));
+    assert_eq!("nvmeof".parse(), Ok(TransportProtocol::NvmeOf));
 
     let custom: TransportProtocol = "sunrise_link".parse().unwrap();
     assert_eq!(custom.as_str(), "sunrise_link");
@@ -58,6 +68,54 @@ fn protocol_is_typed_in_core_and_extensible_at_the_wire_boundary() {
             protocol: invalid_protocol,
             source: ParseTransportProtocolError,
         }
+    );
+}
+
+#[test]
+fn nof_uses_namespace_offsets_and_an_independent_replica_class() {
+    let pool = Arc::new(pool());
+    pool.attach(spec(1, "memory", "host-a")).unwrap();
+
+    let first = nof_spec(1, "nvme://10.0.0.1/nqn.1", "ssd-a");
+    let second = nof_spec(2, "nvme://10.0.0.2/nqn.2", "ssd-b");
+    let first_id = first.identity().id();
+    let first_endpoint = first.transport().clone();
+    let first_candidate = pool.attach(first).unwrap().candidate().clone();
+    pool.attach(second).unwrap();
+
+    assert_eq!(first_candidate.kind(), SegmentKind::Nof);
+    assert_eq!(first_candidate.replica_class(), ReplicaClass::Nof);
+    assert_eq!(first_candidate.nof_spec().unwrap().region().base(), 0);
+    assert_eq!(
+        first_candidate.resource_id(),
+        SegmentResourceId::NofNamespace(first_endpoint.clone())
+    );
+    assert_eq!(pool.snapshot_for(ReplicaClass::Memory).len(), 1);
+    assert_eq!(pool.snapshot_for(ReplicaClass::Nof).len(), 2);
+
+    let reservation = pool.reserve(&first_candidate, 4096).unwrap();
+    assert_eq!(reservation.replica_class(), ReplicaClass::Nof);
+    assert!(reservation.descriptor().memory().is_none());
+    let descriptor = reservation.descriptor().nof().unwrap();
+    assert_eq!(descriptor.region().base(), 0);
+    assert_eq!(descriptor.transport(), &first_endpoint);
+    drop(reservation);
+
+    let duplicate = nof_spec(3, first_endpoint.endpoint(), "ssd-c");
+    assert_eq!(
+        pool.attach(duplicate).unwrap_err(),
+        AttachError::DuplicateNofEndpoint { existing: first_id }
+    );
+
+    let allocator = ReplicaAllocator::new(pool.clone());
+    let request = PlacementRequest::new(AllocationSpec::new(8192), ReplicaPolicy::new(2))
+        .for_replica_class(ReplicaClass::Nof);
+    let reservations = allocator.reserve(&request).unwrap();
+    assert_eq!(reservations.len(), 2);
+    assert!(
+        reservations
+            .iter()
+            .all(|reservation| reservation.replica_class() == ReplicaClass::Nof)
     );
 }
 

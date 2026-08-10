@@ -7,7 +7,10 @@ use super::config::{
 use super::error::{AttachError, LifecycleError, PoolConfigError, ReserveError};
 use super::identity::{ClientId, SegmentId};
 use super::reservation::Reservation;
-use super::spec::{MemorySegmentSpec, ReplicaClass, SegmentKind, SegmentResourceId, SegmentSpec};
+use super::spec::{
+    MemorySegmentSpec, NofSegmentSpec, ReplicaClass, SegmentKind, SegmentMetadata,
+    SegmentResourceId, SegmentSpec,
+};
 use super::stats::SegmentStats;
 use parking_lot::RwLock;
 use std::fmt;
@@ -51,6 +54,10 @@ impl SegmentCandidate {
 
     pub fn memory_spec(&self) -> Option<&MemorySegmentSpec> {
         self.segment.spec().memory()
+    }
+
+    pub fn nof_spec(&self) -> Option<&NofSegmentSpec> {
+        self.segment.spec().nof()
     }
 
     pub fn stats(&self) -> SegmentStats {
@@ -218,38 +225,56 @@ impl Default for SegmentPool {
 fn validate_spec(spec: &SegmentSpec) -> Result<(), AttachError> {
     match spec {
         SegmentSpec::Memory(spec) => validate_memory_spec(spec),
+        SegmentSpec::Nof(spec) => validate_nof_spec(spec),
     }
 }
 
 fn validate_memory_spec(spec: &MemorySegmentSpec) -> Result<(), AttachError> {
-    if spec.identity().id().is_nil() {
-        return Err(AttachError::NilSegmentId);
-    }
-    if spec.identity().owner().is_nil() {
-        return Err(AttachError::NilOwnerId);
-    }
-    if spec.identity().name().is_empty() {
-        return Err(AttachError::EmptyName);
-    }
+    validate_metadata(spec.metadata())?;
     if spec.region().base() == 0 {
         return Err(AttachError::ZeroBaseAddress);
     }
-    if spec.transport().endpoint().is_empty() {
+    validate_direct_range(spec.region(), spec.transport())
+}
+
+fn validate_nof_spec(spec: &NofSegmentSpec) -> Result<(), AttachError> {
+    validate_metadata(spec.metadata())?;
+    validate_direct_range(spec.region(), spec.transport())
+}
+
+fn validate_metadata(metadata: &SegmentMetadata) -> Result<(), AttachError> {
+    if metadata.identity().id().is_nil() {
+        return Err(AttachError::NilSegmentId);
+    }
+    if metadata.identity().owner().is_nil() {
+        return Err(AttachError::NilOwnerId);
+    }
+    if metadata.identity().name().is_empty() {
+        return Err(AttachError::EmptyName);
+    }
+    if metadata.topology().host_id().is_some_and(str::is_empty) {
+        return Err(AttachError::EmptyHostId);
+    }
+    Ok(())
+}
+
+fn validate_direct_range(
+    region: super::descriptor::MemoryRegion,
+    transport: &super::transport::TransportEndpoint,
+) -> Result<(), AttachError> {
+    if transport.endpoint().is_empty() {
         return Err(AttachError::EmptyTransportEndpoint);
     }
-    let protocol = spec.transport().protocol().as_str();
+    let protocol = transport.protocol().as_str();
     if let Err(source) = protocol.parse::<super::transport::TransportProtocol>() {
         return Err(AttachError::InvalidTransportProtocol {
             protocol: Arc::from(protocol),
             source,
         });
     }
-    if spec.topology().host_id().is_some_and(str::is_empty) {
-        return Err(AttachError::EmptyHostId);
-    }
-    if spec.region().size() == 0 {
+    if region.size() == 0 {
         return Err(AttachError::ZeroSize);
     }
-    spec.region().end().ok_or(AttachError::AddressOverflow)?;
+    region.end().ok_or(AttachError::AddressOverflow)?;
     Ok(())
 }

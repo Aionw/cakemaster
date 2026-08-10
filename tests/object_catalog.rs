@@ -6,9 +6,12 @@ use cakemaster::object::{
     MemoryReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
     ObjectIdentity, ObjectLookup, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
 };
+use cakemaster::segment::placement::{
+    AllocationSpec, PlacementRequest, ReplicaAllocator, ReplicaPolicy,
+};
 use cakemaster::segment::{
-    ClientId, MemoryRegion, MemorySegmentSpec, SegmentId, SegmentIdentity, SegmentPool,
-    SegmentPoolConfig, TransportEndpoint, TransportProtocol,
+    ClientId, MemoryRegion, MemorySegmentSpec, NofSegmentSpec, ReplicaClass, SegmentId,
+    SegmentIdentity, SegmentPool, SegmentPoolConfig, TransportEndpoint, TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
@@ -78,6 +81,31 @@ fn replica_set_preserves_inline_and_multiple_replica_views() {
     assert_eq!(multiple.replicas()[1].id(), ReplicaId::new(2));
     drop(multiple);
     assert_eq!(pool.stats(SEGMENT_ID).unwrap().reservations.live, 0);
+}
+
+#[test]
+fn replica_set_preserves_nof_reservations_as_nof_replicas() {
+    let pool = pool(1 << 20, 64);
+    let nof_id = SegmentId::new(9, 2);
+    pool.attach(NofSegmentSpec::new(
+        SegmentIdentity::new(nof_id, OWNER, "catalog-nof"),
+        MemoryRegion::new(0, 1 << 20),
+        "nvme://10.0.0.1/nqn.1",
+    ))
+    .unwrap();
+
+    let reservations = ReplicaAllocator::new(pool.clone())
+        .reserve(
+            &PlacementRequest::new(AllocationSpec::new(4096), ReplicaPolicy::new(1))
+                .for_replica_class(ReplicaClass::Nof),
+        )
+        .unwrap();
+    let replicas = ReplicaSet::from_reservations(reservations);
+    let nof = replicas.replicas()[0].nof().unwrap();
+    assert_eq!(nof.segment_id(), nof_id);
+    assert_eq!(nof.descriptor().region().base(), 0);
+    drop(replicas);
+    assert_eq!(pool.stats(nof_id).unwrap().reservations.live, 0);
 }
 
 #[test]
