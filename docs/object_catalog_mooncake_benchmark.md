@@ -1,5 +1,108 @@
 # ObjectCatalog 与 Mooncake 同口径性能对比
 
+## Batch RPC 线上比例压测（2026-08-10）
+
+这一组走真实 TCP、Mooncake `WrappedMasterService` wire、真实 catalog、placement、
+OffsetAllocator 和自动高水位淘汰。数据本身不经过 Master；测量的是 metadata plane
+的 RPC、编解码、事务协调、allocator 和 eviction。为了排除 client 实现差异，Rust
+和 C++ server 都由同一个 `-O3` C++ client 驱动。
+
+工作负载按线上量级设置：
+
+- `BatchPut`、`BatchGet`、`BatchExists` 各自一条独立连接和限速流，逻辑请求比例
+  1:1:1，每类 150 batch QPS；
+- batch size 为 333，因此每秒新增 `333 * 150 = 49,950` 个 key，总计 450 logical
+  batch QPS、149,850 item ops/s；
+- 一个 logical `BatchPut` 完整包含串行的 `BatchPutStart + BatchPutEnd`，GET/EXISTS
+  各包含一个 RPC；
+- 对象大小 1 KiB，单 Memory segment 为 1,150,561,798 bytes；先成功写入 1M 个
+  key，初始占用恰为 89%；
+- 热集为预填充尾部 500K key，正式启动前由 GET/EXISTS 全量触达；GET 流约每 10 秒
+  覆盖一次热集，与双方 10 秒 lease 一致；
+- 在三条流下预热 10 秒，再测量 30 秒。测量窗口内每类恰好 4,500 batch，PUT 新增
+  1,498,500 key；加上预热后总新增 1,998,000 key，远大于初始剩余空间，因此成功
+  完成必然依赖持续 eviction。
+
+双方均为 Release 构建、8 个 RPC worker、`high_watermark=0.90`、
+`eviction_ratio=0.05`、10 秒 lease。测试机为 AMD Ryzen 7 9700X（8C/16T），Rust
+1.97.1、GCC 16.1.1；Cakemaster 基于 `dccb3b70582739132b62db90a65a2f0ba9f15724`
+加本次工作树，Mooncake 为 `8c6095c06e20848506cbf91ef4a714924e7b03b1`。测试按实现
+顺序冷启动执行，未绑定 CPU。
+
+Rust 完成 3 轮，表中取中位数；C++ 完成 2 轮，表中取两轮中点。第三轮 C++ 因
+执行环境未能批准本地进程启动而没有产生样本，未用失败启动补数。所有有效轮次均
+达到 450 logical batch QPS，PUT start/end 零失败，GET/EXISTS 零 miss/零错误。
+
+| logical batch | Rust p50 / p99 / p99.9 | C++ Mooncake p50 / p99 / p99.9 | Rust 相对 C++（越低越好） |
+| --- | ---: | ---: | ---: |
+| BatchPut（Start + End） | 1,144.988 / 1,764.960 / 2,243.624 us | 907.538 / 3,467.195 / 9,630.238 us | +26.2% / -49.1% / -76.7% |
+| BatchGet | 479.338 / 1,369.211 / 1,695.677 us | 466.695 / 1,811.577 / 7,761.078 us | +2.7% / -24.4% / -78.2% |
+| BatchExists | 541.390 / 1,151.615 / 1,450.461 us | 351.778 / 1,807.117 / 7,994.771 us | +53.9% / -36.3% / -81.9% |
+
+原始轮次范围如下，避免聚合值掩盖抖动：
+
+| logical batch | 实现 | p50 范围 | p99 范围 | p99.9 范围 |
+| --- | --- | ---: | ---: | ---: |
+| BatchPut | Rust | 1,098.403–1,166.047 us | 1,751.768–1,856.980 us | 2,216.206–2,513.313 us |
+| BatchPut | C++ | 898.277–916.798 us | 3,431.867–3,502.524 us | 9,413.523–9,846.953 us |
+| BatchGet | Rust | 467.347–581.860 us | 1,363.258–1,376.187 us | 1,612.992–1,713.787 us |
+| BatchGet | C++ | 441.748–491.642 us | 1,658.295–1,964.859 us | 6,558.256–8,963.900 us |
+| BatchExists | Rust | 300.646–545.454 us | 1,132.894–1,253.671 us | 1,364.077–1,673.612 us |
+| BatchExists | C++ | 338.002–365.553 us | 1,370.170–2,244.064 us | 6,874.585–9,114.957 us |
+
+结论是：在这个线上目标速率而非饱和吞吐测试中，两边 admission 和正确性都满足
+要求。C++ 的 BatchPut/BatchExists 中位延迟更低，BatchGet 中位基本相当；Rust 的
+三类 p99 都更低，p99.9 低约 77%–82%。C++ 两轮分别出现 35/68 次调度迟到，最大
+约 4.1/4.3 ms；Rust 三轮没有调度迟到。由于没有绑核且 C++ 只有两轮，这组数字应
+作为当前机器上的实测基线，不应外推成不同硬件上的固定倍率。
+
+Rust 三轮均触发 40 次 reclaim，回收约 2.01M 个对象，最高水位
+90.036%–90.037%，结束水位 85.94%–86.06%。C++ 在预热和测量中也成功写入远超
+剩余容量的 1.998M 个对象，因而同样实际触发了滚动 eviction，而不是只消耗预留
+headroom。
+
+可复现命令：
+
+```bash
+g++ -std=c++20 -O3 -DNDEBUG \
+  -I /path/to/Mooncake/extern/yalantinglibs/include \
+  -I /path/to/Mooncake/extern/yalantinglibs/include/ylt/thirdparty \
+  interop/mooncake_benchmark.cpp -pthread -o /tmp/mooncake_benchmark
+
+cargo build --release -p cakemaster-server \
+  --bin object_catalog_rpc_benchmark_server
+
+# Rust server
+target/release/object_catalog_rpc_benchmark_server \
+  127.0.0.1:19094 8 1150561798 4000000 2000000 0.90 0.05
+/tmp/mooncake_benchmark mixed-client \
+  127.0.0.1 19094 333 150 30 10 1000000 500000 1024
+
+# C++ Mooncake server；master_bench 只负责挂载 segment 并维持心跳
+/path/to/Mooncake/build/mooncake-store/src/mooncake_master \
+  --rpc_address=127.0.0.1 --rpc_port=19095 --rpc_thread_num=8 \
+  --enable_metric_reporting=false --memory_allocator=offset \
+  --eviction_high_watermark_ratio=0.90 --eviction_ratio=0.05 \
+  --default_kv_lease_ttl=10000
+/path/to/Mooncake/build/mooncake-store/benchmarks/master_bench \
+  --master_server=127.0.0.1:19095 --num_segments=1 \
+  --segment_size=1150561798 --num_clients=0 --duration=600 \
+  --prefill_ratio=0
+/tmp/mooncake_benchmark mixed-client \
+  127.0.0.1 19095 333 150 30 10 1000000 500000 1024
+```
+
+当前 Mooncake 提交的
+`mooncake-store/include/ha/snapshot/object/snapshot_object_store.h` 使用 `uint8_t`
+但没有直接包含 `<cstdint>`。本次没有修改其源码，Release 构建只增加了
+`-include cstdint` 作为构建期 workaround；这不会改变被测 Master 的业务路径。
+
+Rust benchmark server 的自动压力控制器明确是 Memory-only 测试设施。通用生产
+控制器仍需先实现按 replica class 隔离的 reclaim debt/候选队列，详见
+[`object_catalog_rpc.md`](object_catalog_rpc.md)。
+
+## Direct API 对比（2026-08-07）
+
 测试日期为 2026-08-07。Mooncake 使用提交
 `bdacc80a478cdf574dfd30fbc85ca33d34195a48`，Cakemaster 工作树基于提交
 `765eaf8ff6610649229cc56ba37c1068923ed49d`。测试机为 AMD Ryzen 7 9700X

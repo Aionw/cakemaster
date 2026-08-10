@@ -2,6 +2,7 @@
 
 use super::reclamation::CatalogTick;
 use super::replica::ReplicaId;
+use crate::segment::ReplicaClass;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -96,4 +97,27 @@ pub enum RemoveError {
     NotReady,
     #[error("object is leased until catalog tick {}", .expires_at.get())]
     Leased { expires_at: CatalogTick },
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ObjectManagerError {
+    #[error("object put plan is invalid")]
+    InvalidPlan,
+    #[error("object already exists or has a write in progress")]
+    AlreadyExists,
+    #[error("no suitable replicas are available")]
+    NoAvailableReplicas,
+    #[error("object or pending write was not found")]
+    NotFound,
+    #[error("pending write belongs to another owner")]
+    IllegalOwner,
+    #[error("pending write uses {actual:?} replicas, not {requested:?}")]
+    ReplicaClassMismatch {
+        requested: ReplicaClass,
+        actual: ReplicaClass,
+    },
+    #[error("object write is no longer valid")]
+    InvalidWrite,
+    #[error("object manager invariant failed")]
+    Internal,
 }

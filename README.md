@@ -23,6 +23,7 @@ Cakemaster workspace 包含高并发 object catalog、异构 segment/placement �
 - 基于 `CancellationToken`/`TaskTracker` 的连接级优雅关闭
 - 标准错误码和大于 255 的扩展错误码
 - 入站帧大小、容器大小和单连接并发上限
+- 真实 ObjectCatalog/SegmentPool 驱动的 Mooncake batch exists/get/put RPC adapter
 
 暂不包含 TLS/NTLS、RDMA/CUDA transport、struct_pack varint 配置、IDL 外的自定义 variant/多态指针，以及 C++ 未使用 `YLT_REFL` 的 ABI/padding 结构体。大二进制建议放在 coro_rpc attachment 中，无需经过 struct_pack。
 
@@ -44,6 +45,8 @@ crates/coro-rpc/examples/   # RPC crate 的 benchmark
 领域 API 通过 `object`、`segment` 两个门面暴露；错误、回收控制、placement 和诊断类型位于各自的具名子模块，内部实现文件保持私有。
 
 SegmentPool 对 Memory、CXL、NoF 和 LocalSSD 的领域建模与扩展约束见 [`docs/segment_pool_backends.md`](docs/segment_pool_backends.md)。
+ObjectManager、ReplicaAllocator、异步 RPC 边界和当前 Mooncake 兼容子集见
+[`docs/object_catalog_rpc.md`](docs/object_catalog_rpc.md)。
 
 核心类型保持短路径，扩展接口按职责导入：
 
@@ -256,7 +259,49 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 [`crates/coro-rpc/tests/upstream_golden.rs`](crates/coro-rpc/tests/upstream_golden.rs) 使用 C++ 上游生成的固定字节序列验证类型哈希和编码；[`crates/coro-rpc/tests/end_to_end.rs`](crates/coro-rpc/tests/end_to_end.rs) 验证流水线、错误与 attachment；[`crates/coro-rpc-codegen/tests/codegen.rs`](crates/coro-rpc-codegen/tests/codegen.rs) 验证 Thrift 解析、校验和 stub 生成；[`crates/cakemaster-proto/tests/generated_end_to_end.rs`](crates/cakemaster-proto/tests/generated_end_to_end.rs) 使用同一份生成契约验证 client/server 与业务 struct。`interop/` 中还包含直接编译 yalantinglibs 的向量生成器和双向 C++ peer。
 
-## Mooncake Master RPC 性能对比
+## ObjectCatalog 的 Mooncake Batch RPC
+
+[`ObjectCatalogRpcService`](crates/cakemaster-server/src/object_catalog_rpc.rs) 实现生成的
+异步 `WrappedMasterService` trait，并把 `BatchExistKey`、
+`BatchGetReplicaList`、`BatchPutStart`、`BatchPutEnd` 和 `BatchPutRevoke` 接到真实
+`ObjectManager`。RPC 层只负责 wire 校验、plan 转换和错误码映射；同步、线程安全的
+ObjectManager 负责 owner、pending/published 生命周期、lease 和 reservation 协调。
+
+当前明确不支持 checksum：PutEnd 携带 checksum 返回 `INVALID_PARAMS`，BatchGet
+固定返回 `None`。接口也不提供单 key 版本。Memory-only replica 使用与 C++ 一致的
+best-effort 语义，NoF-only 使用 all-or-nothing；混合 Memory+NoF、pin、Disk 和多租户
+namespace 仍需领域模型支持，不在 RPC handler 中静默降级。
+
+真实 TCP 测试位于
+[`crates/cakemaster-server/tests/object_catalog_rpc.rs`](crates/cakemaster-server/tests/object_catalog_rpc.rs)。
+线上比例 benchmark 使用每批 333 key、BatchPut/Get/Exists 各 150 QPS、100 万 key
+预填充和 50 万热集：
+
+```bash
+cargo build --release -p cakemaster-server \
+  --bin object_catalog_rpc_benchmark_server
+target/release/object_catalog_rpc_benchmark_server
+
+g++ -std=c++20 -O3 -DNDEBUG \
+  -I /path/to/Mooncake/extern/yalantinglibs/include \
+  -I /path/to/Mooncake/extern/yalantinglibs/include/ylt/thirdparty \
+  interop/mooncake_benchmark.cpp -pthread -o /tmp/mooncake_benchmark
+/tmp/mooncake_benchmark mixed-client \
+  127.0.0.1 19094 333 150 30 10 1000000 500000 1024
+```
+
+同一个 C++ client 对 Rust 和 C++ Mooncake Master 的实测结果、原始范围与完整复现
+命令见
+[`docs/object_catalog_mooncake_benchmark.md`](docs/object_catalog_mooncake_benchmark.md)。
+
+## Tokio ClientTaskQueue
+
+[`ClientTaskQueue`](crates/cakemaster-server/src/client_task_queue.rs) 是 Master 侧的
+per-client Tokio channel。Master producer 持有可克隆的 `ClientTaskTx`，client 的 fetch
+RPC handler 持有唯一的 `ClientTaskRx`；有界 `mpsc` 负责 FIFO、异步背压、唤醒和取消
+安全。完成上报走独立 RPC 路径，不属于该队列；具体任务和 RPC wire 类型也由上层定义。
+
+## Mooncake wire/RPC 空服务性能对比
 
 [`crates/cakemaster-proto/idl/mooncake_master.thrift`](crates/cakemaster-proto/idl/mooncake_master.thrift) 和 [`crates/cakemaster-server/src/bin/mooncake_benchmark.rs`](crates/cakemaster-server/src/bin/mooncake_benchmark.rs) 提供与 Mooncake `WrappedMasterService` 相同 wire 的 Rust peer，[`interop/mooncake_benchmark.cpp`](interop/mooncake_benchmark.cpp) 是使用 Mooncake 自带 yalantinglibs 的 C++ peer。两端只实现最小合法返回值，不维护 segment、replica、lease 或 object 状态，适合单独比较 RPC framing、struct_pack 编解码、调度和网络开销。
 

@@ -395,6 +395,33 @@ impl ObjectCatalog {
         Err(LookupError::NotFound)
     }
 
+    pub(super) fn inspect_published(
+        &self,
+        lookup: ObjectLookup<'_>,
+    ) -> Result<ObjectHandle, LookupError> {
+        let slot = self
+            .inner
+            .lookup_slot(lookup)
+            .ok_or(LookupError::NotFound)?;
+        for _ in 0..3 {
+            let node = slot.current.load_full().ok_or(LookupError::NotFound)?;
+            match node.control.lifecycle.load(Ordering::Acquire) {
+                OBJECT_CLAIMED | OBJECT_PENDING | OBJECT_PUBLISHING => {
+                    return Err(LookupError::NotReady);
+                }
+                OBJECT_RETIRING => return Err(LookupError::NotFound),
+                OBJECT_PUBLISHED => {}
+                _ => unreachable!("object lifecycle is validated internally"),
+            }
+            if node.control.lifecycle.load(Ordering::Acquire) == OBJECT_PUBLISHED
+                && slot_points_to(&slot, &node)
+            {
+                return Ok(ObjectHandle { node });
+            }
+        }
+        Err(LookupError::NotFound)
+    }
+
     pub fn get_batch_into<'a, I>(
         &self,
         lookups: I,
