@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The upstream allocator uses `u32` units. Segments larger than 4 GiB use the
 /// smallest power-of-two byte quantum that can represent their full range.
 /// Allocation, binning, and coalescing remain owned by the upstream crate.
+#[derive(Clone)]
 pub(crate) struct ByteAllocator {
     shared: Arc<SharedAllocator>,
 }

@@ -2,7 +2,7 @@ use super::error::ReserveError;
 use super::identity::SegmentId;
 use super::pool::{PoolSnapshot, SegmentCandidate, SegmentPool};
 use super::reservation::Reservation;
-use super::spec::{ReplicaClass, SegmentResourceId};
+use super::spec::{ReplicaClass, SegmentKind, SegmentResourceId};
 use super::stats::SegmentStats;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -70,6 +70,7 @@ impl ReplicaPolicy {
 pub struct PlacementConstraints {
     preferred_names: Vec<Arc<str>>,
     excluded_segments: HashSet<SegmentId>,
+    allowed_kinds: Option<HashSet<SegmentKind>>,
 }
 
 impl PlacementConstraints {
@@ -90,12 +91,24 @@ impl PlacementConstraints {
         self
     }
 
+    pub fn allowing_kinds<I>(mut self, kinds: I) -> Self
+    where
+        I: IntoIterator<Item = SegmentKind>,
+    {
+        self.allowed_kinds = Some(kinds.into_iter().collect());
+        self
+    }
+
     pub fn preferred_names(&self) -> &[Arc<str>] {
         &self.preferred_names
     }
 
     pub const fn excluded_segments(&self) -> &HashSet<SegmentId> {
         &self.excluded_segments
+    }
+
+    pub const fn allowed_kinds(&self) -> Option<&HashSet<SegmentKind>> {
+        self.allowed_kinds.as_ref()
     }
 }
 
@@ -170,6 +183,11 @@ impl PlacementPolicy for FreeCapacityPolicy {
                 let stats = candidate.stats();
                 (stats.state.is_accepting()
                     && stats.space.available_bytes >= request.allocation.bytes
+                    && request
+                        .constraints
+                        .allowed_kinds
+                        .as_ref()
+                        .is_none_or(|kinds| kinds.contains(&candidate.kind()))
                     && !request
                         .constraints
                         .excluded_segments

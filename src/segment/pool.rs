@@ -8,7 +8,7 @@ use super::error::{AttachError, LifecycleError, PoolConfigError, ReserveError};
 use super::identity::{ClientId, SegmentId};
 use super::reservation::Reservation;
 use super::spec::{
-    MemorySegmentSpec, NofSegmentSpec, ReplicaClass, SegmentKind, SegmentMetadata,
+    CxlSegmentSpec, MemorySegmentSpec, NofSegmentSpec, ReplicaClass, SegmentKind, SegmentMetadata,
     SegmentResourceId, SegmentSpec,
 };
 use super::stats::SegmentStats;
@@ -54,6 +54,10 @@ impl SegmentCandidate {
 
     pub fn memory_spec(&self) -> Option<&MemorySegmentSpec> {
         self.segment.spec().memory()
+    }
+
+    pub fn cxl_spec(&self) -> Option<&CxlSegmentSpec> {
+        self.segment.spec().cxl()
     }
 
     pub fn nof_spec(&self) -> Option<&NofSegmentSpec> {
@@ -225,12 +229,19 @@ impl Default for SegmentPool {
 fn validate_spec(spec: &SegmentSpec) -> Result<(), AttachError> {
     match spec {
         SegmentSpec::Memory(spec) => validate_memory_spec(spec),
+        SegmentSpec::Cxl(spec) => validate_cxl_spec(spec),
         SegmentSpec::Nof(spec) => validate_nof_spec(spec),
     }
 }
 
 fn validate_memory_spec(spec: &MemorySegmentSpec) -> Result<(), AttachError> {
     validate_metadata(spec.metadata())?;
+    if matches!(spec.transport().protocol().as_str(), "cxl" | "nvmeof") {
+        return Err(AttachError::IncompatibleTransportProtocol {
+            kind: SegmentKind::Memory,
+            protocol: spec.transport().protocol().clone(),
+        });
+    }
     if spec.region().base() == 0 {
         return Err(AttachError::ZeroBaseAddress);
     }
@@ -240,6 +251,17 @@ fn validate_memory_spec(spec: &MemorySegmentSpec) -> Result<(), AttachError> {
 fn validate_nof_spec(spec: &NofSegmentSpec) -> Result<(), AttachError> {
     validate_metadata(spec.metadata())?;
     validate_direct_range(spec.region(), spec.transport())
+}
+
+fn validate_cxl_spec(spec: &CxlSegmentSpec) -> Result<(), AttachError> {
+    validate_metadata(spec.metadata())?;
+    if spec.arena().id().as_str().is_empty() {
+        return Err(AttachError::EmptyCxlArenaId);
+    }
+    if spec.arena().capacity_bytes() == 0 {
+        return Err(AttachError::ZeroSize);
+    }
+    Ok(())
 }
 
 fn validate_metadata(metadata: &SegmentMetadata) -> Result<(), AttachError> {

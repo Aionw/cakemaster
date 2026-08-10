@@ -3,21 +3,27 @@ use crate::segment::descriptor::MemoryRegion;
 use crate::segment::error::{AttachError, LifecycleError, ReserveError};
 use crate::segment::identity::{ClientId, SegmentId};
 use crate::segment::offset_allocator::ByteAllocator;
-use crate::segment::reservation::Reservation;
-use crate::segment::spec::{ReplicaClass, SegmentSpec};
+use crate::segment::reservation::{Reservation, ReservationCounter};
+use crate::segment::spec::{CxlArenaId, CxlArenaSpec, ReplicaClass, SegmentSpec};
 use crate::segment::stats::{
     SegmentReservationStats, SegmentSpaceStats, SegmentState, SegmentStats,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 pub(super) struct Catalog {
     pool_id: u64,
     generation: u64,
     segments: HashMap<SegmentId, Arc<Segment>>,
+    cxl_arenas: HashMap<CxlArenaId, CxlArena>,
     allocatable: HashMap<ReplicaClass, Arc<[SegmentCandidate]>>,
+}
+
+struct CxlArena {
+    spec: CxlArenaSpec,
+    allocator: ByteAllocator,
 }
 
 pub(super) struct Segment {
@@ -25,6 +31,7 @@ pub(super) struct Segment {
     spec: Arc<SegmentSpec>,
     phase: Mutex<SegmentState>,
     allocator: ByteAllocator,
+    live_reservations: Arc<AtomicU64>,
     accepting: AtomicBool,
 }
 
@@ -38,6 +45,7 @@ impl Catalog {
             pool_id,
             generation: 0,
             segments: HashMap::new(),
+            cxl_arenas: HashMap::new(),
             allocatable: HashMap::new(),
         }
     }
@@ -57,7 +65,8 @@ impl Catalog {
 
         self.validate_resource_conflicts(&spec)?;
 
-        let candidate = self.mutation().insert(spec, max_allocator_nodes);
+        let allocator = self.allocator_for(&spec, max_allocator_nodes)?;
+        let candidate = self.mutation().insert(spec, allocator);
         Ok(AttachOutcome::Attached(candidate))
     }
 
@@ -127,8 +136,41 @@ impl Catalog {
                     return Err(AttachError::DuplicateNofEndpoint { existing });
                 }
             }
+            SegmentSpec::Cxl(_) => {}
         }
         Ok(())
+    }
+
+    fn allocator_for(
+        &mut self,
+        spec: &SegmentSpec,
+        max_allocator_nodes: u32,
+    ) -> Result<ByteAllocator, AttachError> {
+        let SegmentSpec::Cxl(cxl) = spec else {
+            return Ok(ByteAllocator::new(
+                spec.direct_region().size(),
+                max_allocator_nodes,
+            ));
+        };
+
+        if let Some(arena) = self.cxl_arenas.get(cxl.arena().id()) {
+            if &arena.spec != cxl.arena() {
+                return Err(AttachError::ConflictingCxlArena {
+                    arena: cxl.arena().id().clone(),
+                });
+            }
+            return Ok(arena.allocator.clone());
+        }
+
+        let allocator = ByteAllocator::new(cxl.arena().capacity_bytes(), max_allocator_nodes);
+        self.cxl_arenas.insert(
+            cxl.arena().id().clone(),
+            CxlArena {
+                spec: cxl.arena().clone(),
+                allocator: allocator.clone(),
+            },
+        );
+        Ok(allocator)
     }
 
     fn mutation(&mut self) -> CatalogMutation<'_> {
@@ -180,13 +222,9 @@ impl Catalog {
 }
 
 impl CatalogMutation<'_> {
-    fn insert(&mut self, spec: SegmentSpec, max_allocator_nodes: u32) -> SegmentCandidate {
+    fn insert(&mut self, spec: SegmentSpec, allocator: ByteAllocator) -> SegmentCandidate {
         let spec = Arc::new(spec);
-        let segment = Arc::new(Segment::new(
-            self.catalog.pool_id,
-            spec,
-            max_allocator_nodes,
-        ));
+        let segment = Arc::new(Segment::new(self.catalog.pool_id, spec, allocator));
         let candidate = SegmentCandidate {
             pool_id: self.catalog.pool_id,
             segment: segment.clone(),
@@ -244,14 +282,13 @@ impl Drop for CatalogMutation<'_> {
 }
 
 impl Segment {
-    fn new(pool_id: u64, spec: Arc<SegmentSpec>, max_allocator_nodes: u32) -> Self {
-        let capacity = spec.direct_region().size();
-        let allocator = ByteAllocator::new(capacity, max_allocator_nodes);
+    fn new(pool_id: u64, spec: Arc<SegmentSpec>, allocator: ByteAllocator) -> Self {
         Self {
             pool_id,
             spec,
             phase: Mutex::new(SegmentState::Accepting),
             allocator,
+            live_reservations: Arc::new(AtomicU64::new(0)),
             accepting: AtomicBool::new(true),
         }
     }
@@ -294,11 +331,13 @@ impl Segment {
             Some(address) => address,
             None => return Err(ReserveError::AddressOverflow(self.spec.identity().id())),
         };
+        let counter = ReservationCounter::acquire(self.live_reservations.clone());
         drop(phase);
 
         Ok(Reservation {
             allocation,
             segment: self.spec.clone(),
+            _counter: counter,
             region: MemoryRegion::new(buffer_address, bytes),
         })
     }
@@ -321,7 +360,7 @@ impl Segment {
 
     fn prepare_remove(&self) -> Result<(), LifecycleError> {
         let mut phase = self.phase.lock();
-        let live_allocations = self.allocator.stats().live_allocations;
+        let live_allocations = self.live_reservations.load(Ordering::Acquire);
         match *phase {
             SegmentState::Accepting => {
                 Err(LifecycleError::StillAccepting(self.spec.identity().id()))
@@ -350,7 +389,7 @@ impl Segment {
                 largest_free_region_bytes: stats.largest_free_region,
             },
             reservations: SegmentReservationStats {
-                live: stats.live_allocations,
+                live: self.live_reservations.load(Ordering::Acquire),
             },
             state,
         }

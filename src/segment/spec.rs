@@ -1,6 +1,7 @@
 use super::descriptor::{MemoryRegion, SegmentTopology};
 use super::identity::{SegmentId, SegmentIdentity};
 use super::transport::{TransportEndpoint, TransportProtocol};
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SegmentMetadata {
@@ -92,7 +93,7 @@ impl NofSegmentSpec {
     pub fn new(
         identity: SegmentIdentity,
         region: MemoryRegion,
-        endpoint: impl Into<std::sync::Arc<str>>,
+        endpoint: impl Into<Arc<str>>,
     ) -> Self {
         Self {
             metadata: SegmentMetadata::new(identity),
@@ -127,6 +128,91 @@ impl NofSegmentSpec {
     }
 }
 
+/// Stable identity of one physical CXL allocation arena.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CxlArenaId(Arc<str>);
+
+impl CxlArenaId {
+    pub fn new(id: impl Into<Arc<str>>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// Physical capacity shared by every logical CXL segment that names this
+/// arena.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CxlArenaSpec {
+    id: CxlArenaId,
+    capacity_bytes: u64,
+}
+
+impl CxlArenaSpec {
+    pub const fn new(id: CxlArenaId, capacity_bytes: u64) -> Self {
+        Self { id, capacity_bytes }
+    }
+
+    pub const fn id(&self) -> &CxlArenaId {
+        &self.id
+    }
+
+    pub const fn capacity_bytes(&self) -> u64 {
+        self.capacity_bytes
+    }
+}
+
+/// A client-visible logical mount backed by a shared CXL arena.
+///
+/// Reservations allocate offsets from the arena. The resulting descriptor is
+/// a memory descriptor with protocol `cxl` and the logical segment name as its
+/// endpoint, matching Mooncake's wire semantics without conflating CXL with a
+/// regular process address range.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CxlSegmentSpec {
+    metadata: SegmentMetadata,
+    arena: CxlArenaSpec,
+    transport: TransportEndpoint,
+}
+
+impl CxlSegmentSpec {
+    pub fn new(identity: SegmentIdentity, arena: CxlArenaSpec) -> Self {
+        let endpoint = Arc::<str>::from(identity.name());
+        Self {
+            metadata: SegmentMetadata::new(identity),
+            arena,
+            transport: TransportEndpoint::new(TransportProtocol::Cxl, endpoint),
+        }
+    }
+
+    pub fn with_topology(mut self, topology: SegmentTopology) -> Self {
+        self.metadata = self.metadata.with_topology(topology);
+        self
+    }
+
+    pub const fn metadata(&self) -> &SegmentMetadata {
+        &self.metadata
+    }
+
+    pub const fn identity(&self) -> &SegmentIdentity {
+        self.metadata.identity()
+    }
+
+    pub const fn arena(&self) -> &CxlArenaSpec {
+        &self.arena
+    }
+
+    pub const fn transport(&self) -> &TransportEndpoint {
+        &self.transport
+    }
+
+    pub const fn topology(&self) -> &SegmentTopology {
+        self.metadata.topology()
+    }
+}
+
 /// Concrete storage implementation mounted in a [`SegmentPool`](super::SegmentPool).
 ///
 /// A segment kind describes how capacity is provided. It is deliberately
@@ -136,6 +222,7 @@ impl NofSegmentSpec {
 #[non_exhaustive]
 pub enum SegmentKind {
     Memory,
+    Cxl,
     Nof,
 }
 
@@ -159,6 +246,7 @@ pub enum ReplicaClass {
 #[non_exhaustive]
 pub enum SegmentResourceId {
     Dedicated(SegmentId),
+    CxlArena(CxlArenaId),
     NofNamespace(TransportEndpoint),
 }
 
@@ -171,6 +259,7 @@ pub enum SegmentResourceId {
 #[non_exhaustive]
 pub enum SegmentSpec {
     Memory(MemorySegmentSpec),
+    Cxl(CxlSegmentSpec),
     Nof(NofSegmentSpec),
 }
 
@@ -178,13 +267,14 @@ impl SegmentSpec {
     pub const fn kind(&self) -> SegmentKind {
         match self {
             Self::Memory(_) => SegmentKind::Memory,
+            Self::Cxl(_) => SegmentKind::Cxl,
             Self::Nof(_) => SegmentKind::Nof,
         }
     }
 
     pub const fn replica_class(&self) -> ReplicaClass {
         match self {
-            Self::Memory(_) => ReplicaClass::Memory,
+            Self::Memory(_) | Self::Cxl(_) => ReplicaClass::Memory,
             Self::Nof(_) => ReplicaClass::Nof,
         }
     }
@@ -200,6 +290,7 @@ impl SegmentSpec {
     pub fn resource_id(&self) -> SegmentResourceId {
         match self {
             Self::Memory(spec) => SegmentResourceId::Dedicated(spec.identity().id()),
+            Self::Cxl(spec) => SegmentResourceId::CxlArena(spec.arena().id().clone()),
             Self::Nof(spec) => SegmentResourceId::NofNamespace(spec.transport().clone()),
         }
     }
@@ -207,6 +298,7 @@ impl SegmentSpec {
     pub const fn metadata(&self) -> &SegmentMetadata {
         match self {
             Self::Memory(spec) => spec.metadata(),
+            Self::Cxl(spec) => spec.metadata(),
             Self::Nof(spec) => spec.metadata(),
         }
     }
@@ -214,13 +306,20 @@ impl SegmentSpec {
     pub const fn memory(&self) -> Option<&MemorySegmentSpec> {
         match self {
             Self::Memory(spec) => Some(spec),
-            Self::Nof(_) => None,
+            Self::Cxl(_) | Self::Nof(_) => None,
+        }
+    }
+
+    pub const fn cxl(&self) -> Option<&CxlSegmentSpec> {
+        match self {
+            Self::Cxl(spec) => Some(spec),
+            Self::Memory(_) | Self::Nof(_) => None,
         }
     }
 
     pub const fn nof(&self) -> Option<&NofSegmentSpec> {
         match self {
-            Self::Memory(_) => None,
+            Self::Memory(_) | Self::Cxl(_) => None,
             Self::Nof(spec) => Some(spec),
         }
     }
@@ -228,6 +327,7 @@ impl SegmentSpec {
     pub(crate) const fn direct_region(&self) -> MemoryRegion {
         match self {
             Self::Memory(spec) => spec.region(),
+            Self::Cxl(spec) => MemoryRegion::new(0, spec.arena().capacity_bytes()),
             Self::Nof(spec) => spec.region(),
         }
     }
@@ -242,5 +342,11 @@ impl From<MemorySegmentSpec> for SegmentSpec {
 impl From<NofSegmentSpec> for SegmentSpec {
     fn from(spec: NofSegmentSpec) -> Self {
         Self::Nof(spec)
+    }
+}
+
+impl From<CxlSegmentSpec> for SegmentSpec {
+    fn from(spec: CxlSegmentSpec) -> Self {
+        Self::Cxl(spec)
     }
 }

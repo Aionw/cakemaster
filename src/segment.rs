@@ -21,7 +21,7 @@ pub use identity::{ClientId, SegmentId, SegmentIdentity};
 pub use pool::{AttachOutcome, PoolSnapshot, SegmentCandidate, SegmentPool};
 pub use reservation::Reservation;
 pub use spec::{
-    MemorySegmentSpec, NofSegmentSpec, ReplicaClass, SegmentKind, SegmentMetadata,
-    SegmentResourceId, SegmentSpec,
+    CxlArenaId, CxlArenaSpec, CxlSegmentSpec, MemorySegmentSpec, NofSegmentSpec, ReplicaClass,
+    SegmentKind, SegmentMetadata, SegmentResourceId, SegmentSpec,
 };
 pub use transport::{TransportEndpoint, TransportProtocol};

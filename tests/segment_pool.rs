@@ -7,9 +7,10 @@ use cakemaster::segment::placement::{
 };
 use cakemaster::segment::stats::SegmentState;
 use cakemaster::segment::{
-    AttachOutcome, ClientId, MemoryRegion, MemorySegmentSpec, NofSegmentSpec, ReplicaClass,
-    SegmentId, SegmentIdentity, SegmentKind, SegmentPool, SegmentPoolConfig, SegmentResourceId,
-    SegmentTopology, TransportEndpoint, TransportProtocol,
+    AttachOutcome, ClientId, CxlArenaId, CxlArenaSpec, CxlSegmentSpec, MemoryRegion,
+    MemorySegmentSpec, NofSegmentSpec, ReplicaClass, SegmentId, SegmentIdentity, SegmentKind,
+    SegmentPool, SegmentPoolConfig, SegmentResourceId, SegmentTopology, TransportEndpoint,
+    TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
@@ -41,6 +42,14 @@ fn nof_spec(index: u64, endpoint: &str, host: &str) -> NofSegmentSpec {
     .with_topology(SegmentTopology::on_host(host))
 }
 
+fn cxl_spec(index: u64, name: &str, arena: CxlArenaSpec, host: &str) -> CxlSegmentSpec {
+    CxlSegmentSpec::new(
+        SegmentIdentity::new(SegmentId::new(3, index), OWNER, name),
+        arena,
+    )
+    .with_topology(SegmentTopology::on_host(host))
+}
+
 #[test]
 fn protocol_is_typed_in_core_and_extensible_at_the_wire_boundary() {
     assert_eq!("tcp".parse(), Ok(TransportProtocol::Tcp));
@@ -67,6 +76,19 @@ fn protocol_is_typed_in_core_and_extensible_at_the_wire_boundary() {
         AttachError::InvalidTransportProtocol {
             protocol: invalid_protocol,
             source: ParseTransportProtocolError,
+        }
+    );
+
+    let cxl_as_memory = MemorySegmentSpec::new(
+        SegmentIdentity::new(SegmentId::new(1, 2), OWNER, "misclassified-cxl"),
+        MemoryRegion::new(0x2000, 4096),
+        TransportEndpoint::new(TransportProtocol::Cxl, "cxl-client"),
+    );
+    assert_eq!(
+        pool().attach(cxl_as_memory).unwrap_err(),
+        AttachError::IncompatibleTransportProtocol {
+            kind: SegmentKind::Memory,
+            protocol: TransportProtocol::Cxl,
         }
     );
 }
@@ -116,6 +138,77 @@ fn nof_uses_namespace_offsets_and_an_independent_replica_class() {
         reservations
             .iter()
             .all(|reservation| reservation.replica_class() == ReplicaClass::Nof)
+    );
+}
+
+#[test]
+fn cxl_logical_segments_share_one_physical_arena() {
+    let pool = Arc::new(pool());
+    let arena_id = CxlArenaId::new("/dev/dax0.0");
+    let arena = CxlArenaSpec::new(arena_id.clone(), CAPACITY);
+    let first_spec = cxl_spec(1, "cxl-client-a", arena.clone(), "host-a");
+    let second_spec = cxl_spec(2, "cxl-client-b", arena.clone(), "host-b");
+    let second_id = second_spec.identity().id();
+    let first = pool.attach(first_spec).unwrap().candidate().clone();
+    let second = pool.attach(second_spec).unwrap().candidate().clone();
+
+    assert_eq!(first.kind(), SegmentKind::Cxl);
+    assert_eq!(first.replica_class(), ReplicaClass::Memory);
+    assert_eq!(
+        first.resource_id(),
+        SegmentResourceId::CxlArena(arena_id.clone())
+    );
+    assert_eq!(first.resource_id(), second.resource_id());
+    assert!(first.memory_spec().is_none());
+    assert_eq!(first.cxl_spec().unwrap().arena(), &arena);
+
+    let reservation = pool.reserve(&first, CAPACITY * 3 / 4).unwrap();
+    let descriptor = reservation.descriptor().memory().unwrap();
+    assert_eq!(descriptor.region().base(), 0);
+    assert_eq!(descriptor.transport().protocol(), &TransportProtocol::Cxl);
+    assert_eq!(descriptor.transport().endpoint(), "cxl-client-a");
+    assert_eq!(
+        pool.reserve(&second, CAPACITY / 2).unwrap_err(),
+        ReserveError::OutOfSpace(second.id())
+    );
+    assert_eq!(first.stats().reservations.live, 1);
+    assert_eq!(second.stats().reservations.live, 0);
+    assert_eq!(
+        first.stats().space.used_bytes,
+        second.stats().space.used_bytes
+    );
+
+    pool.quiesce(OWNER, second_id).unwrap();
+    pool.remove(OWNER, second_id).unwrap();
+    drop(reservation);
+
+    let third = pool
+        .attach(cxl_spec(3, "cxl-client-c", arena.clone(), "host-c"))
+        .unwrap()
+        .candidate()
+        .clone();
+    let request = PlacementRequest::new(
+        AllocationSpec::new(4096),
+        ReplicaPolicy::new(2).across(FailureDomain::Resource),
+    )
+    .constrained_by(PlacementConstraints::default().allowing_kinds([SegmentKind::Cxl]));
+    assert_eq!(
+        ReplicaAllocator::new(pool.clone())
+            .reserve(&request)
+            .unwrap_err(),
+        PlacementError::InsufficientReplicas {
+            requested: 2,
+            allocated: 1
+        }
+    );
+    assert_eq!(first.stats().reservations.live, 0);
+    assert_eq!(third.stats().reservations.live, 0);
+
+    let conflicting_arena = CxlArenaSpec::new(arena_id.clone(), CAPACITY / 2);
+    assert_eq!(
+        pool.attach(cxl_spec(4, "cxl-conflict", conflicting_arena, "host-d"))
+            .unwrap_err(),
+        AttachError::ConflictingCxlArena { arena: arena_id }
     );
 }
 

@@ -7,10 +7,30 @@ use super::offset_allocator::OffsetAllocationHandle;
 use super::spec::{ReplicaClass, SegmentSpec};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub(super) struct ReservationCounter {
+    live: Arc<AtomicU64>,
+}
+
+impl ReservationCounter {
+    pub(super) fn acquire(live: Arc<AtomicU64>) -> Self {
+        live.fetch_add(1, Ordering::AcqRel);
+        Self { live }
+    }
+}
+
+impl Drop for ReservationCounter {
+    fn drop(&mut self) {
+        let previous = self.live.fetch_sub(1, Ordering::AcqRel);
+        debug_assert_ne!(previous, 0, "reservation counts must remain balanced");
+    }
+}
 
 pub struct Reservation {
     pub(super) allocation: OffsetAllocationHandle,
     pub(super) segment: Arc<SegmentSpec>,
+    pub(super) _counter: ReservationCounter,
     pub(super) region: MemoryRegion,
 }
 
@@ -44,6 +64,10 @@ impl Reservation {
             SegmentSpec::Memory(spec) => ReservationDescriptorRef::Memory(
                 MemoryDescriptorRef::new(self.region, spec.transport()),
             ),
+            SegmentSpec::Cxl(spec) => ReservationDescriptorRef::Memory(MemoryDescriptorRef::new(
+                self.region,
+                spec.transport(),
+            )),
             SegmentSpec::Nof(spec) => {
                 ReservationDescriptorRef::Nof(NofDescriptorRef::new(self.region, spec.transport()))
             }
@@ -55,11 +79,14 @@ impl Reservation {
     }
 
     pub(crate) fn release_batch(reservations: Vec<Self>) {
-        OffsetAllocationHandle::release_batch(
-            reservations
-                .into_iter()
-                .map(|reservation| reservation.allocation),
-        );
+        let mut allocations = Vec::with_capacity(reservations.len());
+        let mut counters = Vec::with_capacity(reservations.len());
+        for reservation in reservations {
+            allocations.push(reservation.allocation);
+            counters.push(reservation._counter);
+        }
+        OffsetAllocationHandle::release_batch(allocations);
+        drop(counters);
     }
 }
 

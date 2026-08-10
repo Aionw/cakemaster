@@ -2,6 +2,8 @@
 
 use super::config::{MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE, MIN_ALLOCATOR_NODES_PER_SEGMENT};
 use super::identity::{ClientId, SegmentId};
+use super::spec::{CxlArenaId, SegmentKind};
+use super::transport::TransportProtocol;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -43,6 +45,11 @@ pub enum AttachError {
         #[source]
         source: ParseTransportProtocolError,
     },
+    #[error("transport protocol {protocol:?} is incompatible with {kind:?} segments")]
+    IncompatibleTransportProtocol {
+        kind: SegmentKind,
+        protocol: TransportProtocol,
+    },
     #[error("host id must not be empty when present")]
     EmptyHostId,
     #[error("segment size must not be zero")]
@@ -55,6 +62,10 @@ pub enum AttachError {
     OverlappingAddressRange { existing: SegmentId },
     #[error("NVMe-oF namespace endpoint is already attached as segment {existing}")]
     DuplicateNofEndpoint { existing: SegmentId },
+    #[error("CXL arena id must not be empty")]
+    EmptyCxlArenaId,
+    #[error("CXL arena {arena:?} is already registered with different capacity")]
+    ConflictingCxlArena { arena: CxlArenaId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
