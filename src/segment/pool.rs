@@ -1,6 +1,9 @@
 mod catalog;
+mod entry;
+mod resource;
 
-use self::catalog::{Catalog, SegmentEntry};
+use self::catalog::Catalog;
+use self::entry::SegmentEntry;
 use super::config::{
     MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE, MIN_ALLOCATOR_NODES_PER_SEGMENT, SegmentPoolConfig,
 };
@@ -67,13 +70,15 @@ impl SegmentHandle {
     }
 
     pub fn direct_candidate(&self) -> Option<DirectCandidate> {
-        self.entry.is_range_capacity().then(|| DirectCandidate {
-            segment: self.clone(),
-        })
+        self.entry
+            .supports_direct_reservation()
+            .then(|| DirectCandidate {
+                segment: self.clone(),
+            })
     }
 
     pub fn offload_target(&self) -> Option<OffloadTarget> {
-        self.entry.is_local_ssd_capacity().then(|| OffloadTarget {
+        self.entry.supports_offload().then(|| OffloadTarget {
             segment: self.clone(),
         })
     }

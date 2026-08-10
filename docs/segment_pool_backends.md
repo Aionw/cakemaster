@@ -27,16 +27,19 @@ LocalSSD 也不能接入 `reserve(bytes)`，因为准入成功不代表数据已
   不放进 spec；当前 placement 只使用确定存在的 owner/resource failure domain。
 - `SegmentKind` 表示具体实现，`ReplicaClass` 表示产物类型，
   `SegmentResourceId` 表示真正共享容量或故障域的资源。这三个维度相互独立。
-- 每个 logical segment 对应一个 `SegmentEntry`，只包含 `spec + state + capacity +
+- 每个 logical segment 对应一个 `SegmentEntry`，只包含 `spec + state + resource +
   usage`。`state` 是明确的 `Accepting/Quiesced/Removed`，不再增加含义重叠的通用
   包装层。
-- `CapacityHandle::Range` 表示同步区间分配能力，Memory/NoF 使用独立 allocator，
+- `MountedResource::Range` 表示同步区间分配能力，Memory/NoF 使用独立 allocator，
   CXL entry 从 `ResourceRegistry` 绑定同一个 arena allocator；
-  `CapacityHandle::LocalSsd` 保存 heartbeat capacity、offload enable、pending 和
+  `MountedResource::LocalSsd` 保存 heartbeat capacity、offload enable、pending 和
   committed bytes。
 - `ResourceRegistry` 只管理确实跨 logical segment 共享的物理资源。目前就是 CXL
   arena；最后一个 CXL entry 移除时才解除 arena 注册。Offload 不是 CXL 的子类或
   关联对象，而是另一种 capability/workflow。
+- Catalog 只保存 entry、维护 candidate index，并在 attach/remove 时调用
+  `mount/unmount` 接口；具体 kind 的构造、冲突检查和容量操作都不在 Catalog
+  分支。新增已有 workflow 的 segment kind 不修改 Catalog。
 - `PoolSnapshot` 暴露 `DirectCandidate`，只进入同步 placement；
   `OffloadSnapshot` 暴露 `OffloadTarget`，只进入异步 offload。两条路径在类型上
   不能混用。
