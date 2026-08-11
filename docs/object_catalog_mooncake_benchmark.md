@@ -97,8 +97,9 @@ target/release/object_catalog_rpc_benchmark_server \
 但没有直接包含 `<cstdint>`。本次没有修改其源码，Release 构建只增加了
 `-include cstdint` 作为构建期 workaround；这不会改变被测 Master 的业务路径。
 
-Rust benchmark server 的自动压力控制器明确是 Memory-only 测试设施。通用生产
-控制器仍需先实现按 replica class 隔离的 reclaim debt/候选队列，详见
+Rust benchmark server 的自动压力控制器明确是 Memory-only 测试设施。catalog
+现已支持按 tenant/replica class 的 scoped reclaim filter；通用生产控制器仍需按
+各 class 的物理水位分别产生全局压力目标，详见
 [`object_catalog_rpc.md`](object_catalog_rpc.md)。
 
 ## Direct API 对比（2026-08-07）

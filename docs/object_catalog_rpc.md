@@ -11,7 +11,7 @@
 async WrappedMasterService handler
         │ wire 校验、类型转换、错误码映射
         ▼
-ObjectManager（同步、线程安全、一次调用内的有界内存工作）
+ObjectManager / TenantObjectManager（同步、线程安全、有界内存工作）
         ├── ObjectCatalog：key 生命周期、owner、lease、回收状态
         └── ReplicaAllocator：placement 与 SegmentPool reservation
 ```
@@ -22,10 +22,23 @@ ObjectManager（同步、线程安全、一次调用内的有界内存工作）
 placement 需要访问远端调度器，应把异步引入 placement/coordinator 边界，而不是
 让 catalog 的纯内存状态机整体异步化。
 
-`ObjectCatalogRpcService` 的 handler 只做四件事：取得单调时钟、执行一次有界
-maintenance、把 wire config 归一化为领域 plan、逐项调用 `ObjectManager` 并映射
+`ObjectCatalogRpcService` 的 handler 先校验 wire 请求并归一化领域输入，再取得单调
+时钟、执行一次有界 maintenance、解析一次 batch tenant、调用领域 batch API 并映射
 返回值。批内每个 key 独立成功或失败，只有连接/编解码失败才返回 transport-level
 `RpcFailure`。
+
+服务类型为 `ObjectCatalogRpcService<B>`，默认 backend 是 `ObjectManager`。RPC
+adapter 内部用私有 `ObjectBatchBackend` trait 统一 batch 接口：single backend 的
+request tenant 是 `()`，multi backend 是 `ResolvedTenant`。trait 通过泛型静态分发，
+不引入每批虚调用；其默认 `execute_batch` 统一 maintenance、tenant 解析和逐项错误
+展开，两种实现只保留实际领域调用的差异。两种具体 manager 仍是核心层的显式安全
+边界。类型化 accessor 只允许 single 服务取得 raw `ObjectManager`，multi 服务只能
+取得 `TenantObjectManager`。
+
+Vec 数量、wire config、replica selector 和 checksum 等纯请求校验全部发生在
+`execute_batch` 之前，非法请求不会触发 maintenance 或 tenant lookup。`put_end` 的
+逐项 checksum 校验会先分流合法项，只把合法 key 交给 backend，再按原索引合并结果；
+backend callback 因此只包含对应的领域 batch 调用。
 
 ## ObjectManager 的职责与行为
 
@@ -90,27 +103,30 @@ bounded collector；它不会在一次调用中无限扫描。
 | Disk/LocalDisk selector | `INVALID_PARAMS` |
 | `ObjectMeta.object_checksum=Some(...)` | `INVALID_PARAMS` |
 | BatchGet checksum | 永远返回 `None` |
-| tenant id | 当前忽略，统一映射到 `NamespaceId::DEFAULT` |
+| tenant id（single 构造） | 忽略并统一映射到 `NamespaceId::DEFAULT` |
+| tenant id（multi 构造） | 映射到隔离 namespace；未知租户和超额分别返回现有 tenant 错误码 |
 
 `ObjectDataType::KVCACHE` 和 `TENSOR` 会保留为对应的 `ObjectKind`，其余类型暂归为
 `General`。空 key、零长度、batch key/length 数量不一致等均逐项返回明确错误。
 
 ## 仍需补齐的设计
 
-RPC adapter 本身已经是薄层。当前不能直接做成通用生产服务的主要缺口在压力控制
-而不在 RPC：`ObjectCatalog` 目前只有全局 reclaim debt/候选队列，而生产环境需要
-按 Memory/NoF class 统计水位、发起回收并保证只回收目标资源池。仓库中的 RPC
-benchmark server 因此只提供明确标注的 Memory-only controller；在增加
-class-aware reclaim queue/debt 前，不应把它伪装成通用后台策略。
-
-另外，真正启用多租户前需要定义 tenant 到 `NamespaceId` 的稳定映射和 quota
-admission；支持混合 Memory+NoF replica 前需要把一个 object plan 从单 class
-扩展成多 class 子计划及原子回滚。checksum 和 pin 是本次明确不支持的能力，不在
-RPC 层用占位实现掩盖。
+RPC adapter 本身已经是薄层。tenant quota 已按 Memory/NoF 分账，并通过 scoped
+filter 在现有 generation queue 上定向回收；整体物理水位控制仍由部署侧 controller
+决定。支持混合 Memory+NoF replica 仍需要把一个 object plan 从单 class 扩展成多
+class 子计划及原子回滚。group、checksum 和 pin 是当前明确不支持的能力，不在 RPC
+层用占位实现掩盖。tenant 的完整约束见 `docs/tenant_quota.md`。
 
 实现入口：
 
 - `src/object/manager.rs`：领域协调器；
+- `src/object/tenant/mod.rs`：tenant 公共模型与模块出口；
+- `src/object/tenant/manager.rs`：tenant-safe object façade；
+- `src/object/tenant/registry.rs`：ID/namespace 解析、注册与生命周期；
+- `src/object/tenant/quota.rs`：quota admission、accounting 与 RAII token；
 - `src/segment/placement.rs`：placement 与 reservation；
-- `crates/cakemaster-server/src/object_catalog_rpc.rs`：Mooncake wire adapter；
+- `crates/cakemaster-server/src/object_catalog_rpc/mod.rs`：service 与 RPC handler；
+- `crates/cakemaster-server/src/object_catalog_rpc/backend.rs`：静态 backend 契约与公共 batch 流程；
+- `crates/cakemaster-server/src/object_catalog_rpc/single_tenant.rs`、`multi_tenant.rs`：两种领域 backend 适配；
+- `crates/cakemaster-server/src/object_catalog_rpc/request.rs`、`response.rs`：wire 请求归一化与响应映射；
 - `crates/cakemaster-server/tests/object_catalog_rpc.rs`：真实 TCP 跨层测试。

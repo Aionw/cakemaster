@@ -47,6 +47,8 @@ crates/coro-rpc/examples/   # RPC crate 的 benchmark
 SegmentPool 对 Memory、CXL、NoF 和 LocalSSD 的领域建模与扩展约束见 [`docs/segment_pool_backends.md`](docs/segment_pool_backends.md)。
 ObjectManager、ReplicaAllocator、异步 RPC 边界和当前 Mooncake 兼容子集见
 [`docs/object_catalog_rpc.md`](docs/object_catalog_rpc.md)。
+可选的 tenant namespace、Memory/NoF quota、RAII 计费与定向回收见
+[`docs/tenant_quota.md`](docs/tenant_quota.md)。
 
 核心类型保持短路径，扩展接口按职责导入：
 
@@ -261,7 +263,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 ## ObjectCatalog 的 Mooncake Batch RPC
 
-[`ObjectCatalogRpcService`](crates/cakemaster-server/src/object_catalog_rpc.rs) 实现生成的
+[`ObjectCatalogRpcService`](crates/cakemaster-server/src/object_catalog_rpc/mod.rs) 实现生成的
 异步 `WrappedMasterService` trait，并把 `BatchExistKey`、
 `BatchGetReplicaList`、`BatchPutStart`、`BatchPutEnd` 和 `BatchPutRevoke` 接到真实
 `ObjectManager`。RPC 层只负责 wire 校验、plan 转换和错误码映射；同步、线程安全的
@@ -269,8 +271,9 @@ ObjectManager 负责 owner、pending/published 生命周期、lease 和 reservat
 
 当前明确不支持 checksum：PutEnd 携带 checksum 返回 `INVALID_PARAMS`，BatchGet
 固定返回 `None`。接口也不提供单 key 版本。Memory-only replica 使用与 C++ 一致的
-best-effort 语义，NoF-only 使用 all-or-nothing；混合 Memory+NoF、pin、Disk 和多租户
-namespace 仍需领域模型支持，不在 RPC handler 中静默降级。
+best-effort 语义，NoF-only 使用 all-or-nothing；混合 Memory+NoF、group、pin 和 Disk
+仍需领域模型支持，不在 RPC handler 中静默降级。multi-tenant 构造会解析 tenant、
+隔离 namespace 并执行 Memory/NoF quota admission。
 
 真实 TCP 测试位于
 [`crates/cakemaster-server/tests/object_catalog_rpc.rs`](crates/cakemaster-server/tests/object_catalog_rpc.rs)。

@@ -1,11 +1,15 @@
-use cakemaster::object::{ObjectCatalogConfig, ObjectManager};
+use cakemaster::object::{
+    ObjectCatalogConfig, ObjectManager, TenantConfig, TenantId, TenantObjectManager, TenantPolicy,
+    TenantQuotaLimits,
+};
 use cakemaster::segment::{
     ClientId, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool, SegmentSpec,
     TransportEndpoint, TransportProtocol,
 };
 use cakemaster_proto::mooncake::{
     DescriptorVariant, ErrorCode, ObjectDataType, ObjectMeta, ReplicaStatus, ReplicaType,
-    ReplicateConfig, Uuid, WrappedMasterServiceClient, WrappedMasterServiceServer,
+    ReplicateConfig, Uuid, WrappedMasterService, WrappedMasterServiceClient,
+    WrappedMasterServiceServer,
 };
 use cakemaster_server::ObjectCatalogRpcService;
 use std::sync::Arc;
@@ -58,7 +62,9 @@ async fn generated_mooncake_rpc_drives_the_real_object_manager() {
         )
         .unwrap(),
     );
-    let server = WrappedMasterServiceServer::new(ObjectCatalogRpcService::new(manager))
+    let service = ObjectCatalogRpcService::new(manager.clone());
+    assert!(Arc::ptr_eq(service.manager(), &manager));
+    let server = WrappedMasterServiceServer::new(service)
         .into_rpc_server()
         .unwrap();
     let bound = server.bind("127.0.0.1:0").await.unwrap();
@@ -297,4 +303,149 @@ async fn generated_mooncake_rpc_drives_the_real_object_manager() {
     drop(client);
     let _ = shutdown_tx.send(());
     server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn multi_tenant_rpc_resolves_once_per_batch_and_maps_tenant_errors() {
+    let tenant_a = TenantId::try_from("tenant-a").unwrap();
+    let tenant_b = TenantId::try_from("tenant-b").unwrap();
+    let policy = TenantPolicy::new(TenantQuotaLimits::new(4096, 0));
+    let manager = Arc::new(
+        TenantObjectManager::new(
+            pool(),
+            TenantConfig::multi(vec![(tenant_a.clone(), policy), (tenant_b.clone(), policy)]),
+        )
+        .unwrap(),
+    );
+    let service = ObjectCatalogRpcService::with_tenants(manager.clone());
+    assert!(Arc::ptr_eq(service.tenant_manager(), &manager));
+    let writer = Uuid { high: 17, low: 23 };
+
+    assert_eq!(
+        service
+            .batch_exist_key(vec!["key".to_owned()], "missing".to_owned())
+            .await
+            .unwrap(),
+        vec![Err(ErrorCode::TenantNotRegistered)]
+    );
+    assert_eq!(
+        service
+            .batch_exist_key(vec!["key".to_owned()], String::new())
+            .await
+            .unwrap(),
+        vec![Err(ErrorCode::InvalidParams)]
+    );
+    assert_eq!(
+        service
+            .batch_put_start(
+                writer.clone(),
+                vec!["a".to_owned(), "b".to_owned()],
+                vec![4096],
+                config(1, 0),
+                "missing".to_owned(),
+            )
+            .await
+            .unwrap(),
+        vec![Err(ErrorCode::InvalidParams), Err(ErrorCode::InvalidParams)]
+    );
+    let mut unsupported = config(1, 0);
+    unsupported.with_soft_pin = true;
+    assert_eq!(
+        service
+            .batch_put_start(
+                writer.clone(),
+                vec!["unsupported".to_owned()],
+                vec![4096],
+                unsupported,
+                "missing".to_owned(),
+            )
+            .await
+            .unwrap(),
+        vec![Err(ErrorCode::InvalidParams)]
+    );
+    assert_eq!(
+        service
+            .batch_put_end(
+                writer.clone(),
+                vec![
+                    ObjectMeta {
+                        key: "bad-checksum".to_owned(),
+                        object_checksum: Some(7),
+                    },
+                    ObjectMeta {
+                        key: "valid".to_owned(),
+                        object_checksum: None,
+                    },
+                ],
+                ReplicaType::Memory,
+                "missing".to_owned(),
+            )
+            .await
+            .unwrap(),
+        vec![
+            Err(ErrorCode::InvalidParams),
+            Err(ErrorCode::TenantNotRegistered)
+        ]
+    );
+    assert_eq!(
+        service
+            .batch_put_revoke(
+                writer.clone(),
+                vec!["key".to_owned()],
+                ReplicaType::Disk,
+                "missing".to_owned(),
+            )
+            .await
+            .unwrap(),
+        vec![Err(ErrorCode::InvalidParams)]
+    );
+
+    for tenant in [tenant_a.as_str(), tenant_b.as_str()] {
+        let started = service
+            .batch_put_start(
+                writer.clone(),
+                vec!["same-key".to_owned()],
+                vec![4096],
+                config(1, 0),
+                tenant.to_owned(),
+            )
+            .await
+            .unwrap();
+        assert!(started[0].is_ok());
+        assert_eq!(
+            service
+                .batch_put_end(
+                    writer.clone(),
+                    vec![ObjectMeta {
+                        key: "same-key".to_owned(),
+                        object_checksum: None,
+                    }],
+                    ReplicaType::Memory,
+                    tenant.to_owned(),
+                )
+                .await
+                .unwrap(),
+            vec![Ok(())]
+        );
+    }
+    assert_eq!(
+        service
+            .batch_exist_key(vec!["same-key".to_owned()], tenant_b.to_string())
+            .await
+            .unwrap(),
+        vec![Ok(true)]
+    );
+    assert_eq!(
+        service
+            .batch_put_start(
+                writer,
+                vec!["over-quota".to_owned()],
+                vec![1],
+                config(1, 0),
+                tenant_a.to_string(),
+            )
+            .await
+            .unwrap(),
+        vec![Err(ErrorCode::TenantQuotaExceeded)]
+    );
 }
