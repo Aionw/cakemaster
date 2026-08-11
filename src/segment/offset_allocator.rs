@@ -122,12 +122,9 @@ impl ByteAllocator {
 
         let (allocation, reserved_bytes) = {
             let mut state = self.shared.state.lock();
-            let allocation = match state.inner.allocate(allocation_units) {
-                Some(allocation) => allocation,
-                None => {
-                    self.shared.refresh_largest_free_region(&state);
-                    return None;
-                }
+            let Some(allocation) = state.inner.allocate(allocation_units) else {
+                self.shared.refresh_largest_free_region(&state);
+                return None;
             };
             let reserved_units = state.inner.allocation_size(allocation);
             let reserved_bytes = u64::from(reserved_units) << self.shared.quantum_shift;
