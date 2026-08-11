@@ -2,8 +2,13 @@ use cakemaster::object::{ObjectContent, ObjectKind, ObjectPutPlan, ReplicaSelect
 use cakemaster::segment::placement::{
     AllocationSpec, FulfillmentPolicy, PlacementConstraints, PlacementRequest, ReplicaPolicy,
 };
-use cakemaster::segment::{ClientId, ReplicaClass};
-use cakemaster_proto::mooncake::{ErrorCode, ObjectDataType, ReplicaType, ReplicateConfig, Uuid};
+use cakemaster::segment::{
+    ClientId, CxlArenaId, CxlArenaSpec, MemoryRegion, ReplicaClass, SegmentId, SegmentIdentity,
+    SegmentSpec, TransportEndpoint, TransportProtocol,
+};
+use cakemaster_proto::mooncake::{
+    ErrorCode, ObjectDataType, ReplicaType, ReplicateConfig, Segment, Uuid,
+};
 use std::collections::HashSet;
 
 pub(super) struct PutPlanTemplate {
@@ -121,6 +126,34 @@ pub(super) fn replica_selector(replica_type: ReplicaType) -> Result<ReplicaSelec
 
 pub(super) fn client_id_from_uuid(client_id: &Uuid) -> ClientId {
     ClientId::new(client_id.high, client_id.low)
+}
+
+pub(super) fn segment_spec_from_wire(
+    segment: Segment,
+    owner: ClientId,
+) -> Result<SegmentSpec, ErrorCode> {
+    let protocol = segment
+        .protocol
+        .parse::<TransportProtocol>()
+        .map_err(|_| ErrorCode::InvalidParams)?;
+    let identity = SegmentIdentity::new(
+        SegmentId::new(segment.id.high, segment.id.low),
+        owner,
+        segment.name,
+    )
+    .with_host_id(segment.host_id);
+    match protocol {
+        TransportProtocol::Cxl => Ok(SegmentSpec::cxl(
+            identity,
+            CxlArenaSpec::new(CxlArenaId::new(segment.te_endpoint), segment.size),
+        )),
+        TransportProtocol::NvmeOf => Err(ErrorCode::InvalidParams),
+        protocol => Ok(SegmentSpec::memory(
+            identity,
+            MemoryRegion::new(segment.base, segment.size),
+            TransportEndpoint::new(protocol, segment.te_endpoint),
+        )),
+    }
 }
 
 #[cfg(test)]

@@ -60,6 +60,7 @@ pub struct SegmentIdentity {
     id: SegmentId,
     owner: ClientId,
     name: Arc<str>,
+    host_id: Arc<str>,
 }
 
 impl SegmentIdentity {
@@ -68,7 +69,13 @@ impl SegmentIdentity {
             id,
             owner,
             name: name.into(),
+            host_id: Arc::from(""),
         }
+    }
+
+    pub fn with_host_id(mut self, host_id: impl Into<Arc<str>>) -> Self {
+        self.host_id = host_id.into();
+        self
     }
 
     pub const fn id(&self) -> SegmentId {
@@ -81,5 +88,9 @@ impl SegmentIdentity {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn host_id(&self) -> &str {
+        &self.host_id
     }
 }

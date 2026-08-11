@@ -1,5 +1,6 @@
 //! Process-local monotonic time shared by server runtime components.
 
+use cakemaster::client::ClientTick;
 use cakemaster::object::reclamation::CatalogTick;
 use std::time::Instant;
 
@@ -21,8 +22,15 @@ impl MasterClock {
     }
 
     pub fn now(&self) -> CatalogTick {
-        let millis = self.epoch.elapsed().as_millis();
-        CatalogTick::new(u64::try_from(millis).unwrap_or(u64::MAX))
+        CatalogTick::new(self.elapsed_millis())
+    }
+
+    pub fn client_now(&self) -> ClientTick {
+        ClientTick::new(self.elapsed_millis())
+    }
+
+    fn elapsed_millis(&self) -> u64 {
+        u64::try_from(self.epoch.elapsed().as_millis()).unwrap_or(u64::MAX)
     }
 }
 

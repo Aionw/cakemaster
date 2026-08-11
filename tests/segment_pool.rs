@@ -486,6 +486,42 @@ fn attach_is_idempotent_but_rejects_conflicts_and_overlaps() {
 }
 
 #[test]
+fn quiesced_attach_stays_hidden_until_atomic_batch_reactivation() {
+    let pool = pool();
+    let first = spec(1, "memory-a");
+    let first_id = first.identity().id();
+    let second = owned_spec(2, "memory-b", OTHER_OWNER);
+    let second_id = second.identity().id();
+
+    assert!(matches!(
+        pool.attach_quiesced(first).unwrap(),
+        AttachOutcome::Attached(_)
+    ));
+    pool.attach_quiesced(second).unwrap();
+    assert_eq!(pool.stats(first_id).unwrap().state, SegmentState::Quiesced);
+    assert_eq!(pool.stats(second_id).unwrap().state, SegmentState::Quiesced);
+    assert!(pool.snapshot().is_empty());
+
+    assert_eq!(
+        pool.reactivate_many(OWNER, &[first_id, second_id]),
+        Err(SegmentStateError::OwnerMismatch {
+            segment: second_id,
+            expected: OTHER_OWNER,
+            actual: OWNER,
+        })
+    );
+    assert_eq!(pool.stats(first_id).unwrap().state, SegmentState::Quiesced);
+    assert_eq!(pool.stats(second_id).unwrap().state, SegmentState::Quiesced);
+    assert!(pool.snapshot().is_empty());
+
+    pool.reactivate_many(OWNER, &[first_id]).unwrap();
+    assert_eq!(pool.stats(first_id).unwrap().state, SegmentState::Accepting);
+    assert_eq!(pool.stats(second_id).unwrap().state, SegmentState::Quiesced);
+    assert_eq!(pool.snapshot().len(), 1);
+    assert_eq!(pool.snapshot().candidates()[0].id(), first_id);
+}
+
+#[test]
 fn reservation_owns_the_range_and_releases_it_on_drop() {
     let pool = pool();
     let candidate = pool.attach(spec(1, "memory-a")).unwrap();

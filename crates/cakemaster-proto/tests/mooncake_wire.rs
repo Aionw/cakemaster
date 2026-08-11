@@ -1,8 +1,8 @@
 #![allow(dead_code)]
 
 use cakemaster_proto::mooncake::{
-    ExpectedBool, ExpectedGetReplicaListResponse, ExpectedReplicaDescriptors, ExpectedVoid,
-    ObjectDataType, ObjectMeta, ReplicaType, ReplicateConfig, Uuid,
+    ExpectedBool, ExpectedGetReplicaListResponse, ExpectedPingResponse, ExpectedReplicaDescriptors,
+    ExpectedVoid, ObjectDataType, ObjectMeta, ReplicaType, ReplicateConfig, Segment, Uuid,
 };
 use coro_rpc::function_id;
 use coro_rpc::struct_pack::{deserialize, serialize, type_hash, type_literal};
@@ -15,9 +15,15 @@ type BatchPutStartResponse = Vec<ExpectedReplicaDescriptors>;
 type BatchPutEndRequest = (Uuid, Vec<ObjectMeta>, ReplicaType, String);
 type BatchPutRevokeRequest = (Uuid, Vec<String>, ReplicaType, String);
 type BatchVoidResponse = Vec<ExpectedVoid>;
+type PingRequest = Uuid;
+type RemountRequest = (Vec<Segment>, Uuid);
 
 #[test]
 fn mooncake_rpc_schema_matches_yalantinglibs_metadata() {
+    assert_type::<PingRequest>("fd04048989ff", 1_013_810_144);
+    assert_eq!(type_hash::<ExpectedPingResponse>(), 1_948_946_258);
+    assert_eq!(type_hash::<RemountRequest>(), 3_334_892_424);
+    assert_eq!(type_hash::<ExpectedVoid>(), 2_938_661_068);
     assert_type::<BatchKeyRequest>("fd84800c800cff", 16_223_586);
     assert_type::<BatchExistsResponse>("84870b01", 710_904_924);
     assert_type::<BatchGetResponse>(
@@ -39,6 +45,14 @@ fn mooncake_rpc_schema_matches_yalantinglibs_metadata() {
 
 #[test]
 fn mooncake_rpc_routes_match_wrapped_master_service() {
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::Ping"),
+        3_603_094_245
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::ReMountSegment"),
+        184_892_274
+    );
     assert_eq!(
         function_id("mooncake::WrappedMasterService::BatchExistKey"),
         3_097_470_640

@@ -269,6 +269,23 @@ impl SegmentPool {
         })
     }
 
+    /// Attaches a new segment without publishing it to accepting snapshots.
+    /// Existing idempotent mounts retain their current state.
+    pub fn attach_quiesced(&self, spec: SegmentSpec) -> Result<AttachOutcome, AttachError> {
+        validate_spec(&spec)?;
+        let owner = spec.identity().owner();
+        let id = spec.identity().id();
+        self.update_direct_catalog(|catalog| {
+            let outcome = catalog.attach(spec, self.config.max_allocator_nodes_per_segment)?;
+            if outcome.is_new() {
+                catalog
+                    .quiesce(owner, id)
+                    .expect("a newly attached segment remains owned while catalog-locked");
+            }
+            Ok(outcome)
+        })
+    }
+
     pub fn snapshot(&self) -> PoolSnapshot {
         self.snapshot_for(ReplicaClass::Memory)
     }
@@ -380,6 +397,18 @@ impl SegmentPool {
 
     pub fn reactivate(&self, owner: ClientId, id: SegmentId) -> Result<(), SegmentStateError> {
         self.update_direct_catalog(|catalog| catalog.reactivate(owner, id))
+    }
+
+    /// Validates ownership for the whole batch before publishing any segment.
+    pub fn reactivate_many(
+        &self,
+        owner: ClientId,
+        ids: &[SegmentId],
+    ) -> Result<(), SegmentStateError> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.update_direct_catalog(|catalog| catalog.reactivate_many(owner, ids))
     }
 
     pub fn remove(&self, owner: ClientId, id: SegmentId) -> Result<(), SegmentStateError> {

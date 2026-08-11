@@ -126,6 +126,10 @@ impl ObjectManager {
         &self.catalog
     }
 
+    pub fn pool(&self) -> &Arc<SegmentPool> {
+        self.allocator.pool()
+    }
+
     pub fn start_put(
         &self,
         identity: ObjectIdentity,

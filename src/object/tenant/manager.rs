@@ -115,6 +115,10 @@ impl TenantObjectManager {
         &self.catalog
     }
 
+    pub fn pool(&self) -> &Arc<SegmentPool> {
+        self.object.pool()
+    }
+
     pub fn resolve_tenant(
         &self,
         tenant_id: &TenantId,

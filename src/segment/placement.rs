@@ -248,6 +248,10 @@ where
         Self { pool, policy }
     }
 
+    pub const fn pool(&self) -> &Arc<SegmentPool> {
+        &self.pool
+    }
+
     pub fn reserve(&self, request: &PlacementRequest) -> Result<ReservationSet, PlacementError> {
         if request.allocation.bytes == 0 {
             return Err(PlacementError::ZeroSize);

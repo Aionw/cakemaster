@@ -4,31 +4,43 @@ mod request;
 mod response;
 mod single_tenant;
 
-use crate::MasterClock;
+use crate::{ClientRuntime, ClientRuntimeError, MasterClock};
 use backend::{ObjectBatchBackend, batch_error};
+use cakemaster::client::{ClientLifecycleError, HeartbeatOutcome};
 use cakemaster::object::{ObjectManager, TenantObjectManager, TenantPutRequest, WriteOwner};
+use cakemaster::segment::error::AttachError;
 use cakemaster_proto::mooncake::{
-    ErrorCode, ExpectedBool, ExpectedGetReplicaListResponse, ExpectedReplicaDescriptors,
-    ExpectedVoid, GetReplicaListResponse, ObjectMeta, ReplicaStatus, ReplicaType, ReplicateConfig,
-    Uuid, WrappedMasterService,
+    ClientStatus, ErrorCode, ExpectedBool, ExpectedGetReplicaListResponse, ExpectedPingResponse,
+    ExpectedReplicaDescriptors, ExpectedVoid, GetReplicaListResponse, ObjectMeta, PingResponse,
+    ReplicaStatus, ReplicaType, ReplicateConfig, Segment, Uuid, WrappedMasterService,
 };
 use coro_rpc::RpcFailure;
-use request::{PutPlanTemplate, client_id_from_uuid, replica_selector};
+use request::{PutPlanTemplate, client_id_from_uuid, replica_selector, segment_spec_from_wire};
 use response::{replica_descriptor, started_replica_descriptor};
 use std::sync::Arc;
 
 pub struct ObjectCatalogRpcService<B = ObjectManager> {
     backend: Arc<B>,
     clock: MasterClock,
+    clients: ClientRuntime,
 }
 
 impl<B> ObjectCatalogRpcService<B> {
-    fn from_backend(backend: Arc<B>, clock: MasterClock) -> Self {
-        Self { backend, clock }
+    fn from_backend(backend: Arc<B>, clients: ClientRuntime) -> Self {
+        let clock = clients.clock().clone();
+        Self {
+            backend,
+            clock,
+            clients,
+        }
     }
 
     pub const fn clock(&self) -> &MasterClock {
         &self.clock
+    }
+
+    pub const fn client_runtime(&self) -> &ClientRuntime {
+        &self.clients
     }
 }
 
@@ -38,7 +50,16 @@ impl ObjectCatalogRpcService<ObjectManager> {
     }
 
     pub fn new_with_clock(manager: Arc<ObjectManager>, clock: MasterClock) -> Self {
-        Self::from_backend(manager, clock)
+        let clients = ClientRuntime::new(manager.pool().clone(), clock);
+        Self::from_backend(manager, clients)
+    }
+
+    pub fn new_with_runtime(manager: Arc<ObjectManager>, clients: ClientRuntime) -> Self {
+        assert!(
+            Arc::ptr_eq(manager.pool(), clients.pool()),
+            "the client runtime and object manager must share one SegmentPool"
+        );
+        Self::from_backend(manager, clients)
     }
 
     pub fn manager(&self) -> &Arc<ObjectManager> {
@@ -52,7 +73,19 @@ impl ObjectCatalogRpcService<TenantObjectManager> {
     }
 
     pub fn with_tenants_and_clock(manager: Arc<TenantObjectManager>, clock: MasterClock) -> Self {
-        Self::from_backend(manager, clock)
+        let clients = ClientRuntime::new(manager.pool().clone(), clock);
+        Self::from_backend(manager, clients)
+    }
+
+    pub fn with_tenants_and_runtime(
+        manager: Arc<TenantObjectManager>,
+        clients: ClientRuntime,
+    ) -> Self {
+        assert!(
+            Arc::ptr_eq(manager.pool(), clients.pool()),
+            "the client runtime and tenant object manager must share one SegmentPool"
+        );
+        Self::from_backend(manager, clients)
     }
 
     pub fn tenant_manager(&self) -> &Arc<TenantObjectManager> {
@@ -61,6 +94,40 @@ impl ObjectCatalogRpcService<TenantObjectManager> {
 }
 
 impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> {
+    async fn ping(&self, client_id: Uuid) -> Result<ExpectedPingResponse, RpcFailure> {
+        let ping = self.clients.ping(client_id_from_uuid(&client_id));
+        let client_status = match ping.heartbeat() {
+            HeartbeatOutcome::Alive(_) => ClientStatus::Ok,
+            HeartbeatOutcome::NeedRemount => ClientStatus::NeedRemount,
+        };
+        Ok(Ok(PingResponse {
+            view_version_id: ping.view_version(),
+            client_status,
+        }))
+    }
+
+    async fn re_mount_segment(
+        &self,
+        segments: Vec<Segment>,
+        client_id: Uuid,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        let client_id = client_id_from_uuid(&client_id);
+        let segments = match segments
+            .into_iter()
+            .map(|segment| segment_spec_from_wire(segment, client_id))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            Ok(segments) => segments,
+            Err(error) => return Ok(Err(error)),
+        };
+        Ok(self
+            .clients
+            .remount(client_id, segments)
+            .await
+            .map(|_| ())
+            .map_err(client_runtime_error))
+    }
+
     async fn batch_exist_key(
         &self,
         keys: Vec<String>,
@@ -202,5 +269,34 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
             .execute_batch(&tenant_id, item_count, now, move |backend, tenant| {
                 backend.revoke_put_batch(tenant, &keys, owner, selector, now)
             }))
+    }
+}
+
+fn client_runtime_error(error: ClientRuntimeError) -> ErrorCode {
+    match error {
+        ClientRuntimeError::Lifecycle(ClientLifecycleError::NilClientId) => {
+            ErrorCode::InvalidParams
+        }
+        ClientRuntimeError::Lifecycle(ClientLifecycleError::CleanupInProgress { .. }) => {
+            ErrorCode::UnavailableInCurrentStatus
+        }
+        ClientRuntimeError::Lifecycle(
+            ClientLifecycleError::ClientNotActive
+            | ClientLifecycleError::CleanupNotStarted
+            | ClientLifecycleError::StaleSession,
+        ) => ErrorCode::ClientNotFound,
+        ClientRuntimeError::Lifecycle(
+            ClientLifecycleError::CapacityExceeded { .. }
+            | ClientLifecycleError::GenerationExhausted,
+        )
+        | ClientRuntimeError::InconsistentSlot
+        | ClientRuntimeError::Rollback { .. }
+        | ClientRuntimeError::SegmentState(_) => ErrorCode::InternalError,
+        ClientRuntimeError::Attach(AttachError::ConflictingSegmentId(_)) => {
+            ErrorCode::SegmentAlreadyExists
+        }
+        ClientRuntimeError::Attach(_) | ClientRuntimeError::ActiveRemountConflict => {
+            ErrorCode::InvalidParams
+        }
     }
 }

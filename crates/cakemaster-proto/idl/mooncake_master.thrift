@@ -109,6 +109,27 @@ struct UUID {
   2: required u64 low
 } (coro_rpc.cpp_u64_pair)
 
+enum ClientStatus {
+  UNDEFINED = 0
+  OK = 1
+  NEED_REMOUNT = 2
+}
+
+struct Segment {
+  1: required UUID id
+  2: required string name
+  3: required u64 base
+  4: required u64 size
+  5: required string te_endpoint
+  6: required string protocol
+  7: required string host_id
+}
+
+struct PingResponse {
+  1: required i64 view_version_id
+  2: required ClientStatus client_status
+}
+
 struct BufferDescriptor {
   1: required u64 size
   2: required u64 buffer_address
@@ -188,11 +209,25 @@ union ExpectedReplicaDescriptors {
   2: ErrorCode error
 } (coro_rpc.expected)
 
+union ExpectedPingResponse {
+  1: PingResponse value
+  2: ErrorCode error
+} (coro_rpc.expected)
+
 union ExpectedVoid {
   1: ErrorCode error
 } (coro_rpc.expected)
 
 service WrappedMasterService {
+  ExpectedPingResponse Ping(
+    1: required UUID client_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::Ping")
+
+  ExpectedVoid ReMountSegment(
+    1: required list<Segment> segments,
+    2: required UUID client_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::ReMountSegment")
+
   list<ExpectedBool> BatchExistKey(
     1: required list<string> keys,
     2: required string tenant_id

@@ -2,10 +2,11 @@ use std::error::Error;
 use std::time::Instant;
 
 use cakemaster_proto::mooncake::{
-    BufferDescriptor, DescriptorVariant, ExpectedBool, ExpectedGetReplicaListResponse,
-    ExpectedReplicaDescriptors, ExpectedVoid, GetReplicaListResponse, MemoryDescriptor,
-    ObjectDataType, ObjectMeta, ReplicaDescriptor, ReplicaStatus, ReplicaType, ReplicateConfig,
-    Uuid, WrappedMasterService, WrappedMasterServiceServer,
+    BufferDescriptor, ClientStatus, DescriptorVariant, ExpectedBool,
+    ExpectedGetReplicaListResponse, ExpectedPingResponse, ExpectedReplicaDescriptors, ExpectedVoid,
+    GetReplicaListResponse, MemoryDescriptor, ObjectDataType, ObjectMeta, PingResponse,
+    ReplicaDescriptor, ReplicaStatus, ReplicaType, ReplicateConfig, Segment, Uuid,
+    WrappedMasterService, WrappedMasterServiceServer,
 };
 use coro_rpc::struct_pack::{serialize, type_hash, type_literal};
 use coro_rpc::{ClientConfig, RpcClient, RpcError, RpcFailure, RpcMethod, StructPack, function_id};
@@ -64,6 +65,21 @@ impl Operation {
 struct BenchmarkMasterService;
 
 impl WrappedMasterService for BenchmarkMasterService {
+    async fn ping(&self, _client_id: Uuid) -> Result<ExpectedPingResponse, RpcFailure> {
+        Ok(Ok(PingResponse {
+            view_version_id: 1,
+            client_status: ClientStatus::Ok,
+        }))
+    }
+
+    async fn re_mount_segment(
+        &self,
+        _segments: Vec<Segment>,
+        _client_id: Uuid,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        Ok(Ok(()))
+    }
+
     async fn batch_exist_key(
         &self,
         keys: Vec<String>,

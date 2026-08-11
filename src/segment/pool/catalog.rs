@@ -132,6 +132,22 @@ impl Catalog {
         Ok(())
     }
 
+    pub(super) fn reactivate_many(
+        &mut self,
+        owner: ClientId,
+        ids: &[SegmentId],
+    ) -> Result<(), SegmentStateError> {
+        let entries = ids
+            .iter()
+            .map(|id| self.owned_entry(owner, *id))
+            .collect::<Result<Vec<_>, _>>()?;
+        for entry in entries {
+            entry.reactivate();
+        }
+        self.rebuild_indexes();
+        Ok(())
+    }
+
     pub(super) fn remove(
         &mut self,
         owner: ClientId,
