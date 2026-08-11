@@ -3,7 +3,7 @@ use std::path::Path;
 
 use arborium_tree_sitter::{Language, Node, Parser};
 
-use crate::CodegenError;
+use crate::{CodegenError, invalid_contract as invalid};
 
 #[derive(Debug)]
 pub(crate) struct Document {
@@ -710,11 +710,4 @@ fn first_error(node: Node<'_>) -> Option<Node<'_>> {
 fn text<'a>(node: Node<'_>, source: &'a str) -> &'a str {
     node.utf8_text(source.as_bytes())
         .expect("the IDL source is valid UTF-8")
-}
-
-fn invalid(path: &Path, message: impl Into<String>) -> CodegenError {
-    CodegenError::InvalidContract {
-        path: path.to_owned(),
-        message: message.into(),
-    }
 }

@@ -40,6 +40,13 @@ pub enum CodegenError {
     },
 }
 
+fn invalid_contract(path: &Path, message: impl Into<String>) -> CodegenError {
+    CodegenError::InvalidContract {
+        path: path.to_owned(),
+        message: message.into(),
+    }
+}
+
 /// Configures generation of Rust client and server stubs.
 #[derive(Clone)]
 pub struct Builder {

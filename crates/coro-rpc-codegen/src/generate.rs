@@ -6,10 +6,10 @@ use md5::{Digest, Md5};
 use proc_macro2::{Ident, Span, TokenStream};
 use quote::{format_ident, quote};
 
-use crate::CodegenError;
 use crate::ast::{
     Document, Enum, EnumRepr, Field, Function, Service, Struct, Type, Typedef, Union,
 };
+use crate::{CodegenError, invalid_contract as invalid};
 
 const TYPE_INT32: u8 = 1;
 const TYPE_UINT32: u8 = 2;
@@ -552,7 +552,6 @@ fn validate_ordered_containers(
             validate_ordered_containers(key, typedefs, enums, path)?;
             validate_ordered_containers(value, typedefs, enums, path)
         }
-        Type::Named(_) => Ok(()),
         _ => Ok(()),
     }
 }
@@ -1399,11 +1398,4 @@ fn rust_ident(name: &str, description: &str, path: &Path) -> Result<Ident, Codeg
                 format!("{description} name {name:?} is not a Rust identifier"),
             )
         })
-}
-
-fn invalid(path: &Path, message: impl Into<String>) -> CodegenError {
-    CodegenError::InvalidContract {
-        path: path.to_owned(),
-        message: message.into(),
-    }
 }

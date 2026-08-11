@@ -75,15 +75,16 @@ impl RequestHeader {
                 actual: bytes.len(),
             });
         }
+        let mut fields = &bytes[4..];
         let header = Self {
             magic: bytes[0],
             version: bytes[1],
             serialize_type: bytes[2],
             msg_type: bytes[3],
-            sequence: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            function_id: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            body_len: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
-            attachment_len: u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
+            sequence: fields.get_u32_le(),
+            function_id: fields.get_u32_le(),
+            body_len: fields.get_u32_le(),
+            attachment_len: fields.get_u32_le(),
         };
         validate_common(header.magic, header.version)?;
         if header.serialize_type != STRUCT_PACK_SERIALIZATION {
@@ -139,14 +140,15 @@ impl ResponseHeader {
                 actual: bytes.len(),
             });
         }
+        let mut fields = &bytes[4..];
         let header = Self {
             magic: bytes[0],
             version: bytes[1],
             error_code: bytes[2],
             msg_type: bytes[3],
-            sequence: u32::from_le_bytes(bytes[4..8].try_into().unwrap()),
-            body_len: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-            attachment_len: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
+            sequence: fields.get_u32_le(),
+            body_len: fields.get_u32_le(),
+            attachment_len: fields.get_u32_le(),
         };
         validate_common(header.magic, header.version)?;
         Ok(header)
@@ -211,9 +213,7 @@ impl RequestFrame {
     ) -> Result<Self, ProtocolError> {
         let body = body.into();
         let attachment = attachment.into();
-        let body_len = u32::try_from(body.len()).map_err(|_| ProtocolError::LengthOverflow)?;
-        let attachment_len =
-            u32::try_from(attachment.len()).map_err(|_| ProtocolError::LengthOverflow)?;
+        let (body_len, attachment_len) = payload_lengths(&body, &attachment)?;
         Ok(Self {
             header: RequestHeader::new(sequence, function_id, body_len, attachment_len),
             body,
@@ -238,15 +238,20 @@ impl ResponseFrame {
     ) -> Result<Self, ProtocolError> {
         let body = body.into();
         let attachment = attachment.into();
-        let body_len = u32::try_from(body.len()).map_err(|_| ProtocolError::LengthOverflow)?;
-        let attachment_len =
-            u32::try_from(attachment.len()).map_err(|_| ProtocolError::LengthOverflow)?;
+        let (body_len, attachment_len) = payload_lengths(&body, &attachment)?;
         Ok(Self {
             header: ResponseHeader::new(sequence, error_code, body_len, attachment_len),
             body,
             attachment,
         })
     }
+}
+
+fn payload_lengths(body: &Bytes, attachment: &Bytes) -> Result<(u32, u32), ProtocolError> {
+    Ok((
+        u32::try_from(body.len()).map_err(|_| ProtocolError::LengthOverflow)?,
+        u32::try_from(attachment.len()).map_err(|_| ProtocolError::LengthOverflow)?,
+    ))
 }
 
 fn validate_lengths(
