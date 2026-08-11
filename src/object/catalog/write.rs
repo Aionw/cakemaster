@@ -1,3 +1,20 @@
+//! Write-side object lifecycle and ownership protocol.
+//!
+//! ```text
+//! CLAIMED --stage--> PENDING --publish--> PUBLISHING --> PUBLISHED
+//!    | drop            | revoke/timeout                     | remove/evict
+//!    v                 +---------------> RETIRING <----------+
+//!  cleared                                  |
+//!                                           v
+//!                                      retired queue
+//! ```
+//!
+//! A slot's `current` pointer is the authority for ownership. The immutable
+//! record is installed before `PENDING` is released, and commit metadata plus
+//! accounting are finalized before `PUBLISHED` becomes visible to readers.
+//! Claiming an existing empty slot can race slot collection, so the write path
+//! revalidates both index membership and the current pointer before returning.
+
 use super::*;
 
 impl ObjectCatalog {

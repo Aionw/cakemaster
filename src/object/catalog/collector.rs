@@ -1,3 +1,9 @@
+//! Incremental collection separates object retirement, resource reclamation,
+//! and slot cleanup. Expiration, removal, and eviction first detach a node and
+//! update lifecycle accounting. Reclaim releases replica resources only after
+//! external handles drop; empty stable slots are removed independently after a
+//! grace period.
+
 use super::*;
 
 enum ScopedCandidate {
@@ -66,6 +72,10 @@ impl ObjectCatalog {
             };
         };
 
+        // Pending expiration and eviction use separate queue allowances:
+        // expiration applies max_candidates independently, while scoped and
+        // global eviction share one allowance with scoped debt served first.
+        // Reclaim and slot cleanup then use their dedicated budget fields.
         let mut report = CollectReport::default();
         self.inner.expire_pending(now, budget, &mut report);
         let scoped_scanned = self.inner.evict_scoped(now, budget, targets, &mut report);
@@ -217,6 +227,8 @@ impl CatalogInner {
         if targets.is_empty() || budget.max_candidates == 0 {
             return 0;
         }
+        // Scope-filtered debt uses tenant-accounting bytes (logical bytes
+        // across replicas); the common retirement report uses reserved bytes.
         let mut debts: Vec<_> = targets
             .iter()
             .filter(|target| target.bytes > 0)
@@ -426,6 +438,9 @@ impl CatalogInner {
         resources.release();
     }
 
+    // SLOT_CLOSING is a handshake with claim_put. Removal succeeds only while
+    // the same slot remains indexed and empty; a concurrent claimant can
+    // reopen it, or detect its removal and retry against the current entry.
     pub(super) fn clean_empty_slots(
         &self,
         now: CatalogTick,
