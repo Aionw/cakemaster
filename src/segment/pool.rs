@@ -16,6 +16,7 @@ use super::spec::{
 };
 use super::stats::SegmentStats;
 use parking_lot::RwLock;
+use std::collections::HashSet;
 use std::fmt;
 use std::ops::Deref;
 use std::sync::Arc;
@@ -27,6 +28,7 @@ pub struct SegmentPool {
     pool_id: u64,
     config: SegmentPoolConfig,
     catalog: RwLock<Catalog>,
+    direct_capacity_epoch: AtomicU64,
 }
 
 /// Metadata and runtime-state handle for one logical segment.
@@ -130,6 +132,31 @@ pub struct PoolSnapshot {
     candidates: Arc<[DirectCandidate]>,
 }
 
+/// Capacity currently accepting direct allocations for one replica class.
+///
+/// Logical segments that share a physical resource (for example, CXL mounts)
+/// are counted once.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplicaClassCapacity {
+    generation: u64,
+    replica_class: ReplicaClass,
+    capacity_bytes: u64,
+}
+
+impl ReplicaClassCapacity {
+    pub const fn generation(self) -> u64 {
+        self.generation
+    }
+
+    pub const fn replica_class(self) -> ReplicaClass {
+        self.replica_class
+    }
+
+    pub const fn capacity_bytes(self) -> u64 {
+        self.capacity_bytes
+    }
+}
+
 impl PoolSnapshot {
     pub const fn generation(&self) -> u64 {
         self.generation
@@ -231,14 +258,15 @@ impl SegmentPool {
             pool_id,
             config,
             catalog: RwLock::new(Catalog::new(pool_id)),
+            direct_capacity_epoch: AtomicU64::new(0),
         })
     }
 
     pub fn attach(&self, spec: SegmentSpec) -> Result<AttachOutcome, AttachError> {
         validate_spec(&spec)?;
-        self.catalog
-            .write()
-            .attach(spec, self.config.max_allocator_nodes_per_segment)
+        self.update_direct_catalog(|catalog| {
+            catalog.attach(spec, self.config.max_allocator_nodes_per_segment)
+        })
     }
 
     pub fn snapshot(&self) -> PoolSnapshot {
@@ -247,6 +275,27 @@ impl SegmentPool {
 
     pub fn snapshot_for(&self, replica_class: ReplicaClass) -> PoolSnapshot {
         self.catalog.read().snapshot(replica_class)
+    }
+
+    /// Returns the physical capacity behind the current accepting snapshot.
+    pub fn capacity_for(&self, replica_class: ReplicaClass) -> ReplicaClassCapacity {
+        self.capacities_for(&[replica_class])
+            .pop()
+            .expect("one requested replica class produces one capacity result")
+    }
+
+    /// Computes multiple class capacities from one catalog snapshot lock.
+    pub fn capacities_for(&self, replica_classes: &[ReplicaClass]) -> Vec<ReplicaClassCapacity> {
+        let catalog = self.catalog.read();
+        replica_classes
+            .iter()
+            .map(|replica_class| summarize_capacity(catalog.snapshot(*replica_class)))
+            .collect()
+    }
+
+    /// Cheap change token for callers that cache accepting capacities.
+    pub fn direct_capacity_epoch(&self) -> u64 {
+        self.direct_capacity_epoch.load(Ordering::Acquire)
     }
 
     pub fn offload_snapshot(&self) -> OffloadSnapshot {
@@ -326,15 +375,42 @@ impl SegmentPool {
     }
 
     pub fn quiesce(&self, owner: ClientId, id: SegmentId) -> Result<(), SegmentStateError> {
-        self.catalog.write().quiesce(owner, id)
+        self.update_direct_catalog(|catalog| catalog.quiesce(owner, id))
     }
 
     pub fn reactivate(&self, owner: ClientId, id: SegmentId) -> Result<(), SegmentStateError> {
-        self.catalog.write().reactivate(owner, id)
+        self.update_direct_catalog(|catalog| catalog.reactivate(owner, id))
     }
 
     pub fn remove(&self, owner: ClientId, id: SegmentId) -> Result<(), SegmentStateError> {
-        self.catalog.write().remove(owner, id)
+        self.update_direct_catalog(|catalog| catalog.remove(owner, id))
+    }
+
+    fn update_direct_catalog<T, E>(
+        &self,
+        operation: impl FnOnce(&mut Catalog) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let result = {
+            let mut catalog = self.catalog.write();
+            operation(&mut catalog)?
+        };
+        self.direct_capacity_epoch.fetch_add(1, Ordering::Release);
+        Ok(result)
+    }
+}
+
+fn summarize_capacity(snapshot: PoolSnapshot) -> ReplicaClassCapacity {
+    let mut resources = HashSet::with_capacity(snapshot.len());
+    let mut capacity_bytes = 0_u64;
+    for candidate in snapshot.iter() {
+        if resources.insert(candidate.resource_id()) {
+            capacity_bytes = capacity_bytes.saturating_add(candidate.stats().space.capacity_bytes);
+        }
+    }
+    ReplicaClassCapacity {
+        generation: snapshot.generation(),
+        replica_class: snapshot.replica_class(),
+        capacity_bytes,
     }
 }
 

@@ -59,6 +59,33 @@ fn local_ssd_spec(index: u64, owner: ClientId, enabled: bool) -> SegmentSpec {
 }
 
 #[test]
+fn accepting_capacity_deduplicates_shared_resources_and_separates_classes() {
+    let pool = pool();
+    let arena = CxlArenaSpec::new(CxlArenaId::new("shared"), CAPACITY);
+    pool.attach(cxl_spec(1, "cxl-a", arena.clone())).unwrap();
+    pool.attach(cxl_spec(2, "cxl-b", arena)).unwrap();
+    pool.attach(nof_spec(1, "nvme://10.0.0.1/nqn.1")).unwrap();
+
+    assert_eq!(
+        pool.capacity_for(ReplicaClass::Memory).capacity_bytes(),
+        CAPACITY
+    );
+    assert_eq!(
+        pool.capacity_for(ReplicaClass::Nof).capacity_bytes(),
+        CAPACITY
+    );
+
+    pool.quiesce(OWNER, SegmentId::new(3, 1)).unwrap();
+    // The second logical CXL mount still exposes the shared physical arena.
+    assert_eq!(
+        pool.capacity_for(ReplicaClass::Memory).capacity_bytes(),
+        CAPACITY
+    );
+    pool.quiesce(OWNER, SegmentId::new(3, 2)).unwrap();
+    assert_eq!(pool.capacity_for(ReplicaClass::Memory).capacity_bytes(), 0);
+}
+
+#[test]
 fn protocol_is_typed_in_core_and_extensible_at_the_wire_boundary() {
     assert_eq!("tcp".parse(), Ok(TransportProtocol::Tcp));
     assert_eq!("rdma".parse(), Ok(TransportProtocol::Rdma));
@@ -137,7 +164,7 @@ fn nof_uses_namespace_offsets_and_an_independent_replica_class() {
         AttachError::DuplicateNofEndpoint { existing: first_id }
     );
 
-    let allocator = ReplicaAllocator::new(pool.clone());
+    let allocator = ReplicaAllocator::new(pool);
     let request = PlacementRequest::new(AllocationSpec::new(8192), ReplicaPolicy::new(2))
         .for_replica_class(ReplicaClass::Nof);
     let reservations = allocator.reserve(&request).unwrap();
@@ -195,7 +222,7 @@ fn cxl_logical_segments_share_one_physical_arena() {
     drop(reservation);
 
     let third = pool
-        .attach(cxl_spec(3, "cxl-client-c", arena.clone()))
+        .attach(cxl_spec(3, "cxl-client-c", arena))
         .unwrap()
         .direct_candidate()
         .unwrap();

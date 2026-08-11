@@ -23,8 +23,8 @@ pub use descriptor::{
 pub use identity::{ClientId, SegmentId, SegmentIdentity};
 pub use local_ssd::{LocalSsdLease, LocalSsdStats, OffloadPermit};
 pub use pool::{
-    AttachOutcome, DirectCandidate, OffloadSnapshot, OffloadTarget, PoolSnapshot, SegmentHandle,
-    SegmentPool,
+    AttachOutcome, DirectCandidate, OffloadSnapshot, OffloadTarget, PoolSnapshot,
+    ReplicaClassCapacity, SegmentHandle, SegmentPool,
 };
 pub use reservation::Reservation;
 pub use spec::{
