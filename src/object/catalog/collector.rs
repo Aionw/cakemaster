@@ -1,3 +1,9 @@
+//! Incremental collection separates object retirement, resource reclamation,
+//! and slot cleanup. Expiration, removal, and eviction first detach a node and
+//! update lifecycle accounting. Reclaim releases replica resources only after
+//! external handles drop; empty stable slots are removed independently after a
+//! grace period.
+
 use super::*;
 
 enum ScopedCandidate {
@@ -6,16 +12,140 @@ enum ScopedCandidate {
     Match(usize),
 }
 
+impl ObjectCatalog {
+    pub fn remove(&self, lookup: ObjectLookup<'_>, now: CatalogTick) -> Result<(), RemoveError> {
+        let slot = self
+            .inner
+            .lookup_slot(lookup)
+            .ok_or(RemoveError::NotFound)?;
+        let node = slot.current.load_full().ok_or(RemoveError::NotFound)?;
+        match node.control.lifecycle.compare_exchange(
+            OBJECT_PUBLISHED,
+            OBJECT_RETIRING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(OBJECT_CLAIMED | OBJECT_PENDING | OBJECT_PUBLISHING) => {
+                return Err(RemoveError::NotReady);
+            }
+            Err(_) => return Err(RemoveError::NotFound),
+        }
+
+        let lease_until = CatalogTick::new(node.control.lease_until.load(Ordering::Acquire));
+        if lease_until > now {
+            let _ = node.control.lifecycle.compare_exchange(
+                OBJECT_RETIRING,
+                OBJECT_PUBLISHED,
+                Ordering::Release,
+                Ordering::Relaxed,
+            );
+            return Err(RemoveError::Leased {
+                expires_at: lease_until,
+            });
+        }
+        if !clear_slot(&slot, &node) {
+            return Err(RemoveError::NotFound);
+        }
+        self.inner.retire_published(slot, node, now);
+        Ok(())
+    }
+
+    pub fn request_reclaim(&self, bytes: u64) {
+        self.inner.collector.request_reclaim(bytes);
+    }
+
+    pub fn collect_step(&self, now: CatalogTick, budget: CollectBudget) -> CollectReport {
+        self.collect_step_with_targets(now, budget, &[])
+    }
+
+    pub(in super::super) fn collect_step_with_targets(
+        &self,
+        now: CatalogTick,
+        budget: CollectBudget,
+        targets: &[ReclaimTarget],
+    ) -> CollectReport {
+        let Some(_collector) = self.inner.collector.gate.try_lock() else {
+            return CollectReport {
+                busy: true,
+                ..CollectReport::default()
+            };
+        };
+
+        // Pending expiration and eviction use separate queue allowances:
+        // expiration applies max_candidates independently, while scoped and
+        // global eviction share one allowance with scoped debt served first.
+        // Reclaim and slot cleanup then use their dedicated budget fields.
+        let mut report = CollectReport::default();
+        self.inner.expire_pending(now, budget, &mut report);
+        let scoped_scanned = self.inner.evict_scoped(now, budget, targets, &mut report);
+        let global_budget = CollectBudget::new(
+            budget.max_candidates.saturating_sub(scoped_scanned),
+            budget.max_reclaims,
+            budget.max_empty_slots,
+        );
+        self.inner.evict(now, global_budget, &mut report);
+        self.inner.reclaim(now, budget, &mut report);
+        self.inner.clean_empty_slots(now, budget, &mut report);
+        report
+    }
+}
+
 impl CatalogInner {
+    pub(super) fn enqueue_empty(&self, slot: &Arc<ObjectSlot>, now: CatalogTick) {
+        self.collector.empty_slots.push(EmptySlotCandidate {
+            identity: slot.identity.clone(),
+            slot: Arc::downgrade(slot),
+            deadline: now.saturating_add(self.config.empty_slot_grace_ticks),
+        });
+    }
+
+    pub(super) fn retire_pending(
+        &self,
+        slot: Arc<ObjectSlot>,
+        node: Arc<CatalogNode>,
+        now: CatalogTick,
+    ) {
+        let record = node
+            .record
+            .get()
+            .expect("only staged objects can be retired");
+        let bytes = record.reserved_bytes;
+        node.abort_accounting();
+        self.lifecycle.on_retire_pending(bytes);
+        self.collector.retired.push(RetiredObject {
+            node,
+            reserved_bytes: bytes,
+            retry_at: now,
+        });
+        self.enqueue_empty(&slot, now);
+    }
+
+    fn retire_published(&self, slot: Arc<ObjectSlot>, node: Arc<CatalogNode>, now: CatalogTick) {
+        let record = node
+            .record
+            .get()
+            .expect("only published objects can be retired");
+        let bytes = record.reserved_bytes;
+        node.mark_accounting_retiring();
+        self.lifecycle.on_retire_published(bytes);
+        self.collector.retired.push(RetiredObject {
+            node,
+            reserved_bytes: bytes,
+            retry_at: now,
+        });
+        self.enqueue_empty(&slot, now);
+    }
+
     pub(super) fn expire_pending(
         &self,
         now: CatalogTick,
         budget: CollectBudget,
         report: &mut CollectReport,
     ) {
-        let candidates = self.pending.len().min(budget.max_candidates);
+        let candidates = self.collector.pending.len().min(budget.max_candidates);
         for _ in 0..candidates {
-            let Some(pending) = self.pending.pop() else {
+            let Some(pending) = self.collector.pending.pop() else {
                 break;
             };
             let Some(slot) = pending.candidate.slot.upgrade() else {
@@ -30,7 +160,7 @@ impl CatalogInner {
                 continue;
             }
             if pending.deadline > now {
-                self.pending.push(pending);
+                self.collector.pending.push(pending);
                 continue;
             }
             if node.record.get().is_none() {
@@ -65,8 +195,12 @@ impl CatalogInner {
         // Snapshot both generation sizes before scanning. An object promoted
         // from young to protected must not be reconsidered in the same pause.
         let generations = [
-            (&self.young, self.young.len(), false),
-            (&self.protected, self.protected.len(), true),
+            (&self.collector.young, self.collector.young.len(), false),
+            (
+                &self.collector.protected,
+                self.collector.protected.len(),
+                true,
+            ),
         ];
         let mut remaining = budget.max_candidates;
         for (queue, candidates, from_protected) in generations {
@@ -93,6 +227,8 @@ impl CatalogInner {
         if targets.is_empty() || budget.max_candidates == 0 {
             return 0;
         }
+        // Scope-filtered debt uses tenant-accounting bytes (logical bytes
+        // across replicas); the common retirement report uses reserved bytes.
         let mut debts: Vec<_> = targets
             .iter()
             .filter(|target| target.bytes > 0)
@@ -105,8 +241,12 @@ impl CatalogInner {
         // All scopes share the existing generation queues. A candidate is
         // scanned once and matched against the small active-debt set.
         let generations = [
-            (&self.young, self.young.len(), false),
-            (&self.protected, self.protected.len(), true),
+            (&self.collector.young, self.collector.young.len(), false),
+            (
+                &self.collector.protected,
+                self.collector.protected.len(),
+                true,
+            ),
         ];
         let mut scanned = 0;
         for (queue, candidates, from_protected) in generations {
@@ -179,7 +319,8 @@ impl CatalogInner {
     }
 
     fn reclaim_target_is_covered(&self) -> bool {
-        self.reclaim_debt.load(Ordering::Relaxed) <= self.retired_bytes.load(Ordering::Relaxed)
+        self.collector.reclaim_debt.load(Ordering::Relaxed)
+            <= self.lifecycle.retired_bytes.load(Ordering::Relaxed)
     }
 
     fn evict_candidate(
@@ -203,7 +344,7 @@ impl CatalogInner {
         }
 
         if node.control.recent.swap(false, Ordering::Relaxed) {
-            self.protected.push(candidate);
+            self.collector.protected.push(candidate);
             return 0;
         }
         if node
@@ -224,7 +365,7 @@ impl CatalogInner {
             node.control
                 .lifecycle
                 .store(OBJECT_PUBLISHED, Ordering::Release);
-            self.protected.push(candidate);
+            self.collector.protected.push(candidate);
             return 0;
         }
         if clear_slot(&slot, &node) {
@@ -247,9 +388,9 @@ impl CatalogInner {
                 .lifecycle
                 .store(OBJECT_PUBLISHED, Ordering::Release);
             if from_protected {
-                self.protected.push(candidate);
+                self.collector.protected.push(candidate);
             } else {
-                self.young.push(candidate);
+                self.collector.young.push(candidate);
             }
             0
         }
@@ -261,14 +402,14 @@ impl CatalogInner {
         budget: CollectBudget,
         report: &mut CollectReport,
     ) {
-        let retired_objects = self.retired.len().min(budget.max_reclaims);
+        let retired_objects = self.collector.retired.len().min(budget.max_reclaims);
         let mut resources = ReplicaReclaimBatch::with_capacity(retired_objects);
         for _ in 0..retired_objects {
-            let Some(retired) = self.retired.pop() else {
+            let Some(retired) = self.collector.retired.pop() else {
                 break;
             };
             if retired.retry_at > now {
-                self.retired.push(retired);
+                self.collector.retired.push(retired);
                 continue;
             }
 
@@ -280,14 +421,14 @@ impl CatalogInner {
                         .take()
                         .expect("retired objects always have records");
                     resources.extend(record.replicas);
-                    atomic_saturating_sub(&self.retired_bytes, retired.reserved_bytes);
-                    atomic_saturating_sub(&self.reclaim_debt, retired.reserved_bytes);
+                    self.lifecycle.on_reclaim(retired.reserved_bytes);
+                    self.collector.on_reclaim(retired.reserved_bytes);
                     report.reclaimed_objects += 1;
                     report.reclaimed_bytes = report
                         .reclaimed_bytes
                         .saturating_add(retired.reserved_bytes);
                 }
-                Err(node) => self.retired.push(RetiredObject {
+                Err(node) => self.collector.retired.push(RetiredObject {
                     node,
                     reserved_bytes: retired.reserved_bytes,
                     retry_at: now.saturating_add(1),
@@ -297,19 +438,22 @@ impl CatalogInner {
         resources.release();
     }
 
+    // SLOT_CLOSING is a handshake with claim_put. Removal succeeds only while
+    // the same slot remains indexed and empty; a concurrent claimant can
+    // reopen it, or detect its removal and retry against the current entry.
     pub(super) fn clean_empty_slots(
         &self,
         now: CatalogTick,
         budget: CollectBudget,
         report: &mut CollectReport,
     ) {
-        let candidates = self.empty_slots.len().min(budget.max_empty_slots);
+        let candidates = self.collector.empty_slots.len().min(budget.max_empty_slots);
         for _ in 0..candidates {
-            let Some(candidate) = self.empty_slots.pop() else {
+            let Some(candidate) = self.collector.empty_slots.pop() else {
                 break;
             };
             if candidate.deadline > now {
-                self.empty_slots.push(candidate);
+                self.collector.empty_slots.push(candidate);
                 continue;
             }
             let Some(slot) = candidate.slot.upgrade() else {
@@ -323,15 +467,16 @@ impl CatalogInner {
             {
                 continue;
             }
-            let removed = self
-                .entries
-                .remove_if_sync(&candidate.identity.as_lookup(), |indexed| {
-                    Arc::ptr_eq(indexed, &slot)
-                        && slot.state.load(Ordering::Acquire) == SLOT_CLOSING
-                        && slot.current.load().is_none()
-                });
+            let removed =
+                self.index
+                    .entries
+                    .remove_if_sync(&candidate.identity.as_lookup(), |indexed| {
+                        Arc::ptr_eq(indexed, &slot)
+                            && slot.state.load(Ordering::Acquire) == SLOT_CLOSING
+                            && slot.current.load().is_none()
+                    });
             if removed.is_some() {
-                self.slots.fetch_sub(1, Ordering::Relaxed);
+                self.index.on_slot_removed();
                 report.removed_empty_slots += 1;
             } else {
                 slot.state.store(SLOT_OPEN, Ordering::Release);

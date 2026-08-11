@@ -47,6 +47,8 @@ crates/coro-rpc/examples/   # RPC crate 的 benchmark
 SegmentPool 对 Memory、CXL、NoF 和 LocalSSD 的领域建模与扩展约束见 [`docs/segment_pool_backends.md`](docs/segment_pool_backends.md)。
 ObjectManager、ReplicaAllocator、异步 RPC 边界和当前 Mooncake 兼容子集见
 [`docs/object_catalog_rpc.md`](docs/object_catalog_rpc.md)。
+与当前上游 C++ Mooncake Store 的完整功能差距、最新 wire 漂移和建议实施顺序见
+[`docs/mooncake_feature_gap.md`](docs/mooncake_feature_gap.md)。
 可选的 tenant namespace、Memory/NoF quota、RAII 计费与定向回收见
 [`docs/tenant_quota.md`](docs/tenant_quota.md)。
 
