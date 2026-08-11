@@ -1,13 +1,13 @@
 //! Real ObjectManager RPC server used by the Mooncake mixed-workload benchmark.
 
-use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
+use cakemaster::object::reclamation::CollectBudget;
 use cakemaster::object::{ObjectCatalogConfig, ObjectManager};
 use cakemaster::segment::{
     ClientId, DirectCandidate, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool,
     SegmentPoolConfig, SegmentSpec, TransportEndpoint, TransportProtocol,
 };
 use cakemaster_proto::mooncake::WrappedMasterServiceServer;
-use cakemaster_server::ObjectCatalogRpcService;
+use cakemaster_server::{MasterClock, ObjectCatalogRpcService};
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,6 +56,7 @@ impl EvictionController {
         candidate: DirectCandidate,
         high_watermark: f64,
         eviction_ratio: f64,
+        clock: MasterClock,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = stop.clone();
@@ -66,6 +67,7 @@ impl EvictionController {
                 high_watermark,
                 eviction_ratio,
                 worker_stop,
+                clock,
             )
         });
         Self {
@@ -124,14 +126,19 @@ async fn run_server(address: &str, arguments: Arguments) -> Result<(), Box<dyn E
         pool,
         ObjectCatalogConfig::new(arguments.expected_objects),
     )?);
+    let clock = MasterClock::new();
     let controller = EvictionController::start(
         manager.clone(),
         candidate.clone(),
         arguments.high_watermark,
         arguments.eviction_ratio,
+        clock.clone(),
     );
-    let server = WrappedMasterServiceServer::new(ObjectCatalogRpcService::new(manager.clone()))
-        .into_rpc_server()?;
+    let server = WrappedMasterServiceServer::new(ObjectCatalogRpcService::new_with_clock(
+        manager.clone(),
+        clock,
+    ))
+    .into_rpc_server()?;
     let bound = server.bind(address).await?;
     println!(
         "object_catalog_rpc_server_ready={} threads={} segment_bytes={} expected_objects={} high_watermark={:.3} eviction_ratio={:.3}",
@@ -174,8 +181,8 @@ fn run_eviction_controller(
     high_watermark: f64,
     eviction_ratio: f64,
     stop: Arc<AtomicBool>,
+    clock: MasterClock,
 ) -> EvictionStats {
-    let epoch = Instant::now();
     let mut stats = EvictionStats::default();
     let mut next_trigger = Instant::now();
     let mut previous_used = 0_u64;
@@ -207,7 +214,7 @@ fn run_eviction_controller(
 
         let catalog = manager.catalog().stats();
         if catalog.reclaim_debt != 0 || catalog.retired_bytes != 0 {
-            let report = manager.maintenance(tick(epoch), CollectBudget::default());
+            let report = manager.maintenance(clock.now(), CollectBudget::default());
             stats.reclaimed_objects = stats
                 .reclaimed_objects
                 .saturating_add(report.catalog.reclaimed_objects as u64);
@@ -219,10 +226,6 @@ fn run_eviction_controller(
         thread::sleep(IDLE_SAMPLE_INTERVAL);
     }
     stats
-}
-
-fn tick(epoch: Instant) -> CatalogTick {
-    CatalogTick::new(u64::try_from(epoch.elapsed().as_millis()).unwrap_or(u64::MAX))
 }
 
 fn parse_or<T>(value: Option<String>, default: T) -> Result<T, T::Err>

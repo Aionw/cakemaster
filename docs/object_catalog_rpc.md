@@ -22,10 +22,16 @@ ObjectManager / TenantObjectManager（同步、线程安全、有界内存工作
 placement 需要访问远端调度器，应把异步引入 placement/coordinator 边界，而不是
 让 catalog 的纯内存状态机整体异步化。
 
-`ObjectCatalogRpcService` 的 handler 先校验 wire 请求并归一化领域输入，再取得单调
-时钟、执行一次有界 maintenance、解析一次 batch tenant、调用领域 batch API 并映射
-返回值。批内每个 key 独立成功或失败，只有连接/编解码失败才返回 transport-level
-`RpcFailure`。
+`ObjectCatalogRpcService` 的 handler 先校验 wire 请求并归一化领域输入，再从注入的
+`MasterClock` 取得单调 tick、执行一次有界 maintenance、解析一次 batch tenant、调用
+领域 batch API 并映射返回值。RPC 与后台 controller 必须 clone 同一个 clock，避免把
+不同时间原点产生的 `CatalogTick` 交给同一个 manager。批内每个 key 独立成功或失败，
+只有连接/编解码失败才返回 transport-level `RpcFailure`。
+
+每次 RPC 的 maintenance candidate budget 至少等于当前 batch item 数，因此批量写入
+不会固定每批加入 333 个 timeout candidate、却长期只清理默认的 64 个；reclaim 和空
+slot budget 仍使用固定上限。没有请求时的定时维护属于 server composition root，不由
+同步领域 manager 或单个 handler 隐式启动后台任务。
 
 服务类型为 `ObjectCatalogRpcService<B>`，默认 backend 是 `ObjectManager`。RPC
 adapter 内部用私有 `ObjectBatchBackend` trait 统一 batch 接口：single backend 的
@@ -42,8 +48,9 @@ backend callback 因此只包含对应的领域 batch 调用。
 
 ## ObjectManager 的职责与行为
 
-`ObjectManager` 是 put/get/exists 的领域协调器，拥有一个 `ObjectCatalog`、一个
-`ReplicaAllocator`，以及尚未完成的 put 事务表和 deadline heap。它不决定
+`ObjectManager` 是 put/get/exists 的领域协调器，只拥有一个 `ObjectCatalog` 和一个
+`ReplicaAllocator`。pending node、owner、write generation、ticket 可重建信息和 timeout
+candidate 全部由 catalog 维护，不再在 manager 中复制事务表与 deadline heap。它不决定
 watermark 或淘汰比例。
 
 `start_put` 的顺序为：
@@ -53,16 +60,16 @@ watermark 或淘汰比例。
 3. 让 `ReplicaAllocator` 按 placement plan 预留空间。
 4. 把 reservation 转成由 catalog 持有的 `ReplicaSet`，并将 claim stage 为
    pending object。
-5. 记录 `WriteOwner`、`WriteId`、replica class、`PutTicket` 和超时 deadline，向
-   RPC 返回可写 descriptor。
+5. Catalog node 保留 `WriteOwner`、`WriteId`、replica 和超时 deadline；Manager
+   丢弃临时 ticket，向 RPC 返回可写 descriptor。
 
 任何中途失败都依靠 claim/reservation 的 RAII drop 回滚；all-or-nothing
 placement 的部分 reservation 也会在返回错误前释放。
 
-`finish_put` 先检查 client owner 和请求的 replica selector，再用 pending ticket
-原子 publish。提交元数据固定为 `checksum=None`。相同 owner 对已经 publish 的
-对象重复调用 finish 是幂等成功；owner 不同返回 `ILLEGAL_CLIENT`，class 不匹配或
-已失效写事务返回 `INVALID_WRITE`。
+`finish_put` 从 catalog 当前 generation 重建 pending ticket，检查 client owner 和请求的
+replica selector，再原子 publish。提交元数据固定为 `checksum=None`。相同 owner 对已经
+publish 的对象重复调用 finish 是幂等成功；owner 不同返回 `ILLEGAL_CLIENT`，class 不
+匹配或已失效写事务返回 `INVALID_WRITE`。
 
 `revoke_put` 做同样的 owner/class 校验，然后撤销 pending ticket。reservation
 随 catalog record 进入回收流程并最终归还 allocator；已 publish 的对象不能用
@@ -70,8 +77,9 @@ revoke 删除。
 
 `get` 只返回完整 publish 的对象并刷新 lease，pending object 返回
 `REPLICA_IS_NOT_READY`。`exists` 与 get 使用同一可见性和 lease 语义，但只返回
-bool。`maintenance(now, budget)` 同时处理到期的 pending write 和 catalog 的
-bounded collector；它不会在一次调用中无限扫描。
+bool。`maintenance(now, budget)` 由 catalog 的单一 bounded collector 同时处理到期
+pending write、淘汰、物理回收和空 slot；它不会在一次调用中无限扫描。诊断 snapshot
+同时暴露各 candidate queue 深度，用于发现清理吞吐落后于写入吞吐。
 
 ## ReplicaAllocator 具体负责什么
 

@@ -197,6 +197,36 @@ fn manager_revoke_and_timeout_release_reservations_for_reuse() {
 }
 
 #[test]
+fn completed_writes_leave_no_timeout_backlog_after_one_bounded_step() {
+    let pool = pool(true, false);
+    let manager = ObjectManager::with_config(
+        pool,
+        ObjectCatalogConfig::new(32).with_pending_timeout(1_000),
+    )
+    .unwrap();
+
+    for index in 0..8 {
+        let object = identity(&format!("completed-{index}"));
+        manager
+            .start_put(
+                object.clone(),
+                owner(OWNER),
+                plan(1, 1, ReplicaClass::Memory, FulfillmentPolicy::AllOrNothing),
+                CatalogTick::ZERO,
+            )
+            .unwrap();
+        manager
+            .finish_put(&object, owner(OWNER), ReplicaSelector::All)
+            .unwrap();
+    }
+
+    assert_eq!(manager.catalog().stats().pending_candidates, 8);
+    let report = manager.maintenance(CatalogTick::new(1), CollectBudget::new(8, 0, 0));
+    assert_eq!(report.expired_writes, 0);
+    assert_eq!(manager.catalog().stats().pending_candidates, 0);
+}
+
+#[test]
 fn allocator_policy_is_selected_by_the_normalized_plan() {
     let memory_pool = pool(true, false);
     let memory_manager = ObjectManager::new(memory_pool);

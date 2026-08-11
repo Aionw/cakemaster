@@ -156,7 +156,7 @@ impl TenantObjectManager {
         reservation.resize(prepared.actual_charge_bytes()?)?;
         Ok(self
             .object
-            .finalize_start_put(prepared, Some(reservation), now)?)
+            .finalize_start_put(prepared, Some(reservation))?)
     }
 
     /// Starts a batch after one tenant validation and at most one initial

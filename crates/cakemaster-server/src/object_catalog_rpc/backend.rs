@@ -1,4 +1,4 @@
-use cakemaster::object::reclamation::CatalogTick;
+use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{ObjectRead, ReplicaSelector, StartedPut, TenantPutRequest, WriteOwner};
 use cakemaster_proto::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
 
@@ -19,14 +19,14 @@ pub(super) trait ObjectBatchBackend: Send + Sync + 'static {
     where
         Self: Sized,
     {
-        self.maintain(now);
+        self.maintain(now, item_count);
         match self.resolve_tenant(tenant_id) {
             Ok(tenant) => operation(self, &tenant),
             Err(error) => batch_error(item_count, error),
         }
     }
 
-    fn maintain(&self, now: CatalogTick);
+    fn maintain(&self, now: CatalogTick, item_count: usize);
     fn resolve_tenant(&self, tenant_id: &str) -> Result<Self::Tenant, ErrorCode>;
     fn exists_batch(
         &self,
@@ -66,4 +66,32 @@ pub(super) trait ObjectBatchBackend: Send + Sync + 'static {
 
 pub(super) fn batch_error<T>(item_count: usize, error: ErrorCode) -> Vec<Result<T, ErrorCode>> {
     (0..item_count).map(|_| Err(error)).collect()
+}
+
+pub(super) fn batch_maintenance_budget(item_count: usize) -> CollectBudget {
+    let baseline = CollectBudget::default();
+    CollectBudget::new(
+        baseline.max_candidates().max(item_count),
+        baseline.max_reclaims(),
+        baseline.max_empty_slots(),
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_candidate_budget_keeps_up_with_batch_width() {
+        let baseline = CollectBudget::default();
+        assert_eq!(
+            batch_maintenance_budget(0).max_candidates(),
+            baseline.max_candidates()
+        );
+        assert_eq!(batch_maintenance_budget(333).max_candidates(), 333);
+        assert_eq!(
+            batch_maintenance_budget(333).max_reclaims(),
+            baseline.max_reclaims()
+        );
+    }
 }

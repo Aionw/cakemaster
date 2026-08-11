@@ -4,8 +4,8 @@ mod request;
 mod response;
 mod single_tenant;
 
+use crate::MasterClock;
 use backend::{ObjectBatchBackend, batch_error};
-use cakemaster::object::reclamation::CatalogTick;
 use cakemaster::object::{ObjectManager, TenantObjectManager, TenantPutRequest, WriteOwner};
 use cakemaster_proto::mooncake::{
     ErrorCode, ExpectedBool, ExpectedGetReplicaListResponse, ExpectedReplicaDescriptors,
@@ -16,30 +16,29 @@ use coro_rpc::RpcFailure;
 use request::{PutPlanTemplate, client_id_from_uuid, replica_selector};
 use response::{replica_descriptor, started_replica_descriptor};
 use std::sync::Arc;
-use std::time::Instant;
 
 pub struct ObjectCatalogRpcService<B = ObjectManager> {
     backend: Arc<B>,
-    epoch: Instant,
+    clock: MasterClock,
 }
 
 impl<B> ObjectCatalogRpcService<B> {
-    fn from_backend(backend: Arc<B>) -> Self {
-        Self {
-            backend,
-            epoch: Instant::now(),
-        }
+    fn from_backend(backend: Arc<B>, clock: MasterClock) -> Self {
+        Self { backend, clock }
     }
 
-    fn now(&self) -> CatalogTick {
-        let millis = self.epoch.elapsed().as_millis();
-        CatalogTick::new(u64::try_from(millis).unwrap_or(u64::MAX))
+    pub const fn clock(&self) -> &MasterClock {
+        &self.clock
     }
 }
 
 impl ObjectCatalogRpcService<ObjectManager> {
     pub fn new(manager: Arc<ObjectManager>) -> Self {
-        Self::from_backend(manager)
+        Self::new_with_clock(manager, MasterClock::new())
+    }
+
+    pub fn new_with_clock(manager: Arc<ObjectManager>, clock: MasterClock) -> Self {
+        Self::from_backend(manager, clock)
     }
 
     pub fn manager(&self) -> &Arc<ObjectManager> {
@@ -49,7 +48,11 @@ impl ObjectCatalogRpcService<ObjectManager> {
 
 impl ObjectCatalogRpcService<TenantObjectManager> {
     pub fn with_tenants(manager: Arc<TenantObjectManager>) -> Self {
-        Self::from_backend(manager)
+        Self::with_tenants_and_clock(manager, MasterClock::new())
+    }
+
+    pub fn with_tenants_and_clock(manager: Arc<TenantObjectManager>, clock: MasterClock) -> Self {
+        Self::from_backend(manager, clock)
     }
 
     pub fn tenant_manager(&self) -> &Arc<TenantObjectManager> {
@@ -63,7 +66,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         keys: Vec<String>,
         tenant_id: String,
     ) -> Result<Vec<ExpectedBool>, RpcFailure> {
-        let now = self.now();
+        let now = self.clock.now();
         let item_count = keys.len();
         Ok(self
             .backend
@@ -77,7 +80,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         keys: Vec<String>,
         tenant_id: String,
     ) -> Result<Vec<ExpectedGetReplicaListResponse>, RpcFailure> {
-        let now = self.now();
+        let now = self.clock.now();
         let item_count = keys.len();
         Ok(self
             .backend
@@ -124,7 +127,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
             .zip(slice_lengths)
             .map(|(key, logical_bytes)| TenantPutRequest::new(key, template.plan(logical_bytes)))
             .collect();
-        let now = self.now();
+        let now = self.clock.now();
         let started =
             self.backend
                 .execute_batch(&tenant_id, item_count, now, move |backend, tenant| {
@@ -167,7 +170,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
             return Ok(output);
         }
         let keys: Vec<_> = valid.iter().map(|(_, key)| *key).collect();
-        let now = self.now();
+        let now = self.clock.now();
         let results = self
             .backend
             .execute_batch(&tenant_id, keys.len(), now, |backend, tenant| {
@@ -193,7 +196,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
             Err(error) => return Ok(batch_error(item_count, error)),
         };
         let owner = WriteOwner::new(client_id_from_uuid(&client_id));
-        let now = self.now();
+        let now = self.clock.now();
         Ok(self
             .backend
             .execute_batch(&tenant_id, item_count, now, move |backend, tenant| {

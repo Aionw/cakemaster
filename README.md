@@ -17,7 +17,7 @@ Cakemaster workspace 包含高并发 object catalog、异构 segment/placement �
 - 生成业务 struct、i32/u8-backed enum、union-backed data enum、`tl::expected` 语义 union、typed client、server trait 与整组服务注册代码
 - Tokio 多路复用客户端、流水线并发服务端、请求/响应 attachment
 - 基于 `tokio-util::codec` 的流式拆帧，以及 `Bytes` payload 零拷贝切分
-- 基于 `tower_service::Service` 的路由/执行边界
+- 私有 typed route registry 与 erased handler 执行边界
 - poll-based connection driver：一个连接 future 同时驱动读、handler futures、写入和 flush
 - tarpc 风格的 client handle/dispatch、bounded backpressure 与 drop/timeout cancellation
 - 基于 `CancellationToken`/`TaskTracker` 的连接级优雅关闭
@@ -218,13 +218,13 @@ server.serve("127.0.0.1:9000").await?;
 服务端只为每条 TCP 连接创建一个 Tokio task。该 task 内的 `ServerConnection` 本身实现 `Future`，并持有：
 
 - `Framed<TcpStream, ServerCodec>`：同一个 owner 负责双向协议 I/O
-- 实现 `tower_service::Service` 的路由器
+- 按 function ID 查找 typed handler 的轻量路由器
 - `FuturesUnordered`：并发轮询已经开始的 handler futures
 - 有界的待发送/已编码响应状态
 
 driver 在一次 poll 中尽可能读取一批请求、轮询 handler、调用 `start_send`，最后统一 `poll_flush`。单连接背压由未 flush 的请求数量表达，不需要每请求 `tokio::spawn`、`Semaphore`、共享 writer 或响应 `mpsc`。
 
-路由与执行边界采用 [Tower `Service`](https://docs.rs/tower/latest/tower/trait.Service.html)。客户端采用 handle/dispatch 分离：可 clone 的 `RpcClient` 通过 bounded `mpsc` 向唯一的 `ClientConnection` 提交请求；connection 独占 socket 与 in-flight map，通过 sequence 完成对应 `oneshot`。调用 future 被 drop 或超时时，guard 会通知 dispatch 删除等待项。这个结构分别参考了 [tonic Channel](https://docs.rs/tonic/latest/tonic/transport/channel/struct.Channel.html)、[tarpc client dispatch](https://docs.rs/crate/tarpc/latest/source/src/client.rs) 和 [tokio-postgres Connection](https://docs.rs/tokio-postgres/latest/src/tokio_postgres/connection.rs.html) 的职责划分。
+服务端 route registry 直接把 function ID 映射到类型擦除后的 handler；该边界当前不开放 middleware，因此不再引入只会永远返回 ready 的 Tower `Service` 包装。客户端采用 handle/dispatch 分离：可 clone 的 `RpcClient` 通过 bounded `mpsc` 向唯一的 `ClientConnection` 提交请求；connection 独占 socket 与 in-flight map，通过 sequence 完成对应 `oneshot`。调用 future 被 drop 或超时时，guard 会通知 dispatch 删除等待项。这个结构分别参考了 [tonic Channel](https://docs.rs/tonic/latest/tonic/transport/channel/struct.Channel.html)、[tarpc client dispatch](https://docs.rs/crate/tarpc/latest/source/src/client.rs) 和 [tokio-postgres Connection](https://docs.rs/tokio-postgres/latest/src/tokio_postgres/connection.rs.html) 的职责划分。
 
 ## 结构体互通
 

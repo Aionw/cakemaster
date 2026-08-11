@@ -37,6 +37,18 @@ impl CollectBudget {
             max_empty_slots,
         }
     }
+
+    pub const fn max_candidates(self) -> usize {
+        self.max_candidates
+    }
+
+    pub const fn max_reclaims(self) -> usize {
+        self.max_reclaims
+    }
+
+    pub const fn max_empty_slots(self) -> usize {
+        self.max_empty_slots
+    }
 }
 
 impl Default for CollectBudget {

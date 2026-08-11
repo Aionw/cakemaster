@@ -139,6 +139,11 @@ pub struct ObjectRead {
     lease_expires_at: CatalogTick,
 }
 
+pub(super) enum ObjectWriteState {
+    Pending(PutTicket),
+    Published(ObjectHandle),
+}
+
 impl ObjectCatalog {
     pub fn new() -> Self {
         Self::with_config(ObjectCatalogConfig::default())
@@ -399,29 +404,38 @@ impl ObjectCatalog {
         Err(LookupError::NotFound)
     }
 
-    pub(super) fn inspect_published(
+    pub(super) fn inspect_write(
         &self,
         lookup: ObjectLookup<'_>,
-    ) -> Result<ObjectHandle, LookupError> {
+    ) -> Result<ObjectWriteState, LookupError> {
         let slot = self
             .inner
             .lookup_slot(lookup)
             .ok_or(LookupError::NotFound)?;
         for _ in 0..3 {
             let node = slot.current.load_full().ok_or(LookupError::NotFound)?;
-            match node.control.lifecycle.load(Ordering::Acquire) {
-                OBJECT_CLAIMED | OBJECT_PENDING | OBJECT_PUBLISHING => {
-                    return Err(LookupError::NotReady);
-                }
+            let lifecycle = node.control.lifecycle.load(Ordering::Acquire);
+            match lifecycle {
+                OBJECT_CLAIMED | OBJECT_PUBLISHING => return Err(LookupError::NotReady),
                 OBJECT_RETIRING => return Err(LookupError::NotFound),
-                OBJECT_PUBLISHED => {}
+                OBJECT_PENDING | OBJECT_PUBLISHED => {}
                 _ => unreachable!("object lifecycle is validated internally"),
             }
-            if node.control.lifecycle.load(Ordering::Acquire) == OBJECT_PUBLISHED
-                && slot_points_to(&slot, &node)
+            if !slot_points_to(&slot, &node)
+                || node.control.lifecycle.load(Ordering::Acquire) != lifecycle
             {
-                return Ok(ObjectHandle { node });
+                continue;
             }
+            return Ok(if lifecycle == OBJECT_PENDING {
+                ObjectWriteState::Pending(PutTicket {
+                    catalog: Arc::downgrade(&self.inner),
+                    slot: Arc::downgrade(&slot),
+                    id: node.control.write_id,
+                    node,
+                })
+            } else {
+                ObjectWriteState::Published(ObjectHandle { node })
+            });
         }
         Err(LookupError::NotFound)
     }
@@ -520,6 +534,11 @@ impl ObjectCatalog {
             live_bytes: self.inner.live_bytes.load(Ordering::Relaxed),
             retired_bytes: self.inner.retired_bytes.load(Ordering::Relaxed),
             reclaim_debt: self.inner.reclaim_debt.load(Ordering::Relaxed),
+            pending_candidates: self.inner.pending.len(),
+            young_candidates: self.inner.young.len(),
+            protected_candidates: self.inner.protected.len(),
+            retired_candidates: self.inner.retired.len(),
+            empty_slot_candidates: self.inner.empty_slots.len(),
         }
     }
 }

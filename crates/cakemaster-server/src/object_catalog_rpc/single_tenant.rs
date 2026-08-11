@@ -1,6 +1,6 @@
-use super::backend::ObjectBatchBackend;
+use super::backend::{ObjectBatchBackend, batch_maintenance_budget};
 use super::response::{map_lookup_error, map_manager_error};
-use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
+use cakemaster::object::reclamation::CatalogTick;
 use cakemaster::object::{
     NamespaceId, ObjectIdentity, ObjectLookup, ObjectManager, ObjectRead, ReplicaSelector,
     StartedPut, TenantPutRequest, WriteOwner,
@@ -10,8 +10,8 @@ use cakemaster_proto::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
 impl ObjectBatchBackend for ObjectManager {
     type Tenant = ();
 
-    fn maintain(&self, now: CatalogTick) {
-        let _ = ObjectManager::maintenance(self, now, CollectBudget::default());
+    fn maintain(&self, now: CatalogTick, item_count: usize) {
+        let _ = ObjectManager::maintenance(self, now, batch_maintenance_budget(item_count));
     }
 
     fn resolve_tenant(&self, _tenant_id: &str) -> Result<Self::Tenant, ErrorCode> {

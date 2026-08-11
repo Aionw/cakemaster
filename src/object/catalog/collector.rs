@@ -18,16 +18,21 @@ impl CatalogInner {
             let Some(pending) = self.pending.pop() else {
                 break;
             };
-            if pending.deadline > now {
-                self.pending.push(pending);
-                continue;
-            }
             let Some(slot) = pending.candidate.slot.upgrade() else {
                 continue;
             };
             let Some(node) = pending.candidate.node.upgrade() else {
                 continue;
             };
+            if node.control.lifecycle.load(Ordering::Acquire) != OBJECT_PENDING
+                || !slot_points_to(&slot, &node)
+            {
+                continue;
+            }
+            if pending.deadline > now {
+                self.pending.push(pending);
+                continue;
+            }
             if node.record.get().is_none() {
                 continue;
             }

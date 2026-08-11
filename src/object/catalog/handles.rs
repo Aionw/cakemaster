@@ -163,6 +163,10 @@ impl PutTicket {
     pub fn replicas(&self) -> &[ReplicaLease] {
         self.node.record().replicas.replicas()
     }
+
+    pub fn owner(&self) -> WriteOwner {
+        self.node.control.owner
+    }
 }
 
 impl fmt::Debug for PutTicket {
