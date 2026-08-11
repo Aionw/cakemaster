@@ -1,21 +1,21 @@
-use super::catalog::{ObjectCatalog, ObjectHandle, ObjectRead, PutTicket};
+use super::catalog::{ObjectCatalog, ObjectHandle, ObjectRead, PutClaim, PutTicket};
 use super::config::ObjectCatalogConfig;
 use super::content::ObjectContent;
 use super::error::{
-    LookupError, ObjectCatalogConfigError, ObjectManagerError, PublishError, PutError, RevokeError,
-    StageError,
+    LookupError, ObjectCatalogConfigError, ObjectManagerError, PublishError, RevokeError,
 };
 use super::identity::{ObjectIdentity, ObjectLookup};
-use super::reclamation::{CatalogTick, CollectBudget, CollectReport};
+use super::reclamation::{CatalogTick, CollectBudget, CollectReport, ReclaimTarget};
 use super::replica::{ReplicaId, ReplicaSet};
+use super::tenant::QuotaReservationGuard;
 use super::write::{ObjectCommit, WriteId, WriteOwner};
-use crate::segment::error::ReserveError;
-use crate::segment::placement::{PlacementError, PlacementRequest, ReplicaAllocator};
+use crate::segment::placement::{PlacementRequest, ReplicaAllocator};
 use crate::segment::{ReplicaClass, ReservationDescriptor, SegmentPool};
 use parking_lot::Mutex;
-use scc::HashMap;
+use scc::{Equivalent, HashMap};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
+use std::hash::Hash;
 use std::sync::Arc;
 
 pub struct ObjectManager {
@@ -98,6 +98,30 @@ impl StartedPut {
     }
 }
 
+/// A claimed object whose replicas have been allocated but whose catalog
+/// record has not been staged yet. Keeping this phase explicit lets callers
+/// adjust RAII accounting after placement without changing core error types.
+pub(super) struct PreparedPut {
+    identity: ObjectIdentity,
+    owner: WriteOwner,
+    content: ObjectContent,
+    claim: PutClaim,
+    replicas: ReplicaSet,
+    started: StartedPut,
+}
+
+impl PreparedPut {
+    #[inline]
+    pub(super) fn actual_charge_bytes(&self) -> Result<u64, ObjectManagerError> {
+        let replica_count =
+            u64::try_from(self.replicas.len()).map_err(|_| ObjectManagerError::Internal)?;
+        self.content
+            .logical_bytes()
+            .checked_mul(replica_count)
+            .ok_or(ObjectManagerError::InvalidPlan)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ObjectManagerMaintenance {
     pub expired_writes: usize,
@@ -135,15 +159,21 @@ impl ObjectManager {
         plan: ObjectPutPlan,
         now: CatalogTick,
     ) -> Result<StartedPut, ObjectManagerError> {
+        let prepared = self.prepare_put(identity, owner, plan, now)?;
+        self.finalize_start_put(prepared, None, now)
+    }
+
+    #[inline]
+    pub(super) fn prepare_put(
+        &self,
+        identity: ObjectIdentity,
+        owner: WriteOwner,
+        plan: ObjectPutPlan,
+        now: CatalogTick,
+    ) -> Result<PreparedPut, ObjectManagerError> {
         self.validate_plan(&plan)?;
-        let claim = self
-            .catalog
-            .claim_put(identity.clone(), owner, now)
-            .map_err(map_put_error)?;
-        let reservations = self
-            .allocator
-            .reserve(plan.placement())
-            .map_err(map_placement_error)?;
+        let claim = self.catalog.claim_put(identity.clone(), owner, now)?;
+        let reservations = self.allocator.reserve(plan.placement())?;
         let replicas = ReplicaSet::from_reservations(reservations);
         if replicas.is_empty() {
             return Err(ObjectManagerError::NoAvailableReplicas);
@@ -159,14 +189,43 @@ impl ObjectManager {
         }
 
         let replica_class = plan.placement().replica_class();
-        let ticket = claim
-            .stage(plan.content(), replicas)
-            .map_err(map_stage_error)?;
+        Ok(PreparedPut {
+            identity,
+            owner,
+            content: plan.content(),
+            claim,
+            replicas,
+            started: StartedPut {
+                replica_class,
+                replicas: allocated,
+            },
+        })
+    }
+
+    #[inline]
+    pub(super) fn finalize_start_put(
+        &self,
+        prepared: PreparedPut,
+        accounting: Option<QuotaReservationGuard>,
+        now: CatalogTick,
+    ) -> Result<StartedPut, ObjectManagerError> {
+        let PreparedPut {
+            identity,
+            owner,
+            content,
+            claim,
+            replicas,
+            started,
+        } = prepared;
+        let ticket = match accounting {
+            Some(reservation) => claim.stage_accounted(content, replicas, reservation)?,
+            None => claim.stage(content, replicas)?,
+        };
         let id = ticket.id();
         let pending = Arc::new(PendingPut {
             owner,
             id,
-            replica_class,
+            replica_class: started.replica_class,
             ticket: Mutex::new(Some(ticket)),
         });
 
@@ -182,10 +241,7 @@ impl ObjectManager {
             generation: id.generation(),
         }));
 
-        Ok(StartedPut {
-            replica_class,
-            replicas: allocated,
-        })
+        Ok(started)
     }
 
     pub fn finish_put(
@@ -194,26 +250,48 @@ impl ObjectManager {
         owner: WriteOwner,
         selector: ReplicaSelector,
     ) -> Result<(), ObjectManagerError> {
+        self.finish_put_key(identity, identity.as_lookup(), owner, selector)
+    }
+
+    pub(super) fn finish_put_lookup(
+        &self,
+        lookup: ObjectLookup<'_>,
+        owner: WriteOwner,
+        selector: ReplicaSelector,
+    ) -> Result<(), ObjectManagerError> {
+        self.finish_put_key(&lookup, lookup, owner, selector)
+    }
+
+    fn finish_put_key<Q>(
+        &self,
+        pending_key: &Q,
+        lookup: ObjectLookup<'_>,
+        owner: WriteOwner,
+        selector: ReplicaSelector,
+    ) -> Result<(), ObjectManagerError>
+    where
+        Q: Equivalent<ObjectIdentity> + Hash + ?Sized,
+    {
         let Some(pending) = self
             .pending
-            .read_sync(identity, |_, pending| Arc::clone(pending))
+            .read_sync(pending_key, |_, pending| Arc::clone(pending))
         else {
-            return self.finish_published(identity.as_lookup(), owner, selector);
+            return self.finish_published(lookup, owner, selector);
         };
         validate_pending(&pending, owner, selector)?;
 
         let mut ticket_slot = pending.ticket.lock();
         let Some(ticket) = ticket_slot.take() else {
             drop(ticket_slot);
-            return self.finish_published(identity.as_lookup(), owner, selector);
+            return self.finish_published(lookup, owner, selector);
         };
         match self.catalog.publish(&ticket, ObjectCommit::new(None)) {
             Ok(_) => {
-                self.remove_pending(identity, &pending);
+                self.remove_pending(pending_key, &pending);
                 Ok(())
             }
             Err(PublishError::ObjectGone | PublishError::NotPending) => {
-                self.remove_pending(identity, &pending);
+                self.remove_pending(pending_key, &pending);
                 Err(ObjectManagerError::NotFound)
             }
             Err(PublishError::PublicationInProgress) => {
@@ -234,11 +312,35 @@ impl ObjectManager {
         selector: ReplicaSelector,
         now: CatalogTick,
     ) -> Result<(), ObjectManagerError> {
+        self.revoke_put_key(identity, identity.as_lookup(), owner, selector, now)
+    }
+
+    pub(super) fn revoke_put_lookup(
+        &self,
+        lookup: ObjectLookup<'_>,
+        owner: WriteOwner,
+        selector: ReplicaSelector,
+        now: CatalogTick,
+    ) -> Result<(), ObjectManagerError> {
+        self.revoke_put_key(&lookup, lookup, owner, selector, now)
+    }
+
+    fn revoke_put_key<Q>(
+        &self,
+        pending_key: &Q,
+        lookup: ObjectLookup<'_>,
+        owner: WriteOwner,
+        selector: ReplicaSelector,
+        now: CatalogTick,
+    ) -> Result<(), ObjectManagerError>
+    where
+        Q: Equivalent<ObjectIdentity> + Hash + ?Sized,
+    {
         let Some(pending) = self
             .pending
-            .read_sync(identity, |_, pending| Arc::clone(pending))
+            .read_sync(pending_key, |_, pending| Arc::clone(pending))
         else {
-            return match self.catalog.inspect_published(identity.as_lookup()) {
+            return match self.catalog.inspect_published(lookup) {
                 Ok(object) => {
                     validate_published(&object, owner, selector)?;
                     Err(ObjectManagerError::InvalidWrite)
@@ -256,15 +358,15 @@ impl ObjectManager {
         };
         match self.catalog.revoke(&ticket, now) {
             Ok(()) => {
-                self.remove_pending(identity, &pending);
+                self.remove_pending(pending_key, &pending);
                 Ok(())
             }
             Err(RevokeError::ObjectGone) => {
-                self.remove_pending(identity, &pending);
+                self.remove_pending(pending_key, &pending);
                 Err(ObjectManagerError::NotFound)
             }
             Err(RevokeError::AlreadyPublished) => {
-                self.remove_pending(identity, &pending);
+                self.remove_pending(pending_key, &pending);
                 Err(ObjectManagerError::InvalidWrite)
             }
             Err(RevokeError::ForeignCatalog) => {
@@ -287,6 +389,15 @@ impl ObjectManager {
     }
 
     pub fn maintenance(&self, now: CatalogTick, budget: CollectBudget) -> ObjectManagerMaintenance {
+        self.maintenance_with_targets(now, budget, &[])
+    }
+
+    pub(super) fn maintenance_with_targets(
+        &self,
+        now: CatalogTick,
+        budget: CollectBudget,
+        targets: &[ReclaimTarget],
+    ) -> ObjectManagerMaintenance {
         let expired = {
             let mut deadlines = self.deadlines.lock();
             let mut expired = Vec::new();
@@ -334,7 +445,7 @@ impl ObjectManager {
 
         ObjectManagerMaintenance {
             expired_writes,
-            catalog: self.catalog.collect_step(now, budget),
+            catalog: self.catalog.collect_step_with_targets(now, budget, targets),
         }
     }
 
@@ -365,8 +476,11 @@ impl ObjectManager {
         }
     }
 
-    fn remove_pending(&self, identity: &ObjectIdentity, expected: &Arc<PendingPut>) {
-        let _ = self.pending.remove_if_sync(identity, |pending| {
+    fn remove_pending<Q>(&self, pending_key: &Q, expected: &Arc<PendingPut>)
+    where
+        Q: Equivalent<ObjectIdentity> + Hash + ?Sized,
+    {
+        let _ = self.pending.remove_if_sync(pending_key, |pending| {
             pending.id == expected.id && Arc::ptr_eq(pending, expected)
         });
     }
@@ -419,40 +533,6 @@ fn validate_selector(
         ReplicaSelector::Class(requested) if requested == actual => Ok(()),
         ReplicaSelector::Class(requested) => {
             Err(ObjectManagerError::ReplicaClassMismatch { requested, actual })
-        }
-    }
-}
-
-fn map_put_error(error: PutError) -> ObjectManagerError {
-    match error {
-        PutError::EmptyKey => ObjectManagerError::InvalidPlan,
-        PutError::AlreadyExists | PutError::WriteInProgress => ObjectManagerError::AlreadyExists,
-        PutError::ReclamationBacklog => ObjectManagerError::NoAvailableReplicas,
-    }
-}
-
-fn map_placement_error(error: PlacementError) -> ObjectManagerError {
-    match error {
-        PlacementError::ZeroSize | PlacementError::ZeroReplicas => ObjectManagerError::InvalidPlan,
-        PlacementError::InsufficientReplicas { .. } => ObjectManagerError::NoAvailableReplicas,
-        PlacementError::Reserve(
-            ReserveError::NotAccepting(_) | ReserveError::OutOfSpace(_) | ReserveError::NotFound(_),
-        ) => ObjectManagerError::NoAvailableReplicas,
-        PlacementError::Reserve(ReserveError::ZeroSize) => ObjectManagerError::InvalidPlan,
-        PlacementError::Reserve(
-            ReserveError::ForeignCandidate
-            | ReserveError::NotDirectlyAllocatable(_)
-            | ReserveError::AddressOverflow(_),
-        ) => ObjectManagerError::Internal,
-    }
-}
-
-fn map_stage_error(error: StageError) -> ObjectManagerError {
-    match error {
-        StageError::ZeroSize => ObjectManagerError::InvalidPlan,
-        StageError::NoReplicas => ObjectManagerError::NoAvailableReplicas,
-        StageError::CatalogDropped | StageError::ClaimLost | StageError::ReplicaTooSmall { .. } => {
-            ObjectManagerError::Internal
         }
     }
 }

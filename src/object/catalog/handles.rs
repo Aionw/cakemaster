@@ -14,9 +14,27 @@ impl PutClaim {
     }
 
     pub fn stage(
+        self,
+        content: ObjectContent,
+        replicas: ReplicaSet,
+    ) -> Result<PutTicket, StageError> {
+        self.stage_inner(content, replicas, None)
+    }
+
+    pub(crate) fn stage_accounted(
+        self,
+        content: ObjectContent,
+        replicas: ReplicaSet,
+        reservation: QuotaReservationGuard,
+    ) -> Result<PutTicket, StageError> {
+        self.stage_inner(content, replicas, Some(reservation))
+    }
+
+    fn stage_inner(
         mut self,
         content: ObjectContent,
         replicas: ReplicaSet,
+        accounting: Option<QuotaReservationGuard>,
     ) -> Result<PutTicket, StageError> {
         if content.logical_bytes() == 0 {
             return Err(StageError::ZeroSize);
@@ -49,25 +67,29 @@ impl PutClaim {
         }
 
         let reserved_bytes = replicas.reserved_bytes();
+        let record = ObjectRecord {
+            identity: self.identity.clone(),
+            content,
+            replicas,
+            reserved_bytes,
+            accounting: accounting.map(QuotaReservationGuard::into_charge),
+        };
+        if let Err(record) = node.record.set(record) {
+            if let Some((charge, class, bytes)) = record.tenant_accounting() {
+                charge.release_reserved(class, bytes);
+            }
+            return Err(StageError::ClaimLost);
+        }
         if node
-            .record
-            .set(ObjectRecord {
-                identity: self.identity.clone(),
-                content,
-                replicas,
-                reserved_bytes,
-            })
+            .control
+            .lifecycle
+            .compare_exchange(
+                OBJECT_CLAIMED,
+                OBJECT_PENDING,
+                Ordering::Release,
+                Ordering::Acquire,
+            )
             .is_err()
-            || node
-                .control
-                .lifecycle
-                .compare_exchange(
-                    OBJECT_CLAIMED,
-                    OBJECT_PENDING,
-                    Ordering::Release,
-                    Ordering::Acquire,
-                )
-                .is_err()
         {
             return Err(StageError::ClaimLost);
         }
@@ -109,7 +131,7 @@ impl Drop for PutClaim {
         };
         if clear_slot(&slot, &node) {
             catalog.claims.fetch_sub(1, Ordering::Relaxed);
-            catalog.enqueue_empty(slot, self.started_at);
+            catalog.enqueue_empty(&slot, self.started_at);
         }
     }
 }

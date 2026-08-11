@@ -1,3 +1,4 @@
+use scc::Equivalent;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
@@ -104,5 +105,11 @@ impl Hash for ObjectLookup<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.namespace.hash(state);
         self.key.hash(state);
+    }
+}
+
+impl Equivalent<ObjectIdentity> for ObjectLookup<'_> {
+    fn equivalent(&self, key: &ObjectIdentity) -> bool {
+        self.namespace() == key.namespace() && self.key() == key.key().as_str()
     }
 }

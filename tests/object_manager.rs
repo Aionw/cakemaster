@@ -199,7 +199,7 @@ fn manager_revoke_and_timeout_release_reservations_for_reuse() {
 #[test]
 fn allocator_policy_is_selected_by_the_normalized_plan() {
     let memory_pool = pool(true, false);
-    let memory_manager = ObjectManager::new(memory_pool.clone());
+    let memory_manager = ObjectManager::new(memory_pool);
     let started = memory_manager
         .start_put(
             identity("best-effort"),

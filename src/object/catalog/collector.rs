@@ -1,5 +1,11 @@
 use super::*;
 
+enum ScopedCandidate {
+    Stale,
+    Unmatched,
+    Match(usize),
+}
+
 impl CatalogInner {
     pub(super) fn expire_pending(
         &self,
@@ -53,29 +59,118 @@ impl CatalogInner {
     ) {
         // Snapshot both generation sizes before scanning. An object promoted
         // from young to protected must not be reconsidered in the same pause.
-        let young_candidates = self.young.len();
-        let protected_candidates = self.protected.len();
+        let generations = [
+            (&self.young, self.young.len(), false),
+            (&self.protected, self.protected.len(), true),
+        ];
         let mut remaining = budget.max_candidates;
+        for (queue, candidates, from_protected) in generations {
+            for _ in 0..candidates.min(remaining) {
+                if self.reclaim_target_is_covered() {
+                    return;
+                }
+                let Some(candidate) = queue.pop() else {
+                    break;
+                };
+                remaining -= 1;
+                self.evict_candidate(candidate, from_protected, now, report);
+            }
+        }
+    }
 
-        for _ in 0..young_candidates.min(remaining) {
-            if self.reclaim_target_is_covered() {
-                return;
-            }
-            let Some(candidate) = self.young.pop() else {
-                break;
-            };
-            remaining -= 1;
-            self.evict_candidate(candidate, false, now, report);
+    pub(super) fn evict_scoped(
+        &self,
+        now: CatalogTick,
+        budget: CollectBudget,
+        targets: &[ReclaimTarget],
+        report: &mut CollectReport,
+    ) -> usize {
+        if targets.is_empty() || budget.max_candidates == 0 {
+            return 0;
         }
-        for _ in 0..protected_candidates.min(remaining) {
-            if self.reclaim_target_is_covered() {
-                return;
-            }
-            let Some(candidate) = self.protected.pop() else {
-                break;
-            };
-            self.evict_candidate(candidate, true, now, report);
+        let mut debts: Vec<_> = targets
+            .iter()
+            .filter(|target| target.bytes > 0)
+            .map(|target| (target.filter, target.bytes))
+            .collect();
+        if debts.is_empty() {
+            return 0;
         }
+
+        // All scopes share the existing generation queues. A candidate is
+        // scanned once and matched against the small active-debt set.
+        let generations = [
+            (&self.young, self.young.len(), false),
+            (&self.protected, self.protected.len(), true),
+        ];
+        let mut scanned = 0;
+        for (queue, candidates, from_protected) in generations {
+            let remaining = budget.max_candidates.saturating_sub(scanned);
+            for _ in 0..candidates.min(remaining) {
+                if debts.iter().all(|(_, debt)| *debt == 0) {
+                    return scanned;
+                }
+                let Some(candidate) = queue.pop() else {
+                    break;
+                };
+                scanned += 1;
+                match self.classify_scoped_candidate(&candidate, &debts) {
+                    ScopedCandidate::Match(index) => {
+                        let retired = self.evict_candidate(candidate, from_protected, now, report);
+                        if retired > 0 {
+                            debts[index].1 = debts[index].1.saturating_sub(retired);
+                            report.scoped_retired_objects += 1;
+                            report.scoped_retired_bytes =
+                                report.scoped_retired_bytes.saturating_add(retired);
+                        }
+                    }
+                    ScopedCandidate::Unmatched => {
+                        report.scanned_candidates += 1;
+                        queue.push(candidate);
+                    }
+                    ScopedCandidate::Stale => report.scanned_candidates += 1,
+                }
+            }
+        }
+        scanned
+    }
+
+    fn classify_scoped_candidate(
+        &self,
+        candidate: &GcCandidate,
+        debts: &[(ReclaimFilter, u64)],
+    ) -> ScopedCandidate {
+        let Some(slot) = candidate.slot.upgrade() else {
+            return ScopedCandidate::Stale;
+        };
+        let Some(node) = candidate.node.upgrade() else {
+            return ScopedCandidate::Stale;
+        };
+        if node.control.lifecycle.load(Ordering::Acquire) != OBJECT_PUBLISHED
+            || !slot_points_to(&slot, &node)
+        {
+            return ScopedCandidate::Stale;
+        }
+        let Some(record) = node.record.get() else {
+            return ScopedCandidate::Stale;
+        };
+        debts
+            .iter()
+            .position(|(filter, debt)| {
+                *debt > 0
+                    && match filter {
+                        ReclaimFilter::Any => true,
+                        ReclaimFilter::Scope {
+                            namespace,
+                            replica_class,
+                        } => {
+                            record.accounting.is_some()
+                                && record.identity.namespace() == *namespace
+                                && record.direct_replica_class() == Some(*replica_class)
+                        }
+                    }
+            })
+            .map_or(ScopedCandidate::Unmatched, ScopedCandidate::Match)
     }
 
     fn reclaim_target_is_covered(&self) -> bool {
@@ -88,23 +183,23 @@ impl CatalogInner {
         from_protected: bool,
         now: CatalogTick,
         report: &mut CollectReport,
-    ) {
+    ) -> u64 {
         report.scanned_candidates += 1;
         let Some(slot) = candidate.slot.upgrade() else {
-            return;
+            return 0;
         };
         let Some(node) = candidate.node.upgrade() else {
-            return;
+            return 0;
         };
         if node.control.lifecycle.load(Ordering::Acquire) != OBJECT_PUBLISHED
             || !slot_points_to(&slot, &node)
         {
-            return;
+            return 0;
         }
 
         if node.control.recent.swap(false, Ordering::Relaxed) {
             self.protected.push(candidate);
-            return;
+            return 0;
         }
         if node
             .control
@@ -117,7 +212,7 @@ impl CatalogInner {
             )
             .is_err()
         {
-            return;
+            return 0;
         }
 
         if node.control.lease_until.load(Ordering::Acquire) > now.get() {
@@ -125,7 +220,7 @@ impl CatalogInner {
                 .lifecycle
                 .store(OBJECT_PUBLISHED, Ordering::Release);
             self.protected.push(candidate);
-            return;
+            return 0;
         }
         if clear_slot(&slot, &node) {
             let bytes = node
@@ -133,9 +228,15 @@ impl CatalogInner {
                 .get()
                 .expect("published objects always have records")
                 .reserved_bytes;
+            let quota_bytes = node
+                .record
+                .get()
+                .and_then(ObjectRecord::tenant_accounting)
+                .map_or(bytes, |(_, _, quota_bytes)| quota_bytes);
             self.retire_published(slot, node, now);
             report.retired_objects += 1;
             report.retired_bytes = report.retired_bytes.saturating_add(bytes);
+            quota_bytes
         } else {
             node.control
                 .lifecycle
@@ -145,6 +246,7 @@ impl CatalogInner {
             } else {
                 self.young.push(candidate);
             }
+            0
         }
     }
 
@@ -166,10 +268,11 @@ impl CatalogInner {
             }
 
             match Arc::try_unwrap(retired.node) {
-                Ok(node) => {
+                Ok(mut node) => {
+                    node.release_accounting();
                     let record = node
                         .record
-                        .into_inner()
+                        .take()
                         .expect("retired objects always have records");
                     resources.extend(record.replicas);
                     atomic_saturating_sub(&self.retired_bytes, retired.reserved_bytes);

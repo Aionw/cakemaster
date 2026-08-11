@@ -3,6 +3,8 @@
 use super::reclamation::CatalogTick;
 use super::replica::ReplicaId;
 use crate::segment::ReplicaClass;
+use crate::segment::error::ReserveError;
+use crate::segment::placement::PlacementError;
 use thiserror::Error;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -120,4 +122,47 @@ pub enum ObjectManagerError {
     InvalidWrite,
     #[error("object manager invariant failed")]
     Internal,
+}
+
+impl From<PutError> for ObjectManagerError {
+    fn from(error: PutError) -> Self {
+        match error {
+            PutError::EmptyKey => Self::InvalidPlan,
+            PutError::AlreadyExists | PutError::WriteInProgress => Self::AlreadyExists,
+            PutError::ReclamationBacklog => Self::NoAvailableReplicas,
+        }
+    }
+}
+
+impl From<PlacementError> for ObjectManagerError {
+    fn from(error: PlacementError) -> Self {
+        match error {
+            PlacementError::ZeroSize
+            | PlacementError::ZeroReplicas
+            | PlacementError::Reserve(ReserveError::ZeroSize) => Self::InvalidPlan,
+            PlacementError::InsufficientReplicas { .. }
+            | PlacementError::Reserve(
+                ReserveError::NotAccepting(_)
+                | ReserveError::OutOfSpace(_)
+                | ReserveError::NotFound(_),
+            ) => Self::NoAvailableReplicas,
+            PlacementError::Reserve(
+                ReserveError::ForeignCandidate
+                | ReserveError::NotDirectlyAllocatable(_)
+                | ReserveError::AddressOverflow(_),
+            ) => Self::Internal,
+        }
+    }
+}
+
+impl From<StageError> for ObjectManagerError {
+    fn from(error: StageError) -> Self {
+        match error {
+            StageError::ZeroSize => Self::InvalidPlan,
+            StageError::NoReplicas => Self::NoAvailableReplicas,
+            StageError::CatalogDropped
+            | StageError::ClaimLost
+            | StageError::ReplicaTooSmall { .. } => Self::Internal,
+        }
+    }
 }

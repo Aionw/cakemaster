@@ -1,5 +1,8 @@
 //! Incremental object-catalog reclamation controls and reports.
 
+use super::NamespaceId;
+use crate::segment::ReplicaClass;
+
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub struct CatalogTick(u64);
 
@@ -52,4 +55,21 @@ pub struct CollectReport {
     pub reclaimed_objects: usize,
     pub reclaimed_bytes: u64,
     pub removed_empty_slots: usize,
+    pub scoped_retired_objects: usize,
+    pub scoped_retired_bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReclaimFilter {
+    Any,
+    Scope {
+        namespace: NamespaceId,
+        replica_class: ReplicaClass,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ReclaimTarget {
+    pub filter: ReclaimFilter,
+    pub bytes: u64,
 }

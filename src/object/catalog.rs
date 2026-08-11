@@ -6,14 +6,15 @@ use super::error::{
     StageError,
 };
 use super::identity::{ObjectIdentity, ObjectLookup};
-use super::reclamation::{CatalogTick, CollectBudget, CollectReport};
+use super::reclamation::{CatalogTick, CollectBudget, CollectReport, ReclaimFilter, ReclaimTarget};
 use super::replica::{ReplicaLease, ReplicaReclaimBatch, ReplicaSet};
+use super::tenant::{CHARGE_RESERVED, QuotaReservationGuard, TenantQuotaCharge};
 use super::write::{ObjectCommit, WriteId, WriteOwner};
 use arc_swap::ArcSwapOption;
 use crossbeam_queue::SegQueue;
 use parking_lot::Mutex;
+use scc::HashMap;
 use scc::hash_map::Entry;
-use scc::{Equivalent, HashMap};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -73,10 +74,12 @@ struct ObjectRecord {
     content: ObjectContent,
     replicas: ReplicaSet,
     reserved_bytes: u64,
+    accounting: Option<TenantQuotaCharge>,
 }
 
 struct ObjectControl {
     lifecycle: AtomicU8,
+    accounting_phase: AtomicU8,
     write_id: WriteId,
     owner: WriteOwner,
     commit: OnceLock<ObjectCommit>,
@@ -299,6 +302,7 @@ impl ObjectCatalog {
                     .get()
                     .expect("pending objects always have records")
                     .reserved_bytes;
+                ticket.node.commit_accounting();
                 self.inner.pending_objects.fetch_sub(1, Ordering::Relaxed);
                 self.inner.published_objects.fetch_add(1, Ordering::Relaxed);
                 atomic_saturating_sub(&self.inner.pending_bytes, reserved_bytes);
@@ -476,6 +480,15 @@ impl ObjectCatalog {
     }
 
     pub fn collect_step(&self, now: CatalogTick, budget: CollectBudget) -> CollectReport {
+        self.collect_step_with_targets(now, budget, &[])
+    }
+
+    pub(super) fn collect_step_with_targets(
+        &self,
+        now: CatalogTick,
+        budget: CollectBudget,
+        targets: &[ReclaimTarget],
+    ) -> CollectReport {
         let Some(_collector) = self.inner.collector_gate.try_lock() else {
             return CollectReport {
                 busy: true,
@@ -485,7 +498,13 @@ impl ObjectCatalog {
 
         let mut report = CollectReport::default();
         self.inner.expire_pending(now, budget, &mut report);
-        self.inner.evict(now, budget, &mut report);
+        let scoped_scanned = self.inner.evict_scoped(now, budget, targets, &mut report);
+        let global_budget = CollectBudget::new(
+            budget.max_candidates.saturating_sub(scoped_scanned),
+            budget.max_reclaims,
+            budget.max_empty_slots,
+        );
+        self.inner.evict(now, global_budget, &mut report);
         self.inner.reclaim(now, budget, &mut report);
         self.inner.clean_empty_slots(now, budget, &mut report);
         report
@@ -521,20 +540,21 @@ impl CatalogInner {
             .is_some_and(|indexed| Arc::ptr_eq(&indexed, slot))
     }
 
-    fn enqueue_empty(&self, slot: Arc<ObjectSlot>, now: CatalogTick) {
+    fn enqueue_empty(&self, slot: &Arc<ObjectSlot>, now: CatalogTick) {
         self.empty_slots.push(EmptySlotCandidate {
             identity: slot.identity.clone(),
-            slot: Arc::downgrade(&slot),
+            slot: Arc::downgrade(slot),
             deadline: now.saturating_add(self.config.empty_slot_grace_ticks),
         });
     }
 
     fn retire_pending(&self, slot: Arc<ObjectSlot>, node: Arc<CatalogNode>, now: CatalogTick) {
-        let bytes = node
+        let record = node
             .record
             .get()
-            .expect("only staged objects can be retired")
-            .reserved_bytes;
+            .expect("only staged objects can be retired");
+        let bytes = record.reserved_bytes;
+        node.abort_accounting();
         self.pending_objects.fetch_sub(1, Ordering::Relaxed);
         atomic_saturating_sub(&self.pending_bytes, bytes);
         self.retired_bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -543,15 +563,16 @@ impl CatalogInner {
             reserved_bytes: bytes,
             retry_at: now,
         });
-        self.enqueue_empty(slot, now);
+        self.enqueue_empty(&slot, now);
     }
 
     fn retire_published(&self, slot: Arc<ObjectSlot>, node: Arc<CatalogNode>, now: CatalogTick) {
-        let bytes = node
+        let record = node
             .record
             .get()
-            .expect("only published objects can be retired")
-            .reserved_bytes;
+            .expect("only published objects can be retired");
+        let bytes = record.reserved_bytes;
+        node.mark_accounting_retiring();
         self.published_objects.fetch_sub(1, Ordering::Relaxed);
         atomic_saturating_sub(&self.live_bytes, bytes);
         self.retired_bytes.fetch_add(bytes, Ordering::Relaxed);
@@ -560,7 +581,7 @@ impl CatalogInner {
             reserved_bytes: bytes,
             retry_at: now,
         });
-        self.enqueue_empty(slot, now);
+        self.enqueue_empty(&slot, now);
     }
 }
 
@@ -576,6 +597,10 @@ impl CatalogNode {
             record: OnceLock::new(),
             control: ObjectControl {
                 lifecycle: AtomicU8::new(OBJECT_CLAIMED),
+                // Unaccounted records ignore this field. Accounted records
+                // start reserved, so staging does not need another hot-path
+                // atomic write.
+                accounting_phase: AtomicU8::new(CHARGE_RESERVED),
                 write_id: id,
                 owner,
                 commit: OnceLock::new(),
@@ -589,6 +614,53 @@ impl CatalogNode {
         self.record
             .get()
             .expect("staged objects always have immutable records")
+    }
+
+    fn commit_accounting(&self) {
+        if let Some((charge, class, bytes)) = self.record().tenant_accounting() {
+            charge.commit(&self.control.accounting_phase, class, bytes);
+        }
+    }
+
+    fn abort_accounting(&self) {
+        if let Some((charge, class, bytes)) = self.record().tenant_accounting() {
+            charge.abort(&self.control.accounting_phase, class, bytes);
+        }
+    }
+
+    fn mark_accounting_retiring(&self) {
+        if let Some((charge, class, bytes)) = self.record().tenant_accounting() {
+            charge.mark_retiring(&self.control.accounting_phase, class, bytes);
+        }
+    }
+
+    fn release_accounting(&self) {
+        let Some(record) = self.record.get() else {
+            return;
+        };
+        if let Some((charge, class, bytes)) = record.tenant_accounting() {
+            charge.release(&self.control.accounting_phase, class, bytes);
+        }
+    }
+}
+
+impl Drop for CatalogNode {
+    fn drop(&mut self) {
+        self.release_accounting();
+    }
+}
+
+impl ObjectRecord {
+    fn tenant_accounting(&self) -> Option<(&TenantQuotaCharge, crate::segment::ReplicaClass, u64)> {
+        let charge = self.accounting.as_ref()?;
+        let replica_class = self.direct_replica_class()?;
+        let replica_count = u64::try_from(self.replicas.len()).ok()?;
+        let bytes = self.content.logical_bytes().checked_mul(replica_count)?;
+        Some((charge, replica_class, bytes))
+    }
+
+    fn direct_replica_class(&self) -> Option<crate::segment::ReplicaClass> {
+        Some(self.replicas.replicas().first()?.direct()?.replica_class())
     }
 }
 
@@ -623,12 +695,6 @@ impl GcCandidate {
             slot: Arc::downgrade(slot),
             node: Arc::downgrade(node),
         }
-    }
-}
-
-impl Equivalent<ObjectIdentity> for ObjectLookup<'_> {
-    fn equivalent(&self, key: &ObjectIdentity) -> bool {
-        self.namespace() == key.namespace() && self.key() == key.key().as_str()
     }
 }
 

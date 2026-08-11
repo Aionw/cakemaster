@@ -19,6 +19,7 @@ mod identity;
 mod manager;
 pub mod reclamation;
 mod replica;
+mod tenant;
 mod write;
 
 pub use catalog::{ObjectCatalog, ObjectHandle, ObjectRead, PutClaim, PutTicket};
@@ -29,5 +30,12 @@ pub use manager::{
     AllocatedReplica, ObjectManager, ObjectManagerMaintenance, ObjectPutPlan, ReplicaSelector,
     StartedPut,
 };
+pub use reclamation::ReclaimFilter;
 pub use replica::{DirectReplica, LocalSsdReplica, ReplicaId, ReplicaLease, ReplicaSet};
+pub use tenant::{
+    ResolvedTenant, TenantAdminError, TenantCatalog, TenantConfig, TenantConfigError,
+    TenantGetError, TenantId, TenantIdError, TenantObjectError, TenantObjectManager,
+    TenantObjectManagerCreateError, TenantPolicy, TenantPutRequest, TenantQuotaLimits,
+    TenantQuotaSnapshot, TenantResourceClass, TenantSnapshot,
+};
 pub use write::{ObjectCommit, WriteId, WriteOwner};
