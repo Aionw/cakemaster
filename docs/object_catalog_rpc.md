@@ -1,19 +1,19 @@
-# ObjectCatalog 的 Mooncake Batch RPC 设计
+# ObjectCatalog 的 Mooncake RPC 设计
 
-这条接口只把 Mooncake `WrappedMasterService` 的批量元数据 RPC 接到现有领域层，
-不在 RPC handler 中复制 catalog、placement 或事务规则。当前实现只提供
+这条接口只把 Mooncake `WrappedMasterService` 的元数据 RPC 接到现有领域层，不在 RPC
+handler 中复制 catalog、placement 或事务规则。当前实现提供 client lifecycle 的
+`Ping`、`ReMountSegment`，单 key `ExistKey`、`GetReplicaList`，以及
 `BatchExistKey`、`BatchGetReplicaList`、`BatchPutStart`、`BatchPutEnd` 和
-`BatchPutRevoke`，没有单 key 接口。
+`BatchPutRevoke`。
 
 ## 分层与同步/异步边界
 
 ```text
 async WrappedMasterService handler
-        │ wire 校验、类型转换、错误码映射
-        ▼
-ObjectManager / TenantObjectManager（同步、线程安全、有界内存工作）
-        ├── ObjectCatalog：key 生命周期、owner、lease、回收状态
-        └── ReplicaAllocator：placement 与 SegmentPool reservation
+        ├── Ping / ReMountSegment → ClientRuntime → ClientRegistry + SegmentPool
+        └── object RPC → ObjectManager / TenantObjectManager
+                         ├── ObjectCatalog：key 生命周期、owner、lease、回收状态
+                         └── ReplicaAllocator：placement 与 SegmentPool reservation
 ```
 
 生成的 RPC trait 使用 `async fn`，因此网络入口可以直接被 Tokio/coro_rpc driver
@@ -22,11 +22,15 @@ ObjectManager / TenantObjectManager（同步、线程安全、有界内存工作
 placement 需要访问远端调度器，应把异步引入 placement/coordinator 边界，而不是
 让 catalog 的纯内存状态机整体异步化。
 
-`ObjectCatalogRpcService` 的 handler 先校验 wire 请求并归一化领域输入，再从注入的
+`ObjectCatalogRpcService` 的 object handler 先校验 wire 请求并归一化领域输入，再从注入的
 `MasterClock` 取得单调 tick、执行一次有界 maintenance、解析一次 batch tenant、调用
 领域 batch API 并映射返回值。RPC 与后台 controller 必须 clone 同一个 clock，避免把
 不同时间原点产生的 `CatalogTick` 交给同一个 manager。批内每个 key 独立成功或失败，
 只有连接/编解码失败才返回 transport-level `RpcFailure`。
+
+`Ping` 和 `ReMountSegment` 则使用同一个 `ClientRuntime`：前者只刷新已有 session 的
+heartbeat，未知 client 返回 `NEED_REMOUNT`；后者把 wire segment 转成 `SegmentSpec`，
+在 per-client 锁下完成 attach/reactivate 与 session 激活，失败时回滚本次资源变更。
 
 每次 RPC 的 maintenance candidate budget 至少等于当前 batch item 数，因此批量写入
 不会固定每批加入 333 个 timeout candidate、却长期只清理默认的 64 个；reclaim 和空
@@ -107,10 +111,13 @@ pending write、淘汰、物理回收和空 slot；它不会在一次调用中�
 | `replica_num == 0, nof_replica_num > 0` | NoF，all-or-nothing |
 | Memory 与 NoF 同时请求 | `INVALID_PARAMS` |
 | preferred Memory/NoF segment | 转成 placement preferred names |
-| soft/hard pin、same-node、host/group | `INVALID_PARAMS`，避免静默降级 |
+| soft pin `PRESERVE` 或无 TTL 的 `DISABLE` | 接受；当前对象保持未 soft-pin 状态 |
+| soft pin `ENABLE`、任意 request TTL、hard pin、same-node、host/group | `INVALID_PARAMS`，避免静默降级 |
 | Disk/LocalDisk selector | `INVALID_PARAMS` |
 | `ObjectMeta.object_checksum=Some(...)` | `INVALID_PARAMS` |
-| BatchGet checksum | 永远返回 `None` |
+| Get/BatchGet checksum | 永远返回 `None` |
+| `Ping` | 返回 view version；已激活 session 为 `OK`，其余为 `NEED_REMOUNT` |
+| `ReMountSegment` | 支持 Memory/CXL segment 的原子激活与幂等重挂载；NoF 和冲突配置返回错误 |
 | tenant id（single 构造） | 忽略并统一映射到 `NamespaceId::DEFAULT` |
 | tenant id（multi 构造） | 映射到隔离 namespace；未知租户和超额分别返回现有 tenant 错误码 |
 
@@ -137,4 +144,5 @@ class 子计划及原子回滚。group、checksum 和 pin 是当前明确不支�
 - `crates/cakemaster-server/src/object_catalog_rpc/backend.rs`：静态 backend 契约与公共 batch 流程；
 - `crates/cakemaster-server/src/object_catalog_rpc/single_tenant.rs`、`multi_tenant.rs`：两种领域 backend 适配；
 - `crates/cakemaster-server/src/object_catalog_rpc/request.rs`、`response.rs`：wire 请求归一化与响应映射；
-- `crates/cakemaster-server/tests/object_catalog_rpc.rs`：真实 TCP 跨层测试。
+- `crates/cakemaster-server/src/client_runtime.rs`：client session、remount 与 segment 协调；
+- `crates/cakemaster-server/tests/object_catalog_rpc.rs`、`client_lifecycle_rpc.rs`：真实 TCP 跨层测试。

@@ -2,11 +2,15 @@
 
 use cakemaster_proto::mooncake::{
     ExpectedBool, ExpectedGetReplicaListResponse, ExpectedPingResponse, ExpectedReplicaDescriptors,
-    ExpectedVoid, ObjectDataType, ObjectMeta, ReplicaType, ReplicateConfig, Segment, Uuid,
+    ExpectedVoid, ObjectDataType, ObjectMeta, ReplicaType, ReplicateConfig, Segment, SoftPinAction,
+    Uuid,
 };
 use coro_rpc::function_id;
 use coro_rpc::struct_pack::{deserialize, serialize, type_hash, type_literal};
 
+type SingleKeyRequest = (String, String);
+type SingleExistsResponse = ExpectedBool;
+type SingleGetResponse = ExpectedGetReplicaListResponse;
 type BatchKeyRequest = (Vec<String>, String);
 type BatchExistsResponse = Vec<ExpectedBool>;
 type BatchGetResponse = Vec<ExpectedGetReplicaListResponse>;
@@ -24,6 +28,12 @@ fn mooncake_rpc_schema_matches_yalantinglibs_metadata() {
     assert_eq!(type_hash::<ExpectedPingResponse>(), 1_948_946_258);
     assert_eq!(type_hash::<RemountRequest>(), 3_334_892_424);
     assert_eq!(type_hash::<ExpectedVoid>(), 2_938_661_068);
+    assert_type::<SingleKeyRequest>("fd800c800cff", 2_096_701_144);
+    assert_type::<SingleExistsResponse>("870b01", 2_431_123_666);
+    assert_type::<SingleGetResponse>(
+        "87fd84fd0486fdfd0404800c800cfffffdfd0404800c800cfffffd800c04fffdfd04048989ff04800cffff01ff048504ff01",
+        745_261_896,
+    );
     assert_type::<BatchKeyRequest>("fd84800c800cff", 16_223_586);
     assert_type::<BatchExistsResponse>("84870b01", 710_904_924);
     assert_type::<BatchGetResponse>(
@@ -31,8 +41,8 @@ fn mooncake_rpc_schema_matches_yalantinglibs_metadata() {
         3_125_797_772,
     );
     assert_type::<BatchPutStartRequest>(
-        "fdfd04048989ff84800c8404fd04040b0b84800c800c84800c0b06800c8584800cff800cff",
-        2_152_225_908,
+        "fdfd04048989ff84800c8404fd04040685040b84800c800c84800c0b06800c8584800cff800cff",
+        1_937_958_152,
     );
     assert_type::<BatchPutStartResponse>(
         "848784fd0486fdfd0404800c800cfffffdfd0404800c800cfffffd800c04fffdfd04048989ff04800cffff01ff01",
@@ -54,6 +64,14 @@ fn mooncake_rpc_routes_match_wrapped_master_service() {
         184_892_274
     );
     assert_eq!(
+        function_id("mooncake::WrappedMasterService::ExistKey"),
+        2_302_172_937
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::GetReplicaList"),
+        528_413_044
+    );
+    assert_eq!(
         function_id("mooncake::WrappedMasterService::BatchExistKey"),
         3_097_470_640
     );
@@ -72,6 +90,60 @@ fn mooncake_rpc_routes_match_wrapped_master_service() {
     assert_eq!(
         function_id("mooncake::WrappedMasterService::BatchPutRevoke"),
         3_089_459_114
+    );
+}
+
+#[test]
+fn latest_mooncake_put_start_bytes_decode_with_soft_pin_action() {
+    let request = (
+        Uuid { high: 1, low: 2 },
+        vec!["benchmark-key-00000000".to_owned()],
+        vec![4096],
+        ReplicateConfig {
+            replica_num: 1,
+            nof_replica_num: 0,
+            soft_pin_action: SoftPinAction::Enable,
+            soft_pin_ttl_ms: Some(1234),
+            with_hard_pin: false,
+            preferred_segments: Vec::new(),
+            preferred_segment: String::new(),
+            preferred_nof_segments: Vec::new(),
+            prefer_alloc_in_same_node: false,
+            data_type: ObjectDataType::Kvcache,
+            host_id: String::new(),
+            group_ids: None,
+        },
+        "default".to_owned(),
+    );
+    let cpp_encoded = hex(
+        "09e5827304fdfd04048989ff84800c8404fd04040685040b84800c800c84800c0b06800c8584800cff800cff0001000000000000000200000000000000011662656e63686d61726b2d6b65792d3030303030303030010010000000000000010000000000000000000000000000000101d20400000000000000000000000100000764656661756c74",
+    );
+    assert_eq!(
+        deserialize::<BatchPutStartRequest>(&cpp_encoded).unwrap(),
+        request
+    );
+    let rust_encoded = serialize(&request).unwrap();
+    assert_eq!(
+        rust_encoded,
+        hex(
+            "08e5827301000000000000000200000000000000011662656e63686d61726b2d6b65792d3030303030303030010010000000000000010000000000000000000000000000000101d20400000000000000000000000100000764656661756c74"
+        )
+    );
+    assert_eq!(
+        deserialize::<BatchPutStartRequest>(&rust_encoded).unwrap(),
+        request
+    );
+    assert_eq!(
+        serialize(&SoftPinAction::Preserve).unwrap(),
+        serialize(&0_u8).unwrap()
+    );
+    assert_eq!(
+        serialize(&SoftPinAction::Enable).unwrap(),
+        serialize(&1_u8).unwrap()
+    );
+    assert_eq!(
+        serialize(&SoftPinAction::Disable).unwrap(),
+        serialize(&2_u8).unwrap()
     );
 }
 

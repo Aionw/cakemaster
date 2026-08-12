@@ -8,7 +8,7 @@ use cakemaster::segment::{
 };
 use cakemaster_proto::mooncake::{
     DescriptorVariant, ErrorCode, ObjectDataType, ObjectMeta, ReplicaStatus, ReplicaType,
-    ReplicateConfig, Uuid, WrappedMasterService, WrappedMasterServiceClient,
+    ReplicateConfig, SoftPinAction, Uuid, WrappedMasterService, WrappedMasterServiceClient,
     WrappedMasterServiceServer,
 };
 use cakemaster_server::ObjectCatalogRpcService;
@@ -40,7 +40,8 @@ fn config(replica_num: u64, nof_replica_num: u64) -> ReplicateConfig {
     ReplicateConfig {
         replica_num,
         nof_replica_num,
-        with_soft_pin: false,
+        soft_pin_action: SoftPinAction::Preserve,
+        soft_pin_ttl_ms: None,
         with_hard_pin: false,
         preferred_segments: Vec::new(),
         preferred_segment: String::new(),
@@ -77,6 +78,21 @@ async fn generated_mooncake_rpc_drives_the_real_object_manager() {
     let writer = Uuid { high: 17, low: 23 };
     let other_writer = Uuid { high: 17, low: 24 };
 
+    assert_eq!(
+        client
+            .exist_key("missing".to_owned(), "tenant-a".to_owned())
+            .await
+            .unwrap(),
+        Ok(false)
+    );
+    assert_eq!(
+        client
+            .get_replica_list("missing".to_owned(), "tenant-a".to_owned())
+            .await
+            .unwrap(),
+        Err(ErrorCode::ObjectNotFound)
+    );
+
     let started = client
         .batch_put_start(
             writer.clone(),
@@ -111,10 +127,24 @@ async fn generated_mooncake_rpc_drives_the_real_object_manager() {
     );
     assert_eq!(
         client
+            .exist_key("memory-key".to_owned(), "tenant-b".to_owned())
+            .await
+            .unwrap(),
+        Ok(false)
+    );
+    assert_eq!(
+        client
             .batch_get_replica_list(vec!["memory-key".to_owned()], "ignored".to_owned())
             .await
             .unwrap(),
         vec![Err(ErrorCode::ReplicaIsNotReady)]
+    );
+    assert_eq!(
+        client
+            .get_replica_list("memory-key".to_owned(), "ignored".to_owned())
+            .await
+            .unwrap(),
+        Err(ErrorCode::ReplicaIsNotReady)
     );
     assert_eq!(
         client
@@ -182,6 +212,21 @@ async fn generated_mooncake_rpc_drives_the_real_object_manager() {
             .unwrap(),
         vec![Ok(true)]
     );
+    assert_eq!(
+        client
+            .exist_key("memory-key".to_owned(), "tenant-b".to_owned())
+            .await
+            .unwrap(),
+        Ok(true)
+    );
+    let single_get = client
+        .get_replica_list("memory-key".to_owned(), "tenant-b".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(single_get.object_checksum, None);
+    assert!(single_get.lease_ttl_ms > 0 && single_get.lease_ttl_ms <= 10_000);
+    assert_eq!(single_get.replicas[0].status, ReplicaStatus::Complete);
     let get = client
         .batch_get_replica_list(vec!["memory-key".to_owned()], "tenant-b".to_owned())
         .await
@@ -260,7 +305,7 @@ async fn generated_mooncake_rpc_drives_the_real_object_manager() {
         vec![Err(ErrorCode::InvalidParams)]
     );
     let mut unsupported = config(1, 0);
-    unsupported.with_soft_pin = true;
+    unsupported.soft_pin_action = SoftPinAction::Enable;
     assert_eq!(
         client
             .batch_put_start(
@@ -323,6 +368,21 @@ async fn multi_tenant_rpc_resolves_once_per_batch_and_maps_tenant_errors() {
 
     assert_eq!(
         service
+            .exist_key("key".to_owned(), "missing".to_owned())
+            .await
+            .unwrap(),
+        Err(ErrorCode::TenantNotRegistered)
+    );
+    assert_eq!(
+        service
+            .get_replica_list("key".to_owned(), "missing".to_owned())
+            .await
+            .unwrap(),
+        Err(ErrorCode::TenantNotRegistered)
+    );
+
+    assert_eq!(
+        service
             .batch_exist_key(vec!["key".to_owned()], "missing".to_owned())
             .await
             .unwrap(),
@@ -349,7 +409,7 @@ async fn multi_tenant_rpc_resolves_once_per_batch_and_maps_tenant_errors() {
         vec![Err(ErrorCode::InvalidParams), Err(ErrorCode::InvalidParams)]
     );
     let mut unsupported = config(1, 0);
-    unsupported.with_soft_pin = true;
+    unsupported.soft_pin_action = SoftPinAction::Enable;
     assert_eq!(
         service
             .batch_put_start(
@@ -434,6 +494,20 @@ async fn multi_tenant_rpc_resolves_once_per_batch_and_maps_tenant_errors() {
             .await
             .unwrap(),
         vec![Ok(true)]
+    );
+    assert_eq!(
+        service
+            .exist_key("same-key".to_owned(), tenant_b.to_string())
+            .await
+            .unwrap(),
+        Ok(true)
+    );
+    assert!(
+        service
+            .get_replica_list("same-key".to_owned(), tenant_b.to_string())
+            .await
+            .unwrap()
+            .is_ok()
     );
     assert_eq!(
         service

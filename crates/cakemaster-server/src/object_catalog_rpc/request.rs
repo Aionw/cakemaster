@@ -7,7 +7,7 @@ use cakemaster::segment::{
     SegmentSpec, TransportEndpoint, TransportProtocol,
 };
 use cakemaster_proto::mooncake::{
-    ErrorCode, ObjectDataType, ReplicaType, ReplicateConfig, Segment, Uuid,
+    ErrorCode, ObjectDataType, ReplicaType, ReplicateConfig, Segment, SoftPinAction, Uuid,
 };
 use std::collections::HashSet;
 
@@ -39,7 +39,8 @@ impl TryFrom<&ReplicateConfig> for PutPlanTemplate {
     type Error = ErrorCode;
 
     fn try_from(config: &ReplicateConfig) -> Result<Self, Self::Error> {
-        if config.with_soft_pin
+        if config.soft_pin_action == SoftPinAction::Enable
+            || config.soft_pin_ttl_ms.is_some()
             || config.with_hard_pin
             || config.prefer_alloc_in_same_node
             || !config.host_id.is_empty()
@@ -164,7 +165,8 @@ mod tests {
         ReplicateConfig {
             replica_num,
             nof_replica_num,
-            with_soft_pin: false,
+            soft_pin_action: SoftPinAction::Preserve,
+            soft_pin_ttl_ms: None,
             with_hard_pin: false,
             preferred_segments: Vec::new(),
             preferred_segment: String::new(),
@@ -204,9 +206,20 @@ mod tests {
         assert!(PutPlanTemplate::try_from(&config(0, 0)).is_err());
         assert!(PutPlanTemplate::try_from(&config(1, 1)).is_err());
         let mut pinned = config(1, 0);
-        pinned.with_soft_pin = true;
+        pinned.soft_pin_action = SoftPinAction::Enable;
         assert_eq!(
             PutPlanTemplate::try_from(&pinned).err(),
+            Some(ErrorCode::InvalidParams)
+        );
+
+        let mut disabled = config(1, 0);
+        disabled.soft_pin_action = SoftPinAction::Disable;
+        assert!(PutPlanTemplate::try_from(&disabled).is_ok());
+
+        let mut ttl_without_enable = config(1, 0);
+        ttl_without_enable.soft_pin_ttl_ms = Some(1_000);
+        assert_eq!(
+            PutPlanTemplate::try_from(&ttl_without_enable).err(),
             Some(ErrorCode::InvalidParams)
         );
     }
