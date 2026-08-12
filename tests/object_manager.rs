@@ -139,6 +139,89 @@ fn manager_owns_the_complete_pending_to_published_lifecycle() {
 }
 
 #[test]
+fn published_objects_observe_segment_invalidation_without_catalog_retirement() {
+    let pool = pool(true, false);
+    let segment = pool.segment(MEMORY_ID).unwrap();
+    let manager = ObjectManager::new(pool.clone());
+    let object = identity("segment-backed");
+
+    manager
+        .start_put(
+            object.clone(),
+            owner(OWNER),
+            plan(
+                4096,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    manager
+        .finish_put(&object, owner(OWNER), ReplicaSelector::All)
+        .unwrap();
+    let read = manager
+        .get(object.as_lookup(), CatalogTick::new(1))
+        .unwrap();
+    assert!(read.is_live());
+
+    assert_eq!(pool.invalidate_owner(OWNER), 1);
+    assert!(pool.segment(MEMORY_ID).is_none());
+    assert!(!read.is_live());
+
+    // Liveness is observational in this focused change. Catalog retirement
+    // and key replacement remain governed by the existing catalog policy.
+    let reread = manager
+        .get(object.as_lookup(), CatalogTick::new(2))
+        .unwrap();
+    assert!(!reread.is_live());
+    assert_eq!(manager.catalog().stats().published_objects, 1);
+
+    drop(read);
+    drop(reread);
+    drop(manager);
+    assert_eq!(segment.stats().usage.active_allocations, 0);
+}
+
+#[test]
+fn invalidated_pending_put_cannot_publish_but_can_be_revoked() {
+    let pool = pool(true, false);
+    let manager = ObjectManager::new(pool.clone());
+    let object = identity("pending-on-dead-segment");
+
+    manager
+        .start_put(
+            object.clone(),
+            owner(OWNER),
+            plan(
+                4096,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    assert_eq!(pool.invalidate_owner(OWNER), 1);
+    assert_eq!(
+        manager.finish_put(&object, owner(OWNER), ReplicaSelector::All),
+        Err(ObjectManagerError::NoAvailableReplicas)
+    );
+    manager
+        .revoke_put(
+            &object,
+            owner(OWNER),
+            ReplicaSelector::All,
+            CatalogTick::new(1),
+        )
+        .unwrap();
+
+    let report = manager.maintenance(CatalogTick::new(1), CollectBudget::new(0, 1, 0));
+    assert_eq!(report.catalog.reclaimed_objects, 1);
+}
+
+#[test]
 fn manager_revoke_and_timeout_release_reservations_for_reuse() {
     let pool = pool(true, false);
     let manager = ObjectManager::with_config(

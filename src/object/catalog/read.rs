@@ -73,6 +73,12 @@ impl ObjectHandle {
         self.node.record().replicas.replicas()
     }
 
+    /// Whether every replica still belongs to its original live segment
+    /// incarnation.
+    pub fn is_live(&self) -> bool {
+        self.node.record().replicas.is_live()
+    }
+
     pub fn owner(&self) -> WriteOwner {
         self.node.control.owner
     }
@@ -97,5 +103,9 @@ impl ObjectRead {
 
     pub const fn lease_expires_at(&self) -> CatalogTick {
         self.lease_expires_at
+    }
+
+    pub fn is_live(&self) -> bool {
+        self.object.is_live()
     }
 }

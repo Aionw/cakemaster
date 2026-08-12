@@ -415,6 +415,18 @@ impl SegmentPool {
         self.update_direct_catalog(|catalog| catalog.remove(owner, id))
     }
 
+    /// Logically invalidates every segment owned by a fenced client and removes
+    /// them from placement and lookup. Outstanding reservations retain their
+    /// physical allocation until dropped, but become unusable immediately.
+    /// Repeating cleanup for an owner with no mounted segments is a no-op.
+    pub fn invalidate_owner(&self, owner: ClientId) -> usize {
+        let invalidated = self.catalog.write().invalidate_owner(owner);
+        if invalidated != 0 {
+            self.direct_capacity_epoch.fetch_add(1, Ordering::Release);
+        }
+        invalidated
+    }
+
     fn update_direct_catalog<T, E>(
         &self,
         operation: impl FnOnce(&mut Catalog) -> Result<T, E>,

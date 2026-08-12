@@ -164,6 +164,31 @@ impl Catalog {
         Ok(())
     }
 
+    /// Invalidates and detaches every segment owned by a fenced client.
+    /// Outstanding leases retain their resource handles but are logically
+    /// unusable immediately.
+    pub(super) fn invalidate_owner(&mut self, owner: ClientId) -> usize {
+        let owned: Vec<_> = self
+            .segments
+            .iter()
+            .filter(|(_, entry)| entry.spec().identity().owner() == owner)
+            .map(|(id, entry)| (*id, entry.clone()))
+            .collect();
+
+        for (id, entry) in &owned {
+            entry.invalidate();
+            let removed = self
+                .segments
+                .remove(id)
+                .expect("owned entries remain registered while the catalog is write-locked");
+            self.resources.unmount(removed.spec());
+        }
+        if !owned.is_empty() {
+            self.rebuild_indexes();
+        }
+        owned.len()
+    }
+
     fn handle(&self, entry: Arc<SegmentEntry>) -> SegmentHandle {
         SegmentHandle {
             pool_id: self.pool_id,
@@ -248,6 +273,14 @@ impl Catalog {
         if !same_offload_index(&offload, &self.indexes.offload) {
             self.indexes.offload = Arc::from(offload);
             self.indexes.offload_generation = self.indexes.offload_generation.wrapping_add(1);
+        }
+    }
+}
+
+impl Drop for Catalog {
+    fn drop(&mut self) {
+        for entry in self.segments.values() {
+            entry.invalidate();
         }
     }
 }

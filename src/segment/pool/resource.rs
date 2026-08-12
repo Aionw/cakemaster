@@ -1,5 +1,6 @@
 use crate::segment::descriptor::MemoryRegion;
 use crate::segment::error::{AttachError, LocalSsdError, ReserveError};
+use crate::segment::lifetime::SegmentLease;
 use crate::segment::local_ssd::{AdmissionFailure, LocalSsdCapacity, LocalSsdStats, OffloadPermit};
 use crate::segment::offset_allocator::ByteAllocator;
 use crate::segment::reservation::Reservation;
@@ -7,7 +8,6 @@ use crate::segment::spec::{
     CxlArenaId, CxlArenaSpec, ReplicaClass, SegmentConfiguration, SegmentSpec,
 };
 use crate::segment::stats::SegmentSpaceStats;
-use crate::segment::usage::UsageToken;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -60,6 +60,8 @@ impl ResourceRegistry {
     }
 
     pub(super) fn unmount(&mut self, spec: &SegmentSpec) {
+        // This drops only catalog ownership. Outstanding allocation/lease
+        // handles retain their Arc-backed allocator state until RAII cleanup.
         let Some(arena) = spec.cxl_arena() else {
             return;
         };
@@ -139,7 +141,7 @@ impl MountedResource {
     pub(super) fn reserve(
         &self,
         segment: Arc<SegmentSpec>,
-        usage: UsageToken,
+        segment_lease: SegmentLease,
         bytes: u64,
     ) -> Result<Reservation, ReserveError> {
         let id = segment.identity().id();
@@ -159,7 +161,7 @@ impl MountedResource {
         Ok(Reservation {
             allocation,
             segment,
-            _usage: usage,
+            segment_lease,
             region: MemoryRegion::new(buffer_address, bytes),
         })
     }
@@ -191,7 +193,7 @@ impl MountedResource {
     pub(super) fn admit_offload(
         &self,
         segment: Arc<SegmentSpec>,
-        usage: UsageToken,
+        segment_lease: SegmentLease,
         bytes: u64,
     ) -> Result<OffloadPermit, LocalSsdError> {
         let id = segment.identity().id();
@@ -203,7 +205,7 @@ impl MountedResource {
             AdmissionFailure::CapacityNotReported => LocalSsdError::CapacityNotReported(id),
             AdmissionFailure::OutOfSpace => LocalSsdError::OutOfSpace(id),
         })?;
-        Ok(OffloadPermit::new(allocation, usage, segment))
+        Ok(OffloadPermit::new(allocation, segment_lease, segment))
     }
 
     pub(super) fn local_ssd_stats(&self) -> Option<LocalSsdStats> {

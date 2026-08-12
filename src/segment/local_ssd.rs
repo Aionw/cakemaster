@@ -1,8 +1,8 @@
 use super::descriptor::{LocalSsdDescriptor, LocalSsdDescriptorRef};
 use super::error::LocalSsdError;
 use super::identity::SegmentId;
+use super::lifetime::SegmentLease;
 use super::spec::SegmentSpec;
-use super::usage::UsageToken;
 use parking_lot::Mutex;
 use std::fmt;
 use std::sync::Arc;
@@ -48,13 +48,13 @@ pub struct LocalSsdStats {
 
 pub struct OffloadPermit {
     allocation: Option<LocalSsdAllocation>,
-    usage: Option<UsageToken>,
+    segment_lease: Option<SegmentLease>,
     segment: Arc<SegmentSpec>,
 }
 
 pub struct LocalSsdLease {
     allocation: LocalSsdAllocation,
-    _usage: UsageToken,
+    segment_lease: SegmentLease,
     segment: Arc<SegmentSpec>,
     transport_endpoint: Arc<str>,
 }
@@ -155,12 +155,12 @@ impl Drop for LocalSsdAllocation {
 impl OffloadPermit {
     pub(crate) fn new(
         allocation: LocalSsdAllocation,
-        usage: UsageToken,
+        segment_lease: SegmentLease,
         segment: Arc<SegmentSpec>,
     ) -> Self {
         Self {
             allocation: Some(allocation),
-            usage: Some(usage),
+            segment_lease: Some(segment_lease),
             segment,
         }
     }
@@ -176,10 +176,19 @@ impl OffloadPermit {
             .bytes
     }
 
+    pub fn is_live(&self) -> bool {
+        self.segment_lease
+            .as_ref()
+            .is_some_and(SegmentLease::is_live)
+    }
+
     pub fn commit(
         mut self,
         transport_endpoint: impl Into<Arc<str>>,
     ) -> Result<LocalSsdLease, LocalSsdError> {
+        if !self.is_live() {
+            return Err(LocalSsdError::NotAccepting(self.segment_id()));
+        }
         let transport_endpoint = transport_endpoint.into();
         if transport_endpoint.is_empty() {
             return Err(LocalSsdError::EmptyTransportEndpoint);
@@ -191,7 +200,10 @@ impl OffloadPermit {
         allocation.commit();
         Ok(LocalSsdLease {
             allocation,
-            _usage: self.usage.take().expect("live permits contain usage"),
+            segment_lease: self
+                .segment_lease
+                .take()
+                .expect("live permits contain a segment lease"),
             segment: self.segment.clone(),
             transport_endpoint,
         })
@@ -219,6 +231,12 @@ impl LocalSsdLease {
 
     pub const fn bytes(&self) -> u64 {
         self.allocation.bytes
+    }
+
+    /// Whether the mounted segment incarnation that issued this lease is
+    /// still logically valid.
+    pub fn is_live(&self) -> bool {
+        self.segment_lease.is_live()
     }
 
     pub fn transport_endpoint(&self) -> &str {

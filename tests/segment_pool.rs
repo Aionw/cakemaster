@@ -318,6 +318,7 @@ fn local_ssd_uses_heartbeat_capacity_and_two_phase_offload_leases() {
         .unwrap()
         .commit("file://host-a/cache/object")
         .unwrap();
+    assert!(lease.is_live());
     let descriptor = lease.descriptor();
     assert_eq!(descriptor.client_id(), OWNER);
     assert_eq!(descriptor.object_size(), 8192);
@@ -335,15 +336,12 @@ fn local_ssd_uses_heartbeat_capacity_and_two_phase_offload_leases() {
         pool.admit_offload(&candidate, 64).unwrap_err(),
         LocalSsdError::NotAccepting(id)
     );
-    assert_eq!(
-        pool.remove(OWNER, id),
-        Err(SegmentStateError::Busy {
-            segment: id,
-            active_allocations: 1,
-        })
-    );
-    drop(lease);
     pool.remove(OWNER, id).unwrap();
+    assert!(!lease.is_live());
+    assert_eq!(candidate.stats().state, SegmentState::Removed);
+    assert!(pool.segment(id).is_none());
+    assert_eq!(candidate.local_ssd_stats().unwrap().committed_bytes, 8192);
+    drop(lease);
     assert_eq!(candidate.local_ssd_stats().unwrap().committed_bytes, 0);
 }
 
@@ -522,6 +520,42 @@ fn quiesced_attach_stays_hidden_until_atomic_batch_reactivation() {
 }
 
 #[test]
+fn owner_invalidation_is_intent_level_idempotent_and_does_not_wait_for_allocations() {
+    let pool = pool();
+    let first = spec(1, "memory-a");
+    let first_id = first.identity().id();
+    let second = spec(2, "memory-b");
+    let second_id = second.identity().id();
+    let foreign = owned_spec(3, "memory-c", OTHER_OWNER);
+    let foreign_id = foreign.identity().id();
+
+    let first_handle = pool.attach(first).unwrap().segment().clone();
+    let second_handle = pool.attach(second).unwrap().segment().clone();
+    let foreign_handle = pool.attach(foreign).unwrap().segment().clone();
+    let first_reservation = pool.reserve_on(first_id, 2048).unwrap();
+    let reservation = pool.reserve_on(second_id, 4096).unwrap();
+    assert!(first_reservation.is_live());
+    assert!(reservation.is_live());
+
+    assert_eq!(pool.invalidate_owner(OWNER), 2);
+    assert_eq!(first_handle.stats().state, SegmentState::Removed);
+    assert_eq!(second_handle.stats().state, SegmentState::Removed);
+    assert_eq!(foreign_handle.stats().state, SegmentState::Accepting);
+    assert!(!first_reservation.is_live());
+    assert!(!reservation.is_live());
+    assert!(pool.segment(first_id).is_none());
+    assert!(pool.segment(second_id).is_none());
+    assert!(pool.segment(foreign_id).is_some());
+    assert_eq!(pool.len(), 1);
+    assert_eq!(pool.invalidate_owner(OWNER), 0);
+
+    drop(first_reservation);
+    drop(reservation);
+    assert_eq!(first_handle.stats().usage.active_allocations, 0);
+    assert_eq!(second_handle.stats().usage.active_allocations, 0);
+}
+
+#[test]
 fn reservation_owns_the_range_and_releases_it_on_drop() {
     let pool = pool();
     let candidate = pool.attach(spec(1, "memory-a")).unwrap();
@@ -555,12 +589,31 @@ fn reservation_owns_the_range_and_releases_it_on_drop() {
 }
 
 #[test]
-fn quiesce_invalidates_stale_candidates_and_remove_waits_for_handles() {
+fn reservations_observe_pool_shutdown_as_incarnation_invalidation() {
+    let (reservation, candidate) = {
+        let pool = pool();
+        let candidate = pool
+            .attach(spec(1, "memory-a"))
+            .unwrap()
+            .direct_candidate()
+            .unwrap();
+        let reservation = pool.reserve(&candidate, 4096).unwrap();
+        assert!(reservation.is_live());
+        (reservation, candidate)
+    };
+
+    assert!(!reservation.is_live());
+    assert_eq!(candidate.stats().state, SegmentState::Removed);
+}
+
+#[test]
+fn remove_invalidates_mount_incarnation_without_waiting_for_resource_handles() {
     let pool = pool();
     let segment = spec(1, "memory-a");
     let id = segment.identity().id();
     let candidate = pool.attach(segment).unwrap().direct_candidate().unwrap();
     let reservation = pool.reserve(&candidate, 4096).unwrap();
+    assert!(reservation.is_live());
     assert_eq!(candidate.stats().state, SegmentState::Accepting);
 
     assert_eq!(
@@ -574,22 +627,37 @@ fn quiesce_invalidates_stale_candidates_and_remove_waits_for_handles() {
         pool.reserve(&candidate, 64).unwrap_err(),
         ReserveError::NotAccepting(id)
     );
-    assert_eq!(
-        pool.remove(OWNER, id),
-        Err(SegmentStateError::Busy {
-            segment: id,
-            active_allocations: 1
-        })
-    );
-
-    drop(reservation);
     pool.remove(OWNER, id).unwrap();
+    assert!(!reservation.is_live());
     assert_eq!(candidate.stats().state, SegmentState::Removed);
+    assert_eq!(candidate.stats().usage.active_allocations, 1);
     assert!(pool.segment(id).is_none());
     assert_eq!(
         pool.reserve(&candidate, 64).unwrap_err(),
         ReserveError::NotAccepting(id)
     );
+
+    // A new mount gets an independent incarnation immediately. The old
+    // reservation may retain its allocator storage, but it remains fenced.
+    let remount_id = SegmentId::new(1, 2);
+    let remount_spec = SegmentSpec::memory(
+        SegmentIdentity::new(remount_id, OWNER, "memory-b"),
+        MemoryRegion::new(0x1_0000_0000 + CAPACITY * 2, CAPACITY),
+        TransportEndpoint::new(TransportProtocol::Tcp, "127.0.0.1:12345"),
+    );
+    let remounted = pool
+        .attach(remount_spec)
+        .unwrap()
+        .direct_candidate()
+        .unwrap();
+    let fresh = pool.reserve(&remounted, 64).unwrap();
+    assert!(fresh.is_live());
+    assert_eq!(fresh.offset(), 0);
+    assert!(!reservation.is_live());
+    assert!(pool.segment(remount_id).is_some());
+
+    drop(reservation);
+    assert_eq!(candidate.stats().usage.active_allocations, 0);
 }
 
 #[test]

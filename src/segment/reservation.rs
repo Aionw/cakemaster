@@ -2,16 +2,16 @@ use super::descriptor::{
     MemoryRegion, RangeDescriptorRef, ReservationDescriptor, ReservationDescriptorRef,
 };
 use super::identity::SegmentId;
+use super::lifetime::SegmentLease;
 use super::offset_allocator::OffsetAllocationHandle;
 use super::spec::{ReplicaClass, SegmentSpec};
-use super::usage::UsageToken;
 use std::fmt;
 use std::sync::Arc;
 
 pub struct Reservation {
     pub(super) allocation: OffsetAllocationHandle,
     pub(super) segment: Arc<SegmentSpec>,
-    pub(super) _usage: UsageToken,
+    pub(super) segment_lease: SegmentLease,
     pub(super) region: MemoryRegion,
 }
 
@@ -22,6 +22,12 @@ impl Reservation {
 
     pub fn replica_class(&self) -> ReplicaClass {
         self.segment.replica_class()
+    }
+
+    /// Whether the mounted segment incarnation that issued this reservation
+    /// is still logically valid.
+    pub fn is_live(&self) -> bool {
+        self.segment_lease.is_live()
     }
 
     pub const fn offset(&self) -> u64 {
@@ -62,13 +68,13 @@ impl Reservation {
 
     pub(crate) fn release_batch(reservations: Vec<Self>) {
         let mut allocations = Vec::with_capacity(reservations.len());
-        let mut usage = Vec::with_capacity(reservations.len());
+        let mut segment_leases = Vec::with_capacity(reservations.len());
         for reservation in reservations {
             allocations.push(reservation.allocation);
-            usage.push(reservation._usage);
+            segment_leases.push(reservation.segment_lease);
         }
         OffsetAllocationHandle::release_batch(allocations);
-        drop(usage);
+        drop(segment_leases);
     }
 }
 

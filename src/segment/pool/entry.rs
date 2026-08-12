@@ -1,10 +1,10 @@
 use super::resource::{CandidateCapability, MountedResource};
 use crate::segment::error::{LocalSsdError, ReserveError, SegmentStateError};
+use crate::segment::lifetime::SegmentLifetime;
 use crate::segment::local_ssd::{LocalSsdStats, OffloadPermit};
 use crate::segment::reservation::Reservation;
 use crate::segment::spec::SegmentSpec;
 use crate::segment::stats::{SegmentState, SegmentStats, SegmentUsageStats};
-use crate::segment::usage::UsageTracker;
 use parking_lot::Mutex;
 use std::sync::Arc;
 
@@ -12,7 +12,7 @@ pub(super) struct SegmentEntry {
     spec: Arc<SegmentSpec>,
     state: Mutex<SegmentState>,
     resource: MountedResource,
-    usage: UsageTracker,
+    lifetime: SegmentLifetime,
 }
 
 impl SegmentEntry {
@@ -21,7 +21,7 @@ impl SegmentEntry {
             spec,
             state: Mutex::new(SegmentState::Accepting),
             resource,
-            usage: UsageTracker::new(),
+            lifetime: SegmentLifetime::new(),
         }
     }
 
@@ -64,7 +64,7 @@ impl SegmentEntry {
         }
         let result = self
             .resource
-            .reserve(self.spec.clone(), self.usage.acquire(), bytes);
+            .reserve(self.spec.clone(), self.lifetime.acquire(), bytes);
         drop(state);
         result
     }
@@ -97,7 +97,7 @@ impl SegmentEntry {
         }
         let result = self
             .resource
-            .admit_offload(self.spec.clone(), self.usage.acquire(), bytes);
+            .admit_offload(self.spec.clone(), self.lifetime.acquire(), bytes);
         drop(state);
         result
     }
@@ -122,16 +122,12 @@ impl SegmentEntry {
 
     pub(super) fn prepare_remove(&self) -> Result<(), SegmentStateError> {
         let mut state = self.state.lock();
-        let active_allocations = self.usage.active_allocations();
         match *state {
             SegmentState::Accepting => {
                 Err(SegmentStateError::StillAccepting(self.spec.identity().id()))
             }
-            SegmentState::Quiesced if active_allocations != 0 => Err(SegmentStateError::Busy {
-                segment: self.spec.identity().id(),
-                active_allocations,
-            }),
             SegmentState::Quiesced => {
+                self.lifetime.invalidate();
                 *state = SegmentState::Removed;
                 Ok(())
             }
@@ -139,12 +135,20 @@ impl SegmentEntry {
         }
     }
 
+    /// Immediately fences this incarnation regardless of its accepting state.
+    /// Used by owner cleanup after the client session has already been fenced.
+    pub(super) fn invalidate(&self) {
+        let mut state = self.state.lock();
+        self.lifetime.invalidate();
+        *state = SegmentState::Removed;
+    }
+
     pub(super) fn stats(&self) -> SegmentStats {
         let state = *self.state.lock();
         SegmentStats {
             space: self.resource.space_stats(),
             usage: SegmentUsageStats {
-                active_allocations: self.usage.active_allocations(),
+                active_allocations: self.lifetime.active_leases(),
             },
             state,
         }

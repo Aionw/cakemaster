@@ -45,6 +45,10 @@ impl DirectReplica {
         self.reservation.replica_class()
     }
 
+    pub fn is_live(&self) -> bool {
+        self.reservation.is_live()
+    }
+
     pub const fn reserved_bytes(&self) -> u64 {
         self.reservation.reserved_bytes()
     }
@@ -105,6 +109,10 @@ impl LocalSsdReplica {
         self.lease.bytes()
     }
 
+    pub fn is_live(&self) -> bool {
+        self.lease.is_live()
+    }
+
     pub fn descriptor(&self) -> LocalSsdDescriptorRef<'_> {
         self.lease.descriptor()
     }
@@ -149,6 +157,15 @@ impl ReplicaLease {
         match self {
             Self::Direct(replica) => replica.segment_id(),
             Self::LocalSsd(replica) => replica.segment_id(),
+        }
+    }
+
+    /// Whether the exact mounted segment incarnation backing this replica is
+    /// still logically valid.
+    pub fn is_live(&self) -> bool {
+        match self {
+            Self::Direct(replica) => replica.is_live(),
+            Self::LocalSsd(replica) => replica.is_live(),
         }
     }
 
@@ -272,6 +289,13 @@ impl ReplicaSet {
 
     pub fn is_empty(&self) -> bool {
         matches!(self.storage, ReplicaStorage::Empty)
+    }
+
+    /// Objects currently use strict replica validity: losing any associated
+    /// segment invalidates the object rather than silently degrading its
+    /// replication contract.
+    pub(crate) fn is_live(&self) -> bool {
+        !self.is_empty() && self.replicas().iter().all(ReplicaLease::is_live)
     }
 
     pub fn reserved_bytes(&self) -> u64 {

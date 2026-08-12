@@ -342,6 +342,36 @@ fn invalid_staging_rolls_back_claim_and_reservation_by_raii() {
 }
 
 #[test]
+fn invalidated_segment_replicas_cannot_be_staged_or_published() {
+    let pool = pool(1 << 20, 4096);
+    let catalog = ObjectCatalog::new();
+    let publish_object = identity("invalidate-before-publish");
+    let stage_object = identity("invalidate-before-stage");
+
+    let ticket = catalog
+        .claim_put(publish_object, owner(), CatalogTick::ZERO)
+        .unwrap()
+        .stage(ObjectContent::new(1024), replica(&pool, 1024))
+        .unwrap();
+    let claim = catalog
+        .claim_put(stage_object, owner(), CatalogTick::ZERO)
+        .unwrap();
+    let unstaged_replicas = replica(&pool, 1024);
+
+    pool.quiesce(OWNER, SEGMENT_ID).unwrap();
+    pool.remove(OWNER, SEGMENT_ID).unwrap();
+
+    assert!(matches!(
+        catalog.publish(&ticket, ObjectCommit::new(None)),
+        Err(PublishError::ReplicasInvalidated)
+    ));
+    assert!(matches!(
+        claim.stage(ObjectContent::new(1024), unstaged_replicas),
+        Err(StageError::ReplicaInvalidated { replica }) if replica == ReplicaId::new(1)
+    ));
+}
+
+#[test]
 fn reclamation_promotes_recent_objects_and_defers_pinned_resources() {
     let pool = pool(1 << 20, 4096);
     let catalog = ObjectCatalog::with_config(

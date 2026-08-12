@@ -2,8 +2,12 @@
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SegmentState {
+    /// Published to placement and accepting new resource reservations.
     Accepting,
+    /// Hidden from placement but still logically readable.
     Quiesced,
+    /// Logically invalid. Outstanding resource handles may still defer the
+    /// physical release of allocator state.
     Removed,
 }
 

@@ -5,6 +5,7 @@ pub mod config;
 mod descriptor;
 pub mod error;
 mod identity;
+mod lifetime;
 mod local_ssd;
 mod offset_allocator;
 pub mod placement;
@@ -13,7 +14,6 @@ mod reservation;
 mod spec;
 pub mod stats;
 mod transport;
-mod usage;
 
 pub use config::SegmentPoolConfig;
 pub use descriptor::{

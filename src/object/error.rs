@@ -57,6 +57,8 @@ pub enum StageError {
         required_bytes: u64,
         capacity_bytes: u64,
     },
+    #[error("replica {} belongs to an invalidated segment", .replica.get())]
+    ReplicaInvalidated { replica: ReplicaId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -71,6 +73,8 @@ pub enum PublishError {
     NotPending,
     #[error("object commit metadata conflicts with the pending publication")]
     CommitConflict,
+    #[error("one or more object replicas belong to an invalidated segment")]
+    ReplicasInvalidated,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -159,7 +163,9 @@ impl From<StageError> for ObjectManagerError {
     fn from(error: StageError) -> Self {
         match error {
             StageError::ZeroSize => Self::InvalidPlan,
-            StageError::NoReplicas => Self::NoAvailableReplicas,
+            StageError::NoReplicas | StageError::ReplicaInvalidated { .. } => {
+                Self::NoAvailableReplicas
+            }
             StageError::CatalogDropped
             | StageError::ClaimLost
             | StageError::ReplicaTooSmall { .. } => Self::Internal,

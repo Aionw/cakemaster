@@ -133,6 +133,9 @@ impl ObjectCatalog {
         if ticket.node.control.write_id != ticket.id || ticket.node.record.get().is_none() {
             return Err(PublishError::ObjectGone);
         }
+        if !ticket.node.record().replicas.is_live() {
+            return Err(PublishError::ReplicasInvalidated);
+        }
 
         match ticket.node.control.lifecycle.compare_exchange(
             OBJECT_PENDING,
@@ -288,6 +291,15 @@ impl PutClaim {
         }
         if replicas.is_empty() {
             return Err(StageError::NoReplicas);
+        }
+        if let Some(replica) = replicas
+            .replicas()
+            .iter()
+            .find(|replica| !replica.is_live())
+        {
+            return Err(StageError::ReplicaInvalidated {
+                replica: replica.id(),
+            });
         }
         if let Some(replica) = replicas
             .replicas()
