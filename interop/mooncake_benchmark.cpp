@@ -58,6 +58,12 @@ enum class ReplicaStatus {
   FAILED = 5,
 };
 
+enum class SoftPinAction : std::uint8_t {
+  PRESERVE = 0,
+  ENABLE = 1,
+  DISABLE = 2,
+};
+
 using UUID = std::pair<std::uint64_t, std::uint64_t>;
 
 struct BufferDescriptor {
@@ -117,7 +123,8 @@ YLT_REFL(ObjectMeta, key, object_checksum);
 struct ReplicateConfig {
   std::size_t replica_num{1};
   std::size_t nof_replica_num{0};
-  bool with_soft_pin{false};
+  SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+  std::optional<std::uint64_t> soft_pin_ttl_ms;
   bool with_hard_pin{false};
   std::vector<std::string> preferred_segments;
   std::string preferred_segment;
@@ -127,10 +134,10 @@ struct ReplicateConfig {
   std::string host_id;
   std::optional<std::vector<std::string>> group_ids;
 };
-YLT_REFL(ReplicateConfig, replica_num, nof_replica_num, with_soft_pin,
-         with_hard_pin, preferred_segments, preferred_segment,
-         preferred_nof_segments, prefer_alloc_in_same_node, data_type, host_id,
-         group_ids);
+YLT_REFL(ReplicateConfig, replica_num, nof_replica_num, soft_pin_action,
+         soft_pin_ttl_ms, with_hard_pin, preferred_segments,
+         preferred_segment, preferred_nof_segments, prefer_alloc_in_same_node,
+         data_type, host_id, group_ids);
 
 using ExpectedBool = tl::expected<bool, ErrorCode>;
 using ExpectedGetReplicaListResponse =
@@ -148,6 +155,16 @@ ReplicaDescriptor memory_replica() {
 
 class WrappedMasterService {
 public:
+  ExpectedBool ExistKey(const std::string &, const std::string &) {
+    return false;
+  }
+
+  ExpectedGetReplicaListResponse GetReplicaList(const std::string &,
+                                                 const std::string &) {
+    return GetReplicaListResponse{
+        std::vector<ReplicaDescriptor>{memory_replica()}, 1000, std::nullopt};
+  }
+
   std::vector<ExpectedBool> BatchExistKey(const std::vector<std::string> &keys,
                                           const std::string &) {
     return std::vector<ExpectedBool>(keys.size(), ExpectedBool{false});
@@ -231,6 +248,7 @@ void print_values(std::string_view label, const Args &...args) {
 
 void print_metadata() {
   using Service = mooncake::WrappedMasterService;
+  using SingleKeyRequest = std::tuple<std::string, std::string>;
   using BatchKeyRequest = std::tuple<std::vector<std::string>, std::string>;
   using BatchPutStartRequest =
       std::tuple<mooncake::UUID, std::vector<std::string>,
@@ -243,6 +261,9 @@ void print_metadata() {
       std::tuple<mooncake::UUID, std::vector<std::string>,
                  mooncake::ReplicaType, std::string>;
 
+  print_type<SingleKeyRequest>("single_key_request");
+  print_type<mooncake::ExpectedBool>("single_exists_response");
+  print_type<mooncake::ExpectedGetReplicaListResponse>("single_get_response");
   print_type<BatchKeyRequest>("batch_key_request");
   print_type<std::vector<mooncake::ExpectedBool>>("batch_exists_response");
   print_type<std::vector<mooncake::ExpectedGetReplicaListResponse>>(
@@ -263,6 +284,22 @@ void print_metadata() {
                                  mooncake::ReplicaType::ALL, sample_tenant});
   print_values("batch_put_end_args_sample", sample_client_id,
                sample_object_metas, mooncake::ReplicaType::ALL, sample_tenant);
+
+  mooncake::ReplicateConfig sample_replicate_config;
+  sample_replicate_config.soft_pin_action = mooncake::SoftPinAction::ENABLE;
+  sample_replicate_config.soft_pin_ttl_ms = 1234;
+  sample_replicate_config.data_type = mooncake::ObjectDataType::KVCACHE;
+  print_value(
+      "batch_put_start_tuple_sample",
+      BatchPutStartRequest{sample_client_id,
+                           std::vector<std::string>{"benchmark-key-00000000"},
+                           std::vector<std::uint64_t>{4096},
+                           sample_replicate_config, sample_tenant});
+
+  std::cout << "single_exists_route="
+            << coro_rpc::func_id<&Service::ExistKey>() << '\n';
+  std::cout << "single_get_route="
+            << coro_rpc::func_id<&Service::GetReplicaList>() << '\n';
 
   std::cout << "batch_exists_route="
             << coro_rpc::func_id<&Service::BatchExistKey>() << '\n';
@@ -345,6 +382,37 @@ async_simple::coro::Lazy<bool> run_operation(coro_rpc::coro_rpc_client &client,
   using Service = mooncake::WrappedMasterService;
   auto keys = benchmark_keys(batch_size);
   const std::string tenant_id = "default";
+
+  if (operation == "single-exists") {
+    auto call = [&](auto &rpc) {
+      return rpc.template call<&Service::ExistKey>(keys.front(), tenant_id);
+    };
+    auto send = [&](auto &rpc) {
+      return rpc.template send_request<&Service::ExistKey>(keys.front(),
+                                                           tenant_id);
+    };
+    auto validate = [](const auto &response) {
+      return response && !response.value();
+    };
+    co_return co_await run_calls(client, iterations, pipeline, call, send,
+                                 validate);
+  }
+
+  if (operation == "single-get") {
+    auto call = [&](auto &rpc) {
+      return rpc.template call<&Service::GetReplicaList>(keys.front(),
+                                                         tenant_id);
+    };
+    auto send = [&](auto &rpc) {
+      return rpc.template send_request<&Service::GetReplicaList>(keys.front(),
+                                                                  tenant_id);
+    };
+    auto validate = [](const auto &response) {
+      return response && response->replicas.size() == 1;
+    };
+    co_return co_await run_calls(client, iterations, pipeline, call, send,
+                                 validate);
+  }
 
   if (operation == "exists") {
     auto call = [&](auto &rpc) {
@@ -479,7 +547,10 @@ run_client(std::string host, std::string port, std::string operation,
   const auto elapsed = std::chrono::steady_clock::now() - started;
   const auto elapsed_seconds = std::chrono::duration<double>(elapsed).count();
   const auto qps = static_cast<double>(iterations) / elapsed_seconds;
-  const auto item_qps = qps * static_cast<double>(batch_size);
+  const auto items_per_call =
+      operation == "single-exists" || operation == "single-get" ? 1
+                                                                  : batch_size;
+  const auto item_qps = qps * static_cast<double>(items_per_call);
   const auto completion_us = elapsed_seconds * 1'000'000.0 / iterations;
   std::cout << std::fixed << std::setprecision(6)
             << "client=cpp operation=" << operation
@@ -1040,7 +1111,9 @@ int main(int argc, char **argv) {
     mooncake::WrappedMasterService service;
     coro_rpc::coro_rpc_server server(threads, port);
     server
-        .register_handler<&mooncake::WrappedMasterService::BatchExistKey,
+        .register_handler<&mooncake::WrappedMasterService::ExistKey,
+                          &mooncake::WrappedMasterService::GetReplicaList,
+                          &mooncake::WrappedMasterService::BatchExistKey,
                           &mooncake::WrappedMasterService::BatchGetReplicaList,
                           &mooncake::WrappedMasterService::BatchPutStart,
                           &mooncake::WrappedMasterService::BatchPutEnd,
@@ -1086,7 +1159,7 @@ int main(int argc, char **argv) {
 
   std::cerr
       << "usage: mooncake_benchmark server <port> [threads] | client <host> "
-         "<port> <exists|get|put-start|put-end|put-revoke> [batch-size] "
+         "<port> <single-exists|single-get|exists|get|put-start|put-end|put-revoke> [batch-size] "
          "[iterations] [pipeline] [warmup] | mixed-client <host> <port> "
          "[batch-size] [qps-per-operation] [duration-seconds] "
          "[warmup-seconds] "

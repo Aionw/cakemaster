@@ -23,7 +23,8 @@ Cakemaster workspace 包含高并发 object catalog、异构 segment/placement �
 - 基于 `CancellationToken`/`TaskTracker` 的连接级优雅关闭
 - 标准错误码和大于 255 的扩展错误码
 - 入站帧大小、容器大小和单连接并发上限
-- 真实 ObjectCatalog/SegmentPool 驱动的 Mooncake batch exists/get/put RPC adapter
+- 真实 ObjectCatalog/SegmentPool 驱动的 Mooncake `Ping`/`ReMountSegment`、single/batch
+  exists/get 与 batch put RPC adapter
 
 暂不包含 TLS/NTLS、RDMA/CUDA transport、struct_pack varint 配置、IDL 外的自定义 variant/多态指针，以及 C++ 未使用 `YLT_REFL` 的 ABI/padding 结构体。大二进制建议放在 coro_rpc attachment 中，无需经过 struct_pack。
 
@@ -263,22 +264,25 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 [`crates/coro-rpc/tests/upstream_golden.rs`](crates/coro-rpc/tests/upstream_golden.rs) 使用 C++ 上游生成的固定字节序列验证类型哈希和编码；[`crates/coro-rpc/tests/end_to_end.rs`](crates/coro-rpc/tests/end_to_end.rs) 验证流水线、错误与 attachment；[`crates/coro-rpc-codegen/tests/codegen.rs`](crates/coro-rpc-codegen/tests/codegen.rs) 验证 Thrift 解析、校验和 stub 生成；[`crates/cakemaster-proto/tests/generated_end_to_end.rs`](crates/cakemaster-proto/tests/generated_end_to_end.rs) 使用同一份生成契约验证 client/server 与业务 struct。`interop/` 中还包含直接编译 yalantinglibs 的向量生成器和双向 C++ peer。
 
-## ObjectCatalog 的 Mooncake Batch RPC
+## ObjectCatalog 的 Mooncake RPC
 
 [`ObjectCatalogRpcService`](crates/cakemaster-server/src/object_catalog_rpc/mod.rs) 实现生成的
-异步 `WrappedMasterService` trait，并把 `BatchExistKey`、
-`BatchGetReplicaList`、`BatchPutStart`、`BatchPutEnd` 和 `BatchPutRevoke` 接到真实
-`ObjectManager`。RPC 层只负责 wire 校验、plan 转换和错误码映射；同步、线程安全的
-ObjectManager 负责 owner、pending/published 生命周期、lease 和 reservation 协调。
+异步 `WrappedMasterService` trait：`Ping`、`ReMountSegment` 接到 `ClientRuntime`，单 key
+`ExistKey`、`GetReplicaList` 以及 `BatchExistKey`、`BatchGetReplicaList`、
+`BatchPutStart`、`BatchPutEnd`、`BatchPutRevoke` 接到真实 `ObjectManager`。RPC 层只负责
+wire 校验、plan 转换和错误码映射；同步、线程安全的 ObjectManager 负责 owner、
+pending/published 生命周期、lease 和 reservation 协调。
 
-当前明确不支持 checksum：PutEnd 携带 checksum 返回 `INVALID_PARAMS`，BatchGet
-固定返回 `None`。接口也不提供单 key 版本。Memory-only replica 使用与 C++ 一致的
-best-effort 语义，NoF-only 使用 all-or-nothing；混合 Memory+NoF、group、pin 和 Disk
-仍需领域模型支持，不在 RPC handler 中静默降级。multi-tenant 构造会解析 tenant、
-隔离 namespace 并执行 Memory/NoF quota admission。
+当前明确不支持 checksum：PutEnd 携带 checksum 返回 `INVALID_PARAMS`，Get/BatchGet
+固定返回 `None`。Memory-only replica 使用与 C++ 一致的 best-effort 语义，NoF-only
+使用 all-or-nothing；混合 Memory+NoF、group、pin 和 Disk 仍需领域模型支持，不在 RPC
+handler 中静默降级。multi-tenant 构造会解析 tenant、隔离 namespace 并执行
+Memory/NoF quota admission。
 
 真实 TCP 测试位于
-[`crates/cakemaster-server/tests/object_catalog_rpc.rs`](crates/cakemaster-server/tests/object_catalog_rpc.rs)。
+[`crates/cakemaster-server/tests/object_catalog_rpc.rs`](crates/cakemaster-server/tests/object_catalog_rpc.rs)
+和
+[`crates/cakemaster-server/tests/client_lifecycle_rpc.rs`](crates/cakemaster-server/tests/client_lifecycle_rpc.rs)。
 线上比例 benchmark 使用每批 333 key、BatchPut/Get/Exists 各 150 QPS、100 万 key
 预填充和 50 万热集：
 
@@ -320,6 +324,8 @@ RPC handler 持有唯一的 `ClientTaskRx`；有界 `mpsc` 负责 FIFO、异步�
 | `put-end` | `BatchPutEnd` | `BatchPut` 写入成功提交 |
 | `put-revoke` | `BatchPutRevoke` | `BatchPut` 失败回滚 |
 
+`single-exists` 和 `single-get` 分别压测单 key `ExistKey`、`GetReplicaList`。
+
 构建 Rust 与 C++ 版本：
 
 ```bash
@@ -360,7 +366,7 @@ target/release/mooncake_benchmark metadata
 /tmp/mooncake_benchmark metadata
 ```
 
-[`crates/cakemaster-proto/tests/mooncake_wire.rs`](crates/cakemaster-proto/tests/mooncake_wire.rs) 固定了五个接口的 C++ type literal、type hash、route hash 和代表性 `BatchPutEnd` 字节序列。
+[`crates/cakemaster-proto/tests/mooncake_wire.rs`](crates/cakemaster-proto/tests/mooncake_wire.rs) 固定了九个接口的 C++ type metadata 与 route hash，以及代表性的 `BatchPutEnd` 和最新 `BatchPutStart` 字节序列。
 
 ## 本机性能对比
 

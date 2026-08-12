@@ -7,7 +7,9 @@ mod single_tenant;
 use crate::{ClientRuntime, ClientRuntimeError, MasterClock};
 use backend::{ObjectBatchBackend, batch_error};
 use cakemaster::client::{ClientLifecycleError, HeartbeatOutcome};
-use cakemaster::object::{ObjectManager, TenantObjectManager, TenantPutRequest, WriteOwner};
+use cakemaster::object::{
+    ObjectManager, ObjectRead, TenantObjectManager, TenantPutRequest, WriteOwner,
+};
 use cakemaster::segment::error::AttachError;
 use cakemaster_proto::mooncake::{
     ClientStatus, ErrorCode, ExpectedBool, ExpectedGetReplicaListResponse, ExpectedPingResponse,
@@ -128,6 +130,31 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
             .map_err(client_runtime_error))
     }
 
+    async fn exist_key(&self, key: String, tenant_id: String) -> Result<ExpectedBool, RpcFailure> {
+        let now = self.clock.now();
+        Ok(only_item(self.backend.execute_batch(
+            &tenant_id,
+            1,
+            now,
+            |backend, tenant| backend.exists_batch(tenant, std::slice::from_ref(&key), now),
+        )))
+    }
+
+    async fn get_replica_list(
+        &self,
+        key: String,
+        tenant_id: String,
+    ) -> Result<ExpectedGetReplicaListResponse, RpcFailure> {
+        let now = self.clock.now();
+        let read = only_item(
+            self.backend
+                .execute_batch(&tenant_id, 1, now, |backend, tenant| {
+                    backend.get_batch(tenant, std::slice::from_ref(&key), now)
+                }),
+        );
+        Ok(get_replica_list_response(read, now))
+    }
+
     async fn batch_exist_key(
         &self,
         keys: Vec<String>,
@@ -155,20 +182,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
                 backend.get_batch(tenant, &keys, now)
             })
             .into_iter()
-            .map(|read| {
-                let read = read?;
-                let replicas = read
-                    .object()
-                    .replicas()
-                    .iter()
-                    .map(|replica| replica_descriptor(replica, ReplicaStatus::Complete))
-                    .collect::<Result<Vec<_>, _>>()?;
-                Ok(GetReplicaListResponse {
-                    replicas,
-                    lease_ttl_ms: read.lease_expires_at().get().saturating_sub(now.get()),
-                    object_checksum: None,
-                })
-            })
+            .map(|read| get_replica_list_response(read, now))
             .collect())
     }
 
@@ -299,4 +313,30 @@ fn client_runtime_error(error: ClientRuntimeError) -> ErrorCode {
             ErrorCode::InvalidParams
         }
     }
+}
+
+fn only_item<T>(mut items: Vec<Result<T, ErrorCode>>) -> Result<T, ErrorCode> {
+    if items.len() == 1 {
+        items.pop().expect("one-item batch contains one response")
+    } else {
+        Err(ErrorCode::InternalError)
+    }
+}
+
+fn get_replica_list_response(
+    read: Result<ObjectRead, ErrorCode>,
+    now: cakemaster::object::reclamation::CatalogTick,
+) -> ExpectedGetReplicaListResponse {
+    let read = read?;
+    let replicas = read
+        .object()
+        .replicas()
+        .iter()
+        .map(|replica| replica_descriptor(replica, ReplicaStatus::Complete))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(GetReplicaListResponse {
+        replicas,
+        lease_ttl_ms: read.lease_expires_at().get().saturating_sub(now.get()),
+        object_checksum: None,
+    })
 }

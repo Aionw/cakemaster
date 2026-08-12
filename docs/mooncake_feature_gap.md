@@ -5,9 +5,9 @@
 本文固定以下源码基线，避免 `main` 持续变化后表格失去含义：
 
 - 上游：[kvcache-ai/Mooncake `5c0724d22e7f04513a3453c8b6642a5a21b80b47`](https://github.com/kvcache-ai/Mooncake/tree/5c0724d22e7f04513a3453c8b6642a5a21b80b47)，提交时间 2026-08-11；
-- 本仓库：`a69e6ceec209971000ad001d9bd32e59b5f75e0b`，提交时间 2026-08-11；
-- 旧 wire 基线：本仓库现有 Mooncake IDL 和 golden vectors 对应上游
-  `8c6095c06e20848506cbf91ef4a714924e7b03b1`。
+- 本仓库：本文所在提交，更新时间 2026-08-11；
+- 历史 wire 基线 `8c6095c06e20848506cbf91ef4a714924e7b03b1` 仅用于说明迁移来源；
+  当前 IDL 和 golden vectors 已对齐上述 `5c0724d`。
 
 主要比较上游 `mooncake-store` 的 Master、Store Client 和与二者直接相关的数据面，
 不把独立的 Transfer Engine、P2P Store、Mooncake EP/PG、调度器以及 vLLM/SGLang
@@ -24,43 +24,43 @@ Engine 的部分仍计入，因为它属于完整 Mooncake Store 的必要数据
   重写；若目标是完整 Store，则必须补齐。
 
 设计文档不等于实现。例如 [client_lifecycle_and_task_queue.md](client_lifecycle_and_task_queue.md)
-目前是接入方案，仓库里还没有其中规划的 `ClientRegistry`、`ClientRuntime`、
+已落地同步的 `ClientRegistry` 和基础 `ClientRuntime`，但还没有资源清理执行器、
 `TaskLedger` 或 `ClientTaskHub`。
 
 ## 结论
 
-当前 Cakemaster 是一个高并发 metadata/placement 内核，加上一组兼容旧版 Mooncake
-wire 的 batch RPC adapter；它还不是可以替换 `mooncake_master` 的服务，更不是完整的
-Mooncake Store。
+当前 Cakemaster 是一个高并发 metadata/placement 内核，加上一组兼容当前固定 Mooncake
+wire 的 single/batch RPC adapter；它还不是可以替换 `mooncake_master` 的服务，更不是
+完整的 Mooncake Store。
 
 - 上游实际在 `RegisterRpcService` 中注册 **60** 个 coro_rpc 路由；本仓库 contract 和
-  adapter 只有 **5** 个，缺少 **55** 个路由。
-- 这 5 个路由只由 benchmark server 组合起来；默认 `cakemaster server` 运行的是
+  adapter 有 **9** 个，缺少 **51** 个路由。
+- 这 9 个路由只由 benchmark/test server 组合起来；默认 `cakemaster server` 运行的是
   `DemoService`，没有可部署的 Mooncake Master composition root。
-- 对最新上游而言，5 个路由中只有 **4** 个仍保持当前 wire 契约；
-  `BatchPutStart` 已发生 schema drift，最新 C++ Client 的 BatchPut 主路径无法直接使用。
+- 9 个路由均已对齐固定的最新上游 wire；`BatchPutStart` 的 `SoftPinAction`/TTL schema
+  drift 已修复。
 - 已有 `ObjectCatalog`、`SegmentPool`、tenant quota 和 LocalSSD primitive 能复用，但
   client 生命周期、完整对象 API、分层存储任务、HA/恢复、数据面和运维面仍未完成。
 
 因此，“基础 Memory Master 可替换”与“完整 Mooncake Store 对等”应作为两个里程碑，
-不能用已经通过的 5-route benchmark 代表完整兼容。
+不能用已通过的局部 route interop 代表完整兼容。
 
 ## 当前已经具备的基础
 
 | 能力 | 当前实现 | 边界 |
 | --- | --- | --- |
 | Object metadata | `ObjectCatalog` 和 `ObjectManager` 已有 claim、pending、publish、revoke、get/exists、lease、pending timeout 和有界回收 | 没有完整上游 API；checksum、pin、group、upsert 等语义未接入 |
-| Segment/placement | `SegmentPool` 建模 Memory、CXL、NoF、LocalSSD，支持 direct reservation、CXL 共享 arena、LocalSSD permit/lease 和 owner/state 校验 | 没有 Mount/Ping/Remount/Unmount RPC、client TTL、NoF 探活和真实 I/O |
+| Segment/placement | `ClientRuntime` 已把 `Ping`、Memory/CXL `ReMountSegment`、session TTL fencing 接到 `SegmentPool` | 没有其他 Mount/Remount/Unmount RPC、超时资源清理执行器、NoF 探活和真实 I/O |
 | Placement | 支持 preferred segment、free-capacity 排序、replica failure domain 和 RAII 回滚 | 不是上游可配置的五种策略；不支持 mixed Memory+NoF 和 host-local placement |
 | Tenant | `TenantObjectManager` 已有 namespace 隔离、Memory/NoF 分账、quota admission、RAII accounting 和定向回收 | 没有上游 policy connector、HTTP admin、持久化和启动恢复 |
-| Mooncake RPC | 有 `BatchExistKey`、`BatchGetReplicaList`、`BatchPutStart`、`BatchPutEnd`、`BatchPutRevoke` | 面向旧基线；只在 benchmark/测试入口组合，最新 `BatchPutStart` 已不兼容 |
+| Mooncake RPC | 有 `Ping`、`ReMountSegment`、单 key `ExistKey`/`GetReplicaList` 和五个 batch exists/get/put 路由 | 只在 benchmark/测试入口组合；尚无 production composition |
 | RPC runtime | TCP 上兼容 coro_rpc v0/struct_pack，支持 multiplexing、attachment、timeout、取消和流式拆帧 | 没有上游可选的 RDMA RPC socket、leader-aware client pool 和 Store API |
-| Task primitive | 有单 client 的有界 `ClientTaskQueue<T>` | 只是 channel；没有 client registry、任务事实表、状态、重试、恢复或 RPC |
+| Task/client primitive | `ClientRegistry` 已组合进基础 `ClientRuntime`；另有单 client 有界 `ClientTaskQueue<T>` | 没有完整资源清理编排、任务事实表、重试、恢复或 task RPC |
 
 对应实现说明见 [object_catalog_rpc.md](object_catalog_rpc.md)、
 [segment_pool_backends.md](segment_pool_backends.md) 和 [tenant_quota.md](tenant_quota.md)。
 
-## 阻断最新上游兼容的契约漂移
+## 已处理的最新上游契约漂移
 
 上游 `5c0724d` 的 `ReplicateConfig` 已将：
 
@@ -77,20 +77,13 @@ std::optional<uint64_t> soft_pin_ttl_ms;
 
 参见上游 [`replica.h`](https://github.com/kvcache-ai/Mooncake/blob/5c0724d22e7f04513a3453c8b6642a5a21b80b47/mooncake-store/include/replica.h#L63-L126)。
 本仓库 [mooncake_master.thrift](../crates/cakemaster-proto/idl/mooncake_master.thrift)
-仍然声明 `with_soft_pin: bool`，且没有 TTL 字段。字段类型和布局改变后，
-`BatchPutStart` 请求的 struct_pack type literal/type hash 随之改变；当前 server 会以
-`InvalidTypeHash` 拒绝最新 C++ 请求，而不是只把新字段忽略。
+现已声明 `SoftPinAction: u8` 和 optional TTL，并更新 `BatchPutStart` 的 struct_pack type
+literal/type hash。C++ yalantinglibs 生成的 metadata 和代表性请求字节固定在 golden
+测试中。
 
-短期至少需要：
-
-1. 更新 IDL、生成类型和 `ReplicateConfig` 请求转换；
-2. 重新生成 C++ golden type literal/hash/bytes；
-3. 若同时保留旧协议，需要在 decode boundary 按 type hash 显式分流两个 DTO，或提供
-   版本化 endpoint，不能把两种 schema 静默解释成同一结构；
-4. 增加“最新上游 C++ Client -> Rust server”的真实 BatchPutStart/BatchPut 测试。
-
-在这项工作完成前，准确表述应是：`BatchExistKey`、`BatchGetReplicaList`、
-`BatchPutEnd`、`BatchPutRevoke` 对最新基线仍兼容，`BatchPutStart` 只兼容旧基线。
+当前 adapter 接受 `PRESERVE` 和无 TTL 的 `DISABLE`；`ENABLE` 或任意 request TTL 会返回
+`INVALID_PARAMS`，因为领域层尚未保存 pin deadline。当前选择只支持最新 schema；旧
+`8c6095c` client 的 `BatchPutStart` 会按 type hash 明确拒绝，不做模糊双解码。
 
 ## 功能差距明细
 
@@ -98,9 +91,9 @@ std::optional<uint64_t> soft_pin_ttl_ms;
 
 状态：**部分实现，基础 Memory Master 的 P0 缺口**。
 
-当前只有五个 batch handler。以下上游能力尚未形成兼容的公开服务：
+当前有七个对象相关的 single/batch handler。以下上游能力尚未形成兼容的公开服务：
 
-- 单 key `ExistKey`、`GetReplicaList`、`PutStart/End/Revoke`；
+- 单 key `PutStart/End/Revoke`；
 - `GetReplicaListByRegex`；
 - `UpsertStart/End/Revoke` 及 batch 版本，包括原 allocation 复用、尺寸变化和失败回滚；
 - `Remove`、`BatchRemove`、`RemoveByRegex`、`RemoveAll` 及 `force` 语义；
@@ -156,14 +149,14 @@ controller，但产品 server 没有上游的持续后台控制：
 
 ### 3. Client 生命周期与动态 segment 控制面
 
-状态：**领域 primitive 已有，运行时未实现；基础 Master 的 P0 缺口**。
+状态：**基础 runtime 与两个 RPC 已实现，完整控制面未实现；基础 Master 的 P0 缺口**。
 
 缺少的端到端能力包括：
 
-- `MountSegment`、`MountNoFSegment`、`ReMount*`、`Unmount*` 和
+- `MountSegment`、`MountNoFSegment`、`ReMountNoFSegment`、`Unmount*` 和
   `GracefulUnmountSegment`；
-- `Ping` 返回 view version 与 `OK/NEED_REMOUNT`；
-- client registry、heartbeat TTL、session fencing、超时清理和安全重新加入；
+- 定时驱动 `ClientRuntime::maintenance`，并按 session fencing 事件编排超时资源清理、
+  cleanup completion 和安全重新加入；
 - client 超时后 object、segment、task、offload queue 和 metadata service 注册信息的
   清理顺序；
 - NoF heartbeat probe、超时、连续失败阈值与自动摘除；
@@ -172,8 +165,9 @@ controller，但产品 server 没有上游的持续后台控制：
 - graceful drain 和 segment drain job。
 
 `SegmentPool::attach/quiesce/reactivate/remove` 可以作为这些流程的底层 capability，
-但目前没有全局 client session 或 server runtime 来保证调用顺序。详细约束已在
-[client_lifecycle_and_task_queue.md](client_lifecycle_and_task_queue.md) 中设计，尚待实现。
+当前 `ClientRuntime` 已用它们实现 Memory/CXL `ReMountSegment` 的原子激活和回滚；但
+超时后的 object、segment、task 联动清理还没有执行器。详细约束见
+[client_lifecycle_and_task_queue.md](client_lifecycle_and_task_queue.md)。
 
 ### 4. SSD/NoF/DFS 分层存储
 
@@ -309,32 +303,34 @@ composition/configuration，也不应成为上游兼容行为的唯一入口。
 
 | 分组 | 上游路由数 | 当前 contract/adapter | 结论 |
 | --- | ---: | ---: | --- |
-| 对象、metadata 与查询 | 23 | 5 | 18 个缺失；1 个已实现路由发生最新 schema drift |
-| Segment、client lifecycle 与配置 | 15 | 0 | 全部缺失 |
+| 对象、metadata 与查询 | 23 | 7 | 16 个缺失 |
+| Segment、client lifecycle 与配置 | 15 | 2 | 13 个缺失 |
 | LocalSSD offload/promotion | 11 | 0 | 全部缺失 |
 | Copy/Move 与异步任务 | 11 | 0 | 全部缺失 |
-| **合计** | **60** | **5** | **55 个路由缺失；最新完整 wire 兼容为 4/60** |
+| **合计** | **60** | **9** | **51 个路由缺失；最新完整 wire 兼容为 9/60** |
 
-### 已有的五个路由
+### 已有的九个路由
 
 ```text
+Ping
+ReMountSegment
+ExistKey
+GetReplicaList
 BatchExistKey
 BatchGetReplicaList
-BatchPutStart          # 只兼容旧 8c6095c ReplicateConfig
+BatchPutStart
 BatchPutEnd
 BatchPutRevoke
 ```
 
-### 缺少的 55 个路由
+### 缺少的 51 个路由
 
-对象与 metadata（18）：
+对象与 metadata（16）：
 
 ```text
-ExistKey
 BatchQueryIp
 BatchReplicaClear
 GetReplicaListByRegex
-GetReplicaList
 PutStart
 PutEnd
 PutRevoke
@@ -350,19 +346,17 @@ RemoveAll
 BatchRemove
 ```
 
-Segment、client lifecycle 与配置（15）：
+Segment、client lifecycle 与配置（13）：
 
 ```text
 MountSegment
 MountNoFSegment
-ReMountSegment
 ReMountNoFSegment
 UnmountSegment
 GracefulUnmountSegment
 UnmountNoFSegment
 GetAllNoFSegments
 GetNoFSegmentsByName
-Ping
 GetFsdir
 QuerySegmentStatus
 QuerySegmentStatusById
@@ -408,17 +402,17 @@ MarkTaskToComplete
 
 ## 建议实施顺序
 
-### M0：恢复最新 wire 基线
+### M0：恢复最新 wire 基线（wire 迁移已完成）
 
-- 固定并自动检查上游 commit；
-- 更新 `ReplicateConfig`、golden vectors 和 C++ 双向互通测试；
-- CI 中分别跑 latest C++ -> Rust 与 Rust -> latest C++；
-- 明确是否需要同时支持旧 `8c6095c` client。
+- 已更新 `ReplicateConfig`、golden vectors 和 C++ 双向 interop peer；
+- 已明确只支持最新 schema，不同时支持旧 `8c6095c` 的 `BatchPutStart`；
+- 仍需在 CI 固定检查上游 commit，并常态运行 latest C++ -> Rust 与 Rust -> latest C++。
 
 ### M1：可替换的基础 Memory Master
 
 - 增加 production server composition/config；
-- 实现 ClientRegistry、Ping、Mount/Remount/Unmount、TTL cleanup；
+- 把 `ClientRuntime` 接入 production composition，补齐 Mount/NoF Remount/Unmount 和
+  TTL cleanup 执行编排；
 - 补齐单 key、remove、upsert、query 和管理所需的对象 API；
 - 补 checksum、pin、group、mixed replica 和两个 pending timeout 语义；
 - 接入 production watermark/eviction controller 与 metrics；

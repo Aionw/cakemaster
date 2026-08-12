@@ -104,6 +104,12 @@ enum ReplicaStatus {
   FAILED = 5
 }
 
+enum SoftPinAction {
+  PRESERVE = 0
+  ENABLE = 1
+  DISABLE = 2
+} (coro_rpc.repr = "u8")
+
 struct UUID {
   1: required u64 high
   2: required u64 low
@@ -183,15 +189,16 @@ struct ObjectMeta {
 struct ReplicateConfig {
   1: required u64 replica_num
   2: required u64 nof_replica_num
-  3: required bool with_soft_pin
-  4: required bool with_hard_pin
-  5: required list<string> preferred_segments
-  6: required string preferred_segment
-  7: required list<string> preferred_nof_segments
-  8: required bool prefer_alloc_in_same_node
-  9: required ObjectDataType data_type
-  10: required string host_id
-  11: optional list<string> group_ids
+  3: required SoftPinAction soft_pin_action
+  4: optional u64 soft_pin_ttl_ms
+  5: required bool with_hard_pin
+  6: required list<string> preferred_segments
+  7: required string preferred_segment
+  8: required list<string> preferred_nof_segments
+  9: required bool prefer_alloc_in_same_node
+  10: required ObjectDataType data_type
+  11: required string host_id
+  12: optional list<string> group_ids
 }
 
 union ExpectedBool {
@@ -227,6 +234,16 @@ service WrappedMasterService {
     1: required list<Segment> segments,
     2: required UUID client_id
   ) (coro_rpc.name = "mooncake::WrappedMasterService::ReMountSegment")
+
+  ExpectedBool ExistKey(
+    1: required string key,
+    2: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::ExistKey")
+
+  ExpectedGetReplicaListResponse GetReplicaList(
+    1: required string key,
+    2: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::GetReplicaList")
 
   list<ExpectedBool> BatchExistKey(
     1: required list<string> keys,

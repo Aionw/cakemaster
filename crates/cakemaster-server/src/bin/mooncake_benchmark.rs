@@ -5,7 +5,7 @@ use cakemaster_proto::mooncake::{
     BufferDescriptor, ClientStatus, DescriptorVariant, ExpectedBool,
     ExpectedGetReplicaListResponse, ExpectedPingResponse, ExpectedReplicaDescriptors, ExpectedVoid,
     GetReplicaListResponse, MemoryDescriptor, ObjectDataType, ObjectMeta, PingResponse,
-    ReplicaDescriptor, ReplicaStatus, ReplicaType, ReplicateConfig, Segment, Uuid,
+    ReplicaDescriptor, ReplicaStatus, ReplicaType, ReplicateConfig, Segment, SoftPinAction, Uuid,
     WrappedMasterService, WrappedMasterServiceServer,
 };
 use coro_rpc::struct_pack::{serialize, type_hash, type_literal};
@@ -13,12 +13,17 @@ use coro_rpc::{ClientConfig, RpcClient, RpcError, RpcFailure, RpcMethod, StructP
 use futures_util::future::join_all;
 use tokio::runtime::Builder;
 
+const EXIST_KEY: &str = "mooncake::WrappedMasterService::ExistKey";
+const GET_REPLICA_LIST: &str = "mooncake::WrappedMasterService::GetReplicaList";
 const BATCH_EXIST_KEY: &str = "mooncake::WrappedMasterService::BatchExistKey";
 const BATCH_GET_REPLICA_LIST: &str = "mooncake::WrappedMasterService::BatchGetReplicaList";
 const BATCH_PUT_START: &str = "mooncake::WrappedMasterService::BatchPutStart";
 const BATCH_PUT_END: &str = "mooncake::WrappedMasterService::BatchPutEnd";
 const BATCH_PUT_REVOKE: &str = "mooncake::WrappedMasterService::BatchPutRevoke";
 
+type SingleKeyRequest = (String, String);
+type SingleExistResponse = ExpectedBool;
+type SingleGetResponse = ExpectedGetReplicaListResponse;
 type BatchKeyRequest = (Vec<String>, String);
 type BatchExistResponse = Vec<ExpectedBool>;
 type BatchGetResponse = Vec<ExpectedGetReplicaListResponse>;
@@ -30,6 +35,8 @@ type BatchVoidResponse = Vec<ExpectedVoid>;
 
 #[derive(Clone, Copy)]
 enum Operation {
+    SingleExists,
+    SingleGet,
     Exists,
     Get,
     PutStart,
@@ -40,24 +47,37 @@ enum Operation {
 impl Operation {
     fn parse(value: &str) -> Result<Self, String> {
         match value {
+            "single-exists" => Ok(Self::SingleExists),
+            "single-get" => Ok(Self::SingleGet),
             "exists" | "batch-exists" => Ok(Self::Exists),
             "get" | "batch-get" => Ok(Self::Get),
             "put-start" => Ok(Self::PutStart),
             "put-end" => Ok(Self::PutEnd),
             "put-revoke" => Ok(Self::PutRevoke),
             _ => Err(format!(
-                "unknown operation {value:?}; expected exists|get|put-start|put-end|put-revoke"
+                "unknown operation {value:?}; expected single-exists|single-get|exists|get|put-start|put-end|put-revoke"
             )),
         }
     }
 
     const fn name(self) -> &'static str {
         match self {
+            Self::SingleExists => "single-exists",
+            Self::SingleGet => "single-get",
             Self::Exists => "exists",
             Self::Get => "get",
             Self::PutStart => "put-start",
             Self::PutEnd => "put-end",
             Self::PutRevoke => "put-revoke",
+        }
+    }
+
+    const fn item_count(self, batch_size: usize) -> usize {
+        match self {
+            Self::SingleExists | Self::SingleGet => 1,
+            Self::Exists | Self::Get | Self::PutStart | Self::PutEnd | Self::PutRevoke => {
+                batch_size
+            }
         }
     }
 }
@@ -78,6 +98,26 @@ impl WrappedMasterService for BenchmarkMasterService {
         _client_id: Uuid,
     ) -> Result<ExpectedVoid, RpcFailure> {
         Ok(Ok(()))
+    }
+
+    async fn exist_key(
+        &self,
+        _key: String,
+        _tenant_id: String,
+    ) -> Result<ExpectedBool, RpcFailure> {
+        Ok(Ok(false))
+    }
+
+    async fn get_replica_list(
+        &self,
+        _key: String,
+        _tenant_id: String,
+    ) -> Result<ExpectedGetReplicaListResponse, RpcFailure> {
+        Ok(Ok(GetReplicaListResponse {
+            replicas: vec![memory_replica()],
+            lease_ttl_ms: 1_000,
+            object_checksum: None,
+        }))
     }
 
     async fn batch_exist_key(
@@ -190,6 +230,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 fn print_metadata() {
+    print_type::<SingleKeyRequest>("single_key_request");
+    print_type::<SingleExistResponse>("single_exists_response");
+    print_type::<SingleGetResponse>("single_get_response");
     print_type::<BatchKeyRequest>("batch_key_request");
     print_type::<BatchExistResponse>("batch_exists_response");
     print_type::<BatchGetResponse>("batch_get_response");
@@ -211,6 +254,23 @@ fn print_metadata() {
         ))
         .expect("benchmark metadata sample must serialize"),
     );
+    print_bytes(
+        "batch_put_start_sample",
+        &serialize(&(
+            Uuid { high: 1, low: 2 },
+            vec!["benchmark-key-00000000".to_owned()],
+            vec![4_096_u64],
+            ReplicateConfig {
+                soft_pin_action: SoftPinAction::Enable,
+                soft_pin_ttl_ms: Some(1_234),
+                ..benchmark_config()
+            },
+            "default".to_owned(),
+        ))
+        .expect("benchmark metadata sample must serialize"),
+    );
+    println!("single_exists_route={}", function_id(EXIST_KEY));
+    println!("single_get_route={}", function_id(GET_REPLICA_LIST));
     println!("batch_exists_route={}", function_id(BATCH_EXIST_KEY));
     println!("batch_get_route={}", function_id(BATCH_GET_REPLICA_LIST));
     println!("batch_put_start_route={}", function_id(BATCH_PUT_START));
@@ -284,7 +344,7 @@ async fn run_client(
     run_operation(&client, operation, batch_size, iterations, pipeline).await?;
     let elapsed = started.elapsed();
     let qps = iterations as f64 / elapsed.as_secs_f64();
-    let item_qps = qps * batch_size as f64;
+    let item_qps = qps * operation.item_count(batch_size) as f64;
     let completion_us = elapsed.as_secs_f64() * 1_000_000.0 / iterations as f64;
     println!(
         "client=rust operation={} batch_size={batch_size} iterations={iterations} pipeline={pipeline} elapsed_s={:.6} qps={qps:.0} item_qps={item_qps:.0} us_per_completion={completion_us:.3}",
@@ -304,6 +364,40 @@ async fn run_operation(
     let keys = benchmark_keys(batch_size);
     let tenant_id = "default".to_owned();
     match operation {
+        Operation::SingleExists => {
+            let request = (
+                keys.into_iter().next().expect("batch size is non-zero"),
+                tenant_id,
+            );
+            run_calls(
+                client,
+                RpcMethod::<SingleKeyRequest, SingleExistResponse>::new(EXIST_KEY),
+                &request,
+                iterations,
+                pipeline,
+                |response| response == &Ok(false),
+            )
+            .await
+        }
+        Operation::SingleGet => {
+            let request = (
+                keys.into_iter().next().expect("batch size is non-zero"),
+                tenant_id,
+            );
+            run_calls(
+                client,
+                RpcMethod::<SingleKeyRequest, SingleGetResponse>::new(GET_REPLICA_LIST),
+                &request,
+                iterations,
+                pipeline,
+                |response| {
+                    response
+                        .as_ref()
+                        .is_ok_and(|value| value.replicas.len() == 1)
+                },
+            )
+            .await
+        }
         Operation::Exists => {
             let request = (keys, tenant_id);
             run_calls(
@@ -455,7 +549,8 @@ fn benchmark_config() -> ReplicateConfig {
     ReplicateConfig {
         replica_num: 1,
         nof_replica_num: 0,
-        with_soft_pin: false,
+        soft_pin_action: SoftPinAction::Preserve,
+        soft_pin_ttl_ms: None,
         with_hard_pin: false,
         preferred_segments: Vec::new(),
         preferred_segment: String::new(),
@@ -470,7 +565,7 @@ fn benchmark_config() -> ReplicateConfig {
 fn print_usage() {
     eprintln!(
         "usage: mooncake_benchmark server [address] [threads] | \
-         client [address] [exists|get|put-start|put-end|put-revoke] \
+         client [address] [single-exists|single-get|exists|get|put-start|put-end|put-revoke] \
          [batch-size] [iterations] [pipeline] [warmup]"
     );
 }

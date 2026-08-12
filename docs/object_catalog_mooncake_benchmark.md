@@ -1,5 +1,9 @@
 # ObjectCatalog 与 Mooncake 同口径性能对比
 
+> 本页是固定在 Mooncake `8c6095c` wire 的历史性能记录。当前
+> `interop/mooncake_benchmark.cpp` 已随主线契约升级到 `5c0724d`；若要严格复现本文
+> 数据，需要检出记录该实验的仓库版本，不能直接使用当前互操作程序替代。
+
 ## Batch RPC 线上比例压测（2026-08-10）
 
 这一组走真实 TCP、Mooncake `WrappedMasterService` wire、真实 catalog、placement、
