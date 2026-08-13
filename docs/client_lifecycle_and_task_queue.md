@@ -1,0 +1,465 @@
+# Client 生命周期与 TaskQueue 接入设计
+
+## 结论与实施顺序
+
+`ClientTaskQueue` 只解决一个已知 client 的异步任务投递，不负责判断 client 是否
+存在、是否仍然存活、一次重连是否属于旧进程，也不负责 client 超时后的资源清理。
+因此，在接入 Mooncake 的 `FetchTasks`、offload heartbeat 和 promotion heartbeat
+之前，先实现统一的 Client 生命周期管理。
+
+建议按下面的顺序落地：
+
+1. 实现同步、可确定性测试的 `ClientRegistry`，负责 session、状态、TTL 和超时
+   发现，不依赖 Tokio、RPC、`SegmentPool` 或 TaskQueue。
+2. 在 server crate 实现 `ClientRuntime`，串联注册/重挂载、`Ping`、超时清理和
+   per-client runtime slot。
+3. 成功激活 client 时创建 mailbox，client 进入 draining/expired 时关闭 mailbox。
+4. 生命周期稳定后再实现任务 ledger、`FetchTasks` 和各类 typed task lane。
+
+第一阶段不实现通用任务状态机，也不把所有带 `client_id` 的 RPC 变成任务。Put、
+Mount、容量上报和 completion RPC 仍然是同步领域操作；TaskQueue 只承载 Master
+主动交给 Client 执行的异步工作。
+
+## 背景与当前缺口
+
+当前 `ClientId` 是一对 `u64` 组成的值对象，主要用作 segment owner 和 write
+owner。`SegmentPool` 能校验 owner，但没有一个全局组件回答下面的问题：
+
+- client 是否已经完成挂载并可以接收工作；
+- 最近一次有效 heartbeat 是何时，何时应判定超时；
+- 超时 client 的 queue、segment、pending write 和 task 应按什么顺序清理；
+- 同一个 `ClientId` 再次出现时，旧清理流程是否还能影响新会话；
+- Master 重启或 HA 切主后，client 是否必须 remount。
+
+现有 `ClientTaskQueue<T>` 是有界的 per-client Tokio channel。Master producer 持有
+可克隆的 `ClientTaskTx<T>`，fetch RPC handler 持有唯一的
+`ClientTaskRx<T>`。这个抽象提供 FIFO、唤醒、异步背压和等待期间的取消安全，但
+刻意不包含 client registry、任务完成状态和持久化。
+
+C++ Mooncake 当前的相关语义可作为兼容基线：
+
+- `Ping(client_id)` 返回 view version 和 `OK/NEED_REMOUNT`；
+- `ReMountSegment` 用于首次连接或 heartbeat TTL 过期后的重挂载；
+- `FetchTasks(client_id, batch_size)` 按 client 取得任务，
+  `MarkTaskToComplete` 走独立完成路径；
+- offload 和 promotion heartbeat 也会拉取按 client 保存的待办工作。
+
+上游参考：
+
+- [`MasterService::Ping`](https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store/src/master_service.cpp#L5499-L5518)
+- [`FetchTasks`/`MarkTaskToComplete`](https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store/src/master_service.cpp#L9391-L9413)
+- [`ClientTaskManager`](https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store/include/task_manager.h#L182-L233)
+
+## 设计目标
+
+生命周期层需要保证以下不变量：
+
+1. 只有成功完成注册或 remount 的 client 才是 `Active`。
+2. 未知 client 的 `Ping` 只返回 `NEED_REMOUNT`，不能隐式创建 registry entry 或
+   TaskQueue，避免任意 ID 撑大 Master 内存。
+3. 同一时刻一个 `ClientId` 最多有一个 active session。
+4. heartbeat 只能延长当前 active session，不能复活 draining 或 expired session。
+5. 超时处理先将 session 从服务路径中封禁，再异步清理资源。
+6. 所有清理操作都携带 session generation；旧 session 的清理不能删除新 session
+   的 mailbox 或状态。
+7. client 清理完成前，不允许相同 `ClientId` 建立新 session。当前 segment 只记录
+   owner `ClientId`，不记录 session generation；提前重挂载会让旧清理误删新资源。
+8. `ClientRegistry` 内不执行 `.await`，也不在其锁内调用 `SegmentPool`、RPC、
+   TaskQueue 或任务 completion。
+9. Master 重启或切主后不恢复 liveness。新进程从空 registry 开始，所有 client
+   先收到 `NEED_REMOUNT`，通过 remount 重新证明资源仍然有效。
+
+第一版假定 C++ client 每次进程启动生成新的 `ClientId`。现有 wire 只携带
+`client_id`，旧进程和复用同一 ID 的新进程无法被强认证地区分；server-side
+generation 可以隔离内部异步清理，但不能阻止两个进程同时使用同一 ID。若以后要
+支持显式 ID 复用，需要把 session token 加入 wire，或把 session 绑定到 RPC
+connection。
+
+## Identity 与 Session
+
+`ClientId` 是调用方提供的稳定标识；`ClientSession` 是 Master 为一次成功激活分配
+的内部 incarnation：
+
+```rust
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct ClientSession {
+    client_id: ClientId,
+    generation: u64,
+}
+```
+
+generation 由 Master 全局单调分配，进程生命周期内不复用。内部的 mailbox、清理
+事件和以后任务 ledger 的 assignment 都使用 `ClientSession`，不能只使用裸
+`ClientId`。RPC adapter 收到裸 `client_id` 后，必须先通过 registry 解析当前 active
+session。
+
+第一阶段继续复用 `cakemaster::segment::ClientId`，避免为了模块命名迁移所有 owner
+API。生命周期实现稳定后，可以把定义提升到 `cakemaster::client::ClientId`，并在
+`segment` 门面保留兼容 re-export；这个重构不应阻塞生命周期功能。
+
+## 状态机
+
+Registry 只持有正在建立服务关系或等待清理的 entry；完全移除后的状态用 map 中
+不存在表示。
+
+| 状态 | 含义 | 接受 Ping | 接受新工作 | 允许 remount |
+| --- | --- | --- | --- | --- |
+| Absent | registry 中不存在 | 返回 `NEED_REMOUNT` | 否 | 是 |
+| Active | 挂载已成功，TTL 有效 | 刷新 deadline，返回 `OK` | 是 | 幂等重试可复用当前 session |
+| Draining | 主动卸载或 Master shutdown | 返回 `NEED_REMOUNT` | 否 | 否，等待清理完成 |
+| Expired | TTL 到期，强制清理中 | 返回 `NEED_REMOUNT` | 否 | 否，等待清理完成 |
+
+状态转换如下：
+
+```text
+                      successful register/remount
+             ┌─────────────────────────────────────┐
+             │                                     ▼
+          Absent                                Active
+             ▲                                  │    │
+             │                   graceful close │    │ TTL reached
+             │                                  ▼    ▼
+             └──── cleanup finished ─────── Draining Expired
+```
+
+`Draining` 和 `Expired` 的业务清理不同，但 fencing 规则相同：一旦进入这两个状态，
+不能再被 heartbeat 改回 `Active`。清理完成后删除 entry；下一次 remount 才创建更高
+generation 的 session。
+
+普通 `MountSegment` 应只服务 active client。首次连接和 TTL 后恢复走
+`ReMountSegment`；仅挂载 LocalSSD 的 client 可以由成功的
+`MountLocalDiskSegment` 建立 session。如果实际 C++ 初始化路径还会对 absent client
+直接调用 `MountSegment`，RPC adapter 可以把该调用路由到同一个“建立 session”事务，
+但不能让普通 `Ping` 或 object RPC 隐式注册 client。
+
+## 时间与 TTL
+
+生命周期使用 server 端单调时间，不使用 wall clock。为便于无 sleep 的确定性测试，
+core 层使用显式 tick 值：
+
+```rust
+pub struct ClientTick(u64);
+
+pub struct ClientLifecycleConfig {
+    ttl_ticks: u64,
+    max_clients: usize,
+    maintenance_budget: usize,
+}
+```
+
+配置字段保持私有，通过校验构造函数和消费式 `with_*` builder 修改，与现有 core
+配置风格一致。
+
+成功激活和有效 `Ping` 将 `expires_at` 更新为
+`max(old_expires_at, now + ttl)`，乱序到达的旧 heartbeat 不能缩短 deadline。成功的
+remount、mount lifecycle RPC 可以同时视为一次 heartbeat；Put/Get、task fetch 和
+completion 默认不刷新 liveness，避免普通业务流量掩盖已经失效的 heartbeat loop。
+
+过期条件统一为 `now >= expires_at`。`ttl_ticks == 0`、`max_clients == 0` 和
+`maintenance_budget == 0` 在配置构造时拒绝。
+
+### Deadline 索引
+
+第一版使用 `BinaryHeap<Reverse<DeadlineRecord>>`，但不为每个 heartbeat 都追加一条
+新记录：
+
+1. session 激活时放入一条 deadline record；
+2. heartbeat 只更新 entry 中的 `expires_at`；
+3. heap record 到期时重新读取 entry；若 heartbeat 已将 deadline 延后，则只把最新
+   deadline 重新放回 heap；否则将 entry 标记为 `Expired`。
+
+这样 heap 正常情况下接近每个 client 一条记录，不会随 heartbeat 次数增长。record
+携带 generation；已经删除或 generation 不匹配的 record 直接丢弃。
+
+`maintenance(now, budget)` 最多处理 `budget` 条到期/重排记录并返回需要清理的
+session。后台 runtime 可以周期调用它，之后再优化成按 `next_deadline()` 唤醒；core
+行为不依赖具体定时器。
+
+## ClientRegistry API 草案
+
+`ClientRegistry` 是同步、线程安全的领域组件。方法返回值是状态事实或待执行事件，
+外部副作用由 server runtime 完成。
+
+```rust
+pub enum ClientState {
+    Active,
+    Draining,
+    Expired,
+}
+
+pub enum ActivateOutcome {
+    Activated(ClientSession),
+    AlreadyActive(ClientSession),
+}
+
+pub enum HeartbeatOutcome {
+    Alive(ClientSession),
+    NeedRemount,
+}
+
+pub enum CleanupReason {
+    GracefulUnmount,
+    HeartbeatExpired,
+    ServerShutdown,
+}
+
+pub struct ClientCleanup {
+    session: ClientSession,
+    reason: CleanupReason,
+}
+
+impl ClientRegistry {
+    pub fn activate(
+        &self,
+        client_id: ClientId,
+        now: ClientTick,
+    ) -> Result<ActivateOutcome, ClientLifecycleError>;
+
+    pub fn heartbeat(
+        &self,
+        client_id: ClientId,
+        now: ClientTick,
+    ) -> HeartbeatOutcome;
+
+    pub fn active_session(
+        &self,
+        client_id: ClientId,
+    ) -> Result<ClientSession, ClientLifecycleError>;
+
+    pub fn begin_drain(
+        &self,
+        session: ClientSession,
+        reason: CleanupReason,
+    ) -> Result<Option<ClientCleanup>, ClientLifecycleError>;
+
+    pub fn maintenance(
+        &self,
+        now: ClientTick,
+        budget: usize,
+    ) -> Vec<ClientCleanup>;
+
+    pub fn finish_cleanup(
+        &self,
+        session: ClientSession,
+    ) -> Result<(), ClientLifecycleError>;
+}
+```
+
+主要错误包括 `NilClientId`、`CapacityExceeded`、`CleanupInProgress`、
+`ClientNotActive` 和 `StaleSession`。以下操作必须幂等：
+
+- active client 重复激活返回 `AlreadyActive`，不分配新 generation；
+- 相同 session 重复 `begin_drain` 不重复生成清理工作；
+- 相同 session 重复 `finish_cleanup` 成功或返回可忽略的 already-finished 结果；
+- generation 不匹配的旧 `finish_cleanup` 只能返回 `StaleSession`，不能删除当前 entry。
+
+Registry 对外只返回复制出的 snapshot/outcome，不暴露持锁 guard。第一版可以用一个
+`parking_lot::Mutex<Inner>` 保持 map、generation allocator 和 deadline heap 的原子
+关系；heartbeat 频率通常远低于 object RPC，先以正确性为主，再根据 benchmark 决定
+是否分片。
+
+## Server Runtime 与并发边界
+
+`ClientRuntime` 位于 `cakemaster-server`，持有：
+
+```text
+ClientRuntime
+├── Arc<ClientRegistry>                 # 同步领域状态
+├── client_slots[ClientId]              # per-client 生命周期串行门
+├── ClientTaskHub                       # 第二阶段接入
+├── Arc<SegmentPool> / ObjectManager    # 由 coordinator 调用
+└── maintenance task                    # Tokio timer + bounded cleanup
+```
+
+每个 `client_slot` 提供一个异步 mutex，只串行化会改变资源归属的操作：register/remount、
+mount/unmount 和 cleanup。`Ping` 只做 registry 中的短更新，不等待该 mutex；object
+RPC 也不在全局 client lock 下执行。
+
+### 注册或 remount
+
+RPC handler 的顺序为：
+
+1. 获取该 `ClientId` 的 runtime slot；
+2. 获取 slot lifecycle mutex；
+3. 确认 registry 中是 `Absent`，或是可幂等处理的 `Active`；
+4. 校验并挂载完整的 segment 列表；失败时回滚本次新挂载；
+5. 预创建 mailbox，确保 queue 配置有效；
+6. 调用 `registry.activate`；
+7. 只在 `Activated` 时发布 mailbox；`AlreadyActive` 保留原 mailbox；
+8. 返回 RPC 成功。
+
+步骤 4 到 7 之间不应有网络 I/O。对于新 session，挂载、registry 激活和 mailbox 发布
+需要由 coordinator 做成一个可回滚事务，不能出现 RPC 返回失败但部分 segment 永久
+留在 pool 的情况。
+
+### Ping
+
+`Ping` 调用 `registry.heartbeat(client_id, now)`：
+
+- `Alive` 映射为 C++ `ClientStatus::OK`；
+- `NeedRemount` 映射为 `ClientStatus::NEED_REMOUNT`；
+- response 中同时返回当前 Master view version。
+
+未知 `client_id` 不分配 slot、entry 或 queue。为了避免攻击者只靠 Ping 创建大量
+per-client mutex，runtime slot 也只在 register/remount 路径创建，或使用不持久化的
+临时 gate。
+
+### TTL 过期
+
+过期必须先 fence、后清理：
+
+1. `maintenance` 在 registry 锁内把 `Active` 原子改为 `Expired`；
+2. 立即按 `ClientSession` 关闭 TaskQueue mailbox，阻止新任务投递和 fetch；
+3. cleanup worker 获取同一个 client slot mutex，等待正在进行的 mount/unmount 完成；
+4. 再次校验 session generation 和 `Expired` 状态；
+5. quiesce 该 client 的 segment，阻止新的 placement；
+6. 终止或回收该 session 的 pending write、processing task 和 LocalSSD workflow；
+7. 移除 client 拥有的 segment 及关联 metadata；
+8. 调用 `finish_cleanup(session)`，最后删除 runtime slot。
+
+每一步都必须对相同 session 幂等。任何一步失败时保留 `Expired` entry 并重试，不能先
+删除 registry entry 再留下仍可分配的孤儿资源。
+
+第一阶段尚未具备完整 task ledger 和按 owner 批量清理所有 object 的能力时，可以先
+实现 1、2、4、5、8 的接口与测试，并把缺少的 cleanup hook 明确返回为未完成；不能
+静默声称 client 已清理完毕。
+
+### 主动卸载与 shutdown
+
+最后一个 segment 主动卸载或 server graceful shutdown 时，使用相同流程，但状态为
+`Draining`，reason 分别为 `GracefulUnmount` 或 `ServerShutdown`。进入 Draining 后
+不接受新工作；已经进入同步 handler 的有界操作可以完成，随后 cleanup worker 统一
+收尾。
+
+## 与 TaskQueue 的连接
+
+生命周期层稳定后增加 `ClientTaskHub`：
+
+```rust
+pub struct ClientMailbox {
+    session: ClientSession,
+    // 为兼容现有 C++ RPC，初期使用不同返回类型的 typed lanes。
+    replication: ClientTaskQueue<DispatchToken>,
+    offload: ClientTaskQueue<DispatchToken>,
+    promotion: ClientTaskQueue<DispatchToken>,
+    control: ClientTaskQueue<DispatchToken>,
+}
+```
+
+typed lanes 是 wire 兼容要求：`FetchTasks`、`OffloadObjectHeartbeat`、
+`PromotionObjectHeartbeat` 和 `PollRemoveAll` 的返回类型不同，不能让四个 RPC handler
+竞争消费同一条异构 FIFO。以后增加统一的 tagged-union `FetchClientTasks` 后，才可以
+考虑合并 lane。
+
+Hub 必须遵守下面的规则：
+
+- 只允许 `Activated(ClientSession)` 创建 mailbox，不能在第一次 enqueue 或 fetch 时
+  lazy-create；
+- producer 先通过 registry 解析 active session，再 clone `Tx`，释放 registry/hub
+  锁后执行 `send().await`；
+- fetch handler 使用唯一 `Rx`，同 client 同 lane 的并发 fetch 要串行化或明确拒绝；
+- `Draining/Expired` 关闭精确 generation 的 mailbox；旧 cleanup 不能关闭新 session
+  的 mailbox；
+- channel 不是任务事实来源。关闭时被丢弃的 `DispatchToken` 必须能从 TaskLedger
+  重建、失败或重分配；不能把 mpsc buffer 做 snapshot；
+- completion RPC 继续独立处理，并校验 assigned session/task attempt。
+
+现有 `recv_many` 会等待至少一项，而 C++ `FetchTasks` 当前允许立即返回空 batch。
+接入 RPC 前需要为 queue 增加 `try_recv_many` 或有上限的
+`recv_many_timeout`；producer 侧也需要 `try_send`/`send_timeout`，避免 queue 已满时
+在领域锁内或 RPC handler 中无限等待。
+
+## Master 重启与 HA
+
+Client liveness、Tokio channel 和未确认的网络连接都不进入 snapshot。Master 新进程
+或新 leader 使用新的 view version，并从空 `ClientRegistry`/`ClientTaskHub` 开始：
+
+1. client 的下一次 `Ping` 得到 `NEED_REMOUNT`；
+2. client 重新提交完整 segment 描述；
+3. Master 将恢复出的 segment 状态与 remount 请求核对；
+4. 核对成功后建立新 `ClientSession` 并发布 mailbox；
+5. 持久化 TaskLedger 中仍可执行的任务重新 dispatch。
+
+在 client 完成 remount 前，snapshot 恢复出的远端资源不能进入 accepting placement
+snapshot。view version 属于 server/HA runtime，不放进每个 client entry。
+
+## 可观测性
+
+至少提供以下 gauge/counter：
+
+- active、draining、expired 和 cleanup-retry client 数；
+- activate、idempotent activate、heartbeat、unknown heartbeat、expiry 次数；
+- client entry capacity rejection；
+- 从 expiry 到 mailbox close、segment quiesce、cleanup finish 的延迟；
+- stale generation cleanup/finish 次数；
+- 每个 task lane 的深度、full/closed send 和 fetch batch size。
+
+日志必须同时带 `client_id`、generation、旧状态、新状态和 cleanup reason。正常 heartbeat
+不逐次打 INFO，避免大集群日志放大；状态转换和异常才进入 INFO/WARN。
+
+## 测试计划
+
+### Core 单元测试
+
+- unknown Ping 返回 `NeedRemount` 且 registry 长度不变；
+- activate 创建 session，重复 activate 保持同一 generation；
+- heartbeat 延长 deadline，乱序 tick 不缩短 deadline；
+- 旧 heap deadline 到达时按 entry 最新 deadline 重排，而不是误过期；
+- `now == expires_at` 时进入 Expired，后续 heartbeat 不能复活；
+- cleanup 完成前相同 ID activate 返回 `CleanupInProgress`；
+- 旧 generation 的 finish 不能删除当前 entry；
+- maintenance budget 生效，剩余到期 client 留给下一轮；
+- max_clients、nil ID 和非法配置返回明确错误。
+
+### Server 并发测试
+
+- concurrent Ping 不丢失更新且 deadline 单调；
+- remount 与 timeout cleanup 通过同一 client slot 串行；
+- Activated 只创建一次 mailbox，Expired 立即关闭对应 generation；
+- 旧 cleanup 与新 session 交错时不会关闭或删除新 mailbox；
+- server shutdown 将所有 active client 转入 Draining，并有界等待 cleanup；
+- handler cancellation/挂载失败不会留下 Active entry 或部分新挂载。
+
+### C++ wire 跨层测试
+
+- unknown client：`Ping -> NEED_REMOUNT`；
+- remount 成功：`Ping -> OK`；
+- TTL 到期：`Ping -> NEED_REMOUNT`，task fetch 被拒绝；
+- cleanup 完成后 remount：建立新 server generation；
+- Master view version 改变后 client 必须重新 remount。
+
+## 建议文件布局
+
+第一阶段预计新增：
+
+```text
+src/client.rs                              # client 领域门面
+src/client/lifecycle.rs                    # registry、状态机、deadline heap
+src/client/config.rs                       # TTL/容量配置
+src/client/error.rs                        # lifecycle errors/outcomes
+tests/client_lifecycle.rs                  # 确定性 core 测试
+
+crates/cakemaster-server/src/client_runtime.rs
+crates/cakemaster-server/tests/client_runtime.rs
+```
+
+第二阶段再新增 TaskLedger、`ClientTaskHub` 和 Mooncake task RPC adapter。现有
+`crates/cakemaster-server/src/client_task_queue.rs` 保持为最底层 channel primitive，
+不向其中加入 registry、segment cleanup 或任务持久化逻辑。
+
+## 第一阶段验收标准
+
+Client 生命周期管理可以在下面条件全部满足后视为完成：
+
+1. core 状态机和 TTL 测试不依赖 wall-clock sleep；
+2. unknown Ping 不分配持久状态；
+3. timeout 在任何资源清理前先 fence client；
+4. 相同 ID 在 cleanup 完成前无法建立新 session；
+5. 所有异步 cleanup 都按 generation 校验且可重试；
+6. Master restart 明确要求 remount，不恢复旧 liveness；
+7. server runtime 已提供 Activated/Draining/Expired hook，TaskQueue 可以只通过这些
+   hook 创建和关闭 mailbox；
+8. 没有在 client registry 锁内执行 await 或调用其他领域 manager。
+
+完成这些约束后，再接入 TaskQueue 不会反过来决定 client 是否存活，也不会让 queue
+关闭、RPC 取消或旧 session 清理破坏 segment/object 的领域状态。

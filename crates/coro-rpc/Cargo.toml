@@ -1,0 +1,15 @@
+[package]
+name = "coro-rpc"
+version = "0.1.0"
+edition = "2024"
+description = "Tokio implementation of the yalantinglibs coro_rpc v0 wire protocol"
+license = "Apache-2.0"
+
+[dependencies]
+bytes = "1"
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+md-5 = "0.11"
+thiserror.workspace = true
+tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+tower-service = "0.3"

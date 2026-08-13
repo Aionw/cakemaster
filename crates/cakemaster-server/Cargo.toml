@@ -1,0 +1,19 @@
+[package]
+name = "cakemaster-server"
+version = "0.1.0"
+edition = "2024"
+description = "Cakemaster RPC server and diagnostic tools"
+license = "Apache-2.0"
+
+[[bin]]
+name = "cakemaster"
+path = "src/main.rs"
+doc = false
+
+[dependencies]
+cakemaster = { path = "../.." }
+cakemaster-proto = { path = "../cakemaster-proto" }
+coro-rpc = { path = "../coro-rpc" }
+futures-util = "0.3"
+thiserror.workspace = true
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
