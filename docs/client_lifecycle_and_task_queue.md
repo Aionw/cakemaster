@@ -280,7 +280,8 @@ cakemaster::client::ClientManager
 cakemaster-server
 ├── ObjectCatalogRpcService              # wire 转换和错误映射
 ├── MasterClock + view version           # server/HA concern
-└── production timer / ClientTaskHub     # 后续接入
+├── MasterReconciler                     # 显式启动的有界定时收敛
+└── ClientTaskHub                        # 后续接入
 ```
 
 每个 mount slot 使用同步 `parking_lot::Mutex`，只串行化会改变资源归属的
@@ -338,9 +339,11 @@ per-client mutex，mount slot 也只在 register/remount 路径创建，或使�
 每一步都必须对相同 session 幂等。任何一步失败时保留 `Expired` entry 并重试，不能先
 删除 registry entry 再留下仍可分配的孤儿资源。
 
-`ClientManager::run_cleanup_step` 已实现 1 到 7 和 9 的同步单轮入口；production timer、
-task ledger 和 LocalSSD workflow 尚未接入。cleanup 完成表示资源已经逻辑失效，不表示
-所有外部 object handle 都已释放或物理回收结束。
+`ClientManager::run_cleanup_step` 已实现 1 到 7 和 9 的同步单轮入口；
+server 层的 `MasterReconciler` 默认每 100ms 显式调度一轮 client cleanup 和
+object maintenance，但仍由 composition root 统一管理其启动、shutdown 和 join。
+task ledger 和 LocalSSD workflow 尚未接入。cleanup 完成表示资源已经逻辑失效，
+不表示所有外部 object handle 都已释放或物理回收结束。
 
 ### Pending write 的两个归属维度
 

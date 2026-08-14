@@ -25,7 +25,8 @@ Engine 的部分仍计入，因为它属于完整 Mooncake Store 的必要数据
 
 设计文档不等于实现。例如 [client_lifecycle_and_task_queue.md](client_lifecycle_and_task_queue.md)
 已落地同步的 `ClientRegistry`、core `ClientManager` 和单轮资源清理 coordinator，但还
-没有 production timer、`TaskLedger` 或 `ClientTaskHub`。
+没有将 server `MasterReconciler` 接入可部署的 production composition，也没有
+`TaskLedger` 或 `ClientTaskHub`。
 
 ## 结论
 
@@ -50,7 +51,7 @@ wire 的 single/batch RPC adapter；它还不是可以替换 `mooncake_master` �
 | 能力 | 当前实现 | 边界 |
 | --- | --- | --- |
 | Object metadata | `ObjectCatalog` 和 `ObjectManager` 已有 claim、pending、publish、revoke、get/exists、lease、pending timeout、按 client session 主动 revoke 和有界回收 | 没有完整上游 API；checksum、pin、group、upsert 等语义未接入 |
-| Segment/placement | `ClientManager` 已把 `Ping`、Memory/CXL `ReMountSegment`、session TTL fencing 和批量 segment cleanup 接到 `SegmentPool` | 没有 production cleanup timer、其他 Mount/Remount/Unmount RPC、NoF 探活和真实 I/O |
+| Segment/placement | `ClientManager` 已把 `Ping`、Memory/CXL `ReMountSegment`、session TTL fencing 和批量 segment cleanup 接到 `SegmentPool`；server 已有默认 100ms 的 `MasterReconciler` | 尚未接入 production composition；没有其他 Mount/Remount/Unmount RPC、NoF 探活和真实 I/O |
 | Placement | 支持 preferred segment、free-capacity 排序、replica failure domain 和 RAII 回滚 | 不是上游可配置的五种策略；不支持 mixed Memory+NoF 和 host-local placement |
 | Tenant | `TenantObjectManager` 已有 namespace 隔离、Memory/NoF 分账、quota admission、RAII accounting 和定向回收 | 没有上游 policy connector、HTTP admin、持久化和启动恢复 |
 | Mooncake RPC | 有 `Ping`、`ReMountSegment`、单 key `ExistKey`/`GetReplicaList` 和五个 batch exists/get/put 路由 | 只在 benchmark/测试入口组合；尚无 production composition |

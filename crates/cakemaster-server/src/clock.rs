@@ -2,7 +2,7 @@
 
 use cakemaster::client::ClientTick;
 use cakemaster::object::reclamation::CatalogTick;
-use std::time::Instant;
+use tokio::time::Instant;
 
 /// A cloneable time origin for catalog leases, deadlines, and maintenance.
 ///
