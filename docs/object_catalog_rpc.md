@@ -10,7 +10,7 @@ handler 中复制 catalog、placement 或事务规则。当前实现提供 clien
 
 ```text
 async WrappedMasterService handler
-        ├── Ping / ReMountSegment → ClientRuntime → ClientRegistry + SegmentPool
+        ├── Ping / ReMountSegment → ClientManager → ClientRegistry + SegmentPool
         └── object RPC → ObjectManager / TenantObjectManager
                          ├── ObjectCatalog：key 生命周期、owner、lease、回收状态
                          └── ReplicaAllocator：placement 与 SegmentPool reservation
@@ -22,15 +22,16 @@ async WrappedMasterService handler
 placement 需要访问远端调度器，应把异步引入 placement/coordinator 边界，而不是
 让 catalog 的纯内存状态机整体异步化。
 
-`ObjectCatalogRpcService` 的 object handler 先校验 wire 请求并归一化领域输入，再从注入的
-`MasterClock` 取得单调 tick、执行一次有界 maintenance、解析一次 batch tenant、调用
-领域 batch API 并映射返回值。RPC 与后台 controller 必须 clone 同一个 clock，避免把
+`ObjectCatalogRpcService` 自己持有共享的 `MasterClock`。object handler 先校验 wire
+请求并归一化领域输入，再取得单调 tick、执行一次有界 maintenance、解析一次 batch
+tenant、调用领域 batch API 并映射返回值。RPC 与后台 controller 必须 clone 同一个 clock，避免把
 不同时间原点产生的 `CatalogTick` 交给同一个 manager。批内每个 key 独立成功或失败，
 只有连接/编解码失败才返回 transport-level `RpcFailure`。
 
-`Ping` 和 `ReMountSegment` 则使用同一个 `ClientRuntime`：前者只刷新已有 session 的
+`Ping` 和 `ReMountSegment` 使用同一个 core `ClientManager`：前者只刷新已有 session 的
 heartbeat，未知 client 返回 `NEED_REMOUNT`；后者把 wire segment 转成 `SegmentSpec`，
 在 per-client 锁下完成 attach/reactivate 与 session 激活，失败时回滚本次资源变更。
+segment 全部 reactivate 后才发布 active session，因此 object write 不会观察到半挂载状态。
 
 每次 RPC 的 maintenance candidate budget 至少等于当前 batch item 数，因此批量写入
 不会固定每批加入 333 个 timeout candidate、却长期只清理默认的 64 个；reclaim 和空
@@ -64,8 +65,9 @@ watermark 或淘汰比例。
 3. 让 `ReplicaAllocator` 按 placement plan 预留空间。
 4. 把 reservation 转成由 catalog 持有的 `ReplicaSet`，并将 claim stage 为
    pending object。
-5. Catalog node 保留 `WriteOwner`、`WriteId`、replica 和超时 deadline；Manager
-   丢弃临时 ticket，向 RPC 返回可写 descriptor。
+5. Catalog node 只保留纯身份 `WriteOwner`、`WriteId`、replica 和超时 deadline；
+   start/stage 使用的 `WriteAdmission` fence 随 claim 离开后即释放，Manager 丢弃临时
+   ticket，向 RPC 返回可写 descriptor。
 
 任何中途失败都依靠 claim/reservation 的 RAII drop 回滚；all-or-nothing
 placement 的部分 reservation 也会在返回错误前释放。
@@ -144,5 +146,5 @@ class 子计划及原子回滚。group、checksum 和 pin 是当前明确不支�
 - `crates/cakemaster-server/src/object_catalog_rpc/backend.rs`：静态 backend 契约与公共 batch 流程；
 - `crates/cakemaster-server/src/object_catalog_rpc/single_tenant.rs`、`multi_tenant.rs`：两种领域 backend 适配；
 - `crates/cakemaster-server/src/object_catalog_rpc/request.rs`、`response.rs`：wire 请求归一化与响应映射；
-- `crates/cakemaster-server/src/client_runtime.rs`：client session、remount 与 segment 协调；
+- `src/client/manager.rs`：client remount、session fencing 与资源清理协调；
 - `crates/cakemaster-server/tests/object_catalog_rpc.rs`、`client_lifecycle_rpc.rs`：真实 TCP 跨层测试。

@@ -24,8 +24,8 @@ Engine 的部分仍计入，因为它属于完整 Mooncake Store 的必要数据
   重写；若目标是完整 Store，则必须补齐。
 
 设计文档不等于实现。例如 [client_lifecycle_and_task_queue.md](client_lifecycle_and_task_queue.md)
-已落地同步的 `ClientRegistry` 和基础 `ClientRuntime`，但还没有资源清理执行器、
-`TaskLedger` 或 `ClientTaskHub`。
+已落地同步的 `ClientRegistry`、core `ClientManager` 和单轮资源清理 coordinator，但还
+没有 production timer、`TaskLedger` 或 `ClientTaskHub`。
 
 ## 结论
 
@@ -49,13 +49,13 @@ wire 的 single/batch RPC adapter；它还不是可以替换 `mooncake_master` �
 
 | 能力 | 当前实现 | 边界 |
 | --- | --- | --- |
-| Object metadata | `ObjectCatalog` 和 `ObjectManager` 已有 claim、pending、publish、revoke、get/exists、lease、pending timeout 和有界回收 | 没有完整上游 API；checksum、pin、group、upsert 等语义未接入 |
-| Segment/placement | `ClientRuntime` 已把 `Ping`、Memory/CXL `ReMountSegment`、session TTL fencing 接到 `SegmentPool` | 没有其他 Mount/Remount/Unmount RPC、超时资源清理执行器、NoF 探活和真实 I/O |
+| Object metadata | `ObjectCatalog` 和 `ObjectManager` 已有 claim、pending、publish、revoke、get/exists、lease、pending timeout、按 client session 主动 revoke 和有界回收 | 没有完整上游 API；checksum、pin、group、upsert 等语义未接入 |
+| Segment/placement | `ClientManager` 已把 `Ping`、Memory/CXL `ReMountSegment`、session TTL fencing 和批量 segment cleanup 接到 `SegmentPool` | 没有 production cleanup timer、其他 Mount/Remount/Unmount RPC、NoF 探活和真实 I/O |
 | Placement | 支持 preferred segment、free-capacity 排序、replica failure domain 和 RAII 回滚 | 不是上游可配置的五种策略；不支持 mixed Memory+NoF 和 host-local placement |
 | Tenant | `TenantObjectManager` 已有 namespace 隔离、Memory/NoF 分账、quota admission、RAII accounting 和定向回收 | 没有上游 policy connector、HTTP admin、持久化和启动恢复 |
 | Mooncake RPC | 有 `Ping`、`ReMountSegment`、单 key `ExistKey`/`GetReplicaList` 和五个 batch exists/get/put 路由 | 只在 benchmark/测试入口组合；尚无 production composition |
 | RPC runtime | TCP 上兼容 coro_rpc v0/struct_pack，支持 multiplexing、attachment、timeout、取消和流式拆帧 | 没有上游可选的 RDMA RPC socket、leader-aware client pool 和 Store API |
-| Task/client primitive | `ClientRegistry` 已组合进基础 `ClientRuntime`；另有单 client 有界 `ClientTaskQueue<T>` | 没有完整资源清理编排、任务事实表、重试、恢复或 task RPC |
+| Task/client primitive | `ClientRegistry` 已封装在 core `ClientManager` 后，并有 generation-fenced cleanup；另有单 client 有界 `ClientTaskQueue<T>` | 没有任务事实表、重试、恢复、task/LocalSSD cleanup hook 或 task RPC |
 
 对应实现说明见 [object_catalog_rpc.md](object_catalog_rpc.md)、
 [segment_pool_backends.md](segment_pool_backends.md) 和 [tenant_quota.md](tenant_quota.md)。
@@ -155,8 +155,8 @@ controller，但产品 server 没有上游的持续后台控制：
 
 - `MountSegment`、`MountNoFSegment`、`ReMountNoFSegment`、`Unmount*` 和
   `GracefulUnmountSegment`；
-- 定时驱动 `ClientRuntime::maintenance`，并按 session fencing 事件编排超时资源清理、
-  cleanup completion 和安全重新加入；
+- 定时驱动现有 `ClientManager::run_cleanup_step`；单轮 session fencing、批量 segment
+  cleanup、按 session 撤销 pending write、cleanup completion 和安全重新加入已经实现；
 - client 超时后 object、segment、task、offload queue 和 metadata service 注册信息的
   清理顺序；
 - NoF heartbeat probe、超时、连续失败阈值与自动摘除；
@@ -164,9 +164,10 @@ controller，但产品 server 没有上游的持续后台控制：
   `GetStorageConfig`、`GetFsdir`、`ServiceReady`；
 - graceful drain 和 segment drain job。
 
-`SegmentPool::attach/quiesce/reactivate/remove` 可以作为这些流程的底层 capability，
-当前 `ClientRuntime` 已用它们实现 Memory/CXL `ReMountSegment` 的原子激活和回滚；但
-超时后的 object、segment、task 联动清理还没有执行器。详细约束见
+`SegmentPool::attach/quiesce/reactivate/remove/invalidate_owners` 是这些流程的底层
+capability；当前 `ClientManager` 已实现 Memory/CXL `ReMountSegment` 的原子激活、回滚
+以及超时后的批量 pending-write revoke 与 segment/object 逻辑失效。task 和 LocalSSD
+workflow 仍未接入。详细约束见
 [client_lifecycle_and_task_queue.md](client_lifecycle_and_task_queue.md)。
 
 ### 4. SSD/NoF/DFS 分层存储
@@ -411,7 +412,7 @@ MarkTaskToComplete
 ### M1：可替换的基础 Memory Master
 
 - 增加 production server composition/config；
-- 把 `ClientRuntime` 接入 production composition，补齐 Mount/NoF Remount/Unmount 和
+- 把 `ClientManager` 接入 production composition，补齐 Mount/NoF Remount/Unmount 和
   TTL cleanup 执行编排；
 - 补齐单 key、remove、upsert、query 和管理所需的对象 API；
 - 补 checksum、pin、group、mixed replica 和两个 pending timeout 语义；

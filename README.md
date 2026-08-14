@@ -267,7 +267,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 ## ObjectCatalog 的 Mooncake RPC
 
 [`ObjectCatalogRpcService`](crates/cakemaster-server/src/object_catalog_rpc/mod.rs) 实现生成的
-异步 `WrappedMasterService` trait：`Ping`、`ReMountSegment` 接到 `ClientRuntime`，单 key
+异步 `WrappedMasterService` trait：`Ping`、`ReMountSegment` 接到 core `ClientManager`，单 key
 `ExistKey`、`GetReplicaList` 以及 `BatchExistKey`、`BatchGetReplicaList`、
 `BatchPutStart`、`BatchPutEnd`、`BatchPutRevoke` 接到真实 `ObjectManager`。RPC 层只负责
 wire 校验、plan 转换和错误码映射；同步、线程安全的 ObjectManager 负责 owner、
