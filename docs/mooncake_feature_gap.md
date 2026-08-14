@@ -5,7 +5,7 @@
 本文固定以下源码基线，避免 `main` 持续变化后表格失去含义：
 
 - 上游：[kvcache-ai/Mooncake `5c0724d22e7f04513a3453c8b6642a5a21b80b47`](https://github.com/kvcache-ai/Mooncake/tree/5c0724d22e7f04513a3453c8b6642a5a21b80b47)，提交时间 2026-08-11；
-- 本仓库：本文所在提交，更新时间 2026-08-11；
+- 本仓库：本文所在提交，更新时间 2026-08-14；
 - 历史 wire 基线 `8c6095c06e20848506cbf91ef4a714924e7b03b1` 仅用于说明迁移来源；
   当前 IDL 和 golden vectors 已对齐上述 `5c0724d`。
 
@@ -35,10 +35,10 @@ wire 的 single/batch RPC adapter；它还不是可以替换 `mooncake_master` �
 完整的 Mooncake Store。
 
 - 上游实际在 `RegisterRpcService` 中注册 **60** 个 coro_rpc 路由；本仓库 contract 和
-  adapter 有 **9** 个，缺少 **51** 个路由。
-- 这 9 个路由只由 benchmark/test server 组合起来；默认 `cakemaster server` 运行的是
+  adapter 有 **12** 个，缺少 **48** 个路由。
+- 这 12 个路由只由 benchmark/test server 组合起来；默认 `cakemaster server` 运行的是
   `DemoService`，没有可部署的 Mooncake Master composition root。
-- 9 个路由均已对齐固定的最新上游 wire；`BatchPutStart` 的 `SoftPinAction`/TTL schema
+- 12 个路由均已对齐固定的最新上游 wire；`BatchPutStart` 的 `SoftPinAction`/TTL schema
   drift 已修复。
 - 已有 `ObjectCatalog`、`SegmentPool`、tenant quota 和 LocalSSD primitive 能复用，但
   client 生命周期、完整对象 API、分层存储任务、HA/恢复、数据面和运维面仍未完成。
@@ -51,10 +51,10 @@ wire 的 single/batch RPC adapter；它还不是可以替换 `mooncake_master` �
 | 能力 | 当前实现 | 边界 |
 | --- | --- | --- |
 | Object metadata | `ObjectCatalog` 和 `ObjectManager` 已有 claim、pending、publish、revoke、get/exists、lease、pending timeout、按 client session 主动 revoke 和有界回收 | 没有完整上游 API；checksum、pin、group、upsert 等语义未接入 |
-| Segment/placement | `ClientManager` 已把 `Ping`、Memory/CXL `ReMountSegment`、session TTL fencing 和批量 segment cleanup 接到 `SegmentPool`；server 已有默认 100ms 的 `MasterReconciler` | 尚未接入 production composition；没有其他 Mount/Remount/Unmount RPC、NoF 探活和真实 I/O |
+| Segment/placement | `ClientManager` 已把 `Ping`、Memory/CXL `MountSegment`/`ReMountSegment`、立即/Graceful unmount、session TTL fencing 和批量 cleanup 接到 `SegmentPool`；`MasterReconciler` 兼有 100ms 周期维护和 Graceful deadline 唤醒 | 尚未接入 production composition；没有 NoF lifecycle RPC、探活和真实 I/O |
 | Placement | 支持 preferred segment、free-capacity 排序、replica failure domain 和 RAII 回滚 | 不是上游可配置的五种策略；不支持 mixed Memory+NoF 和 host-local placement |
 | Tenant | `TenantObjectManager` 已有 namespace 隔离、Memory/NoF 分账、quota admission、RAII accounting 和定向回收 | 没有上游 policy connector、HTTP admin、持久化和启动恢复 |
-| Mooncake RPC | 有 `Ping`、`ReMountSegment`、单 key `ExistKey`/`GetReplicaList` 和五个 batch exists/get/put 路由 | 只在 benchmark/测试入口组合；尚无 production composition |
+| Mooncake RPC | 有 `Ping`、四个 Memory/CXL segment lifecycle 路由、单 key `ExistKey`/`GetReplicaList` 和五个 batch exists/get/put 路由 | 只在 benchmark/测试入口组合；尚无 production composition |
 | RPC runtime | TCP 上兼容 coro_rpc v0/struct_pack，支持 multiplexing、attachment、timeout、取消和流式拆帧 | 没有上游可选的 RDMA RPC socket、leader-aware client pool 和 Store API |
 | Task/client primitive | `ClientRegistry` 已封装在 core `ClientManager` 后，并有 generation-fenced cleanup；另有单 client 有界 `ClientTaskQueue<T>` | 没有任务事实表、重试、恢复、task/LocalSSD cleanup hook 或 task RPC |
 
@@ -150,14 +150,13 @@ controller，但产品 server 没有上游的持续后台控制：
 
 ### 3. Client 生命周期与动态 segment 控制面
 
-状态：**基础 runtime 与两个 RPC 已实现，完整控制面未实现；基础 Master 的 P0 缺口**。
+状态：**Memory/CXL 基础 runtime 与五个 lifecycle RPC 已实现，完整控制面未实现；基础 Master 的 P0 缺口**。
 
 缺少的端到端能力包括：
 
-- `MountSegment`、`MountNoFSegment`、`ReMountNoFSegment`、`Unmount*` 和
-  `GracefulUnmountSegment`；
-- 定时驱动现有 `ClientManager::run_cleanup_step`；单轮 session fencing、批量 segment
-  cleanup、按 session 撤销 pending write、cleanup completion 和安全重新加入已经实现；
+- `MountNoFSegment`、`ReMountNoFSegment` 和 `UnmountNoFSegment`；
+- production composition 显式启动并 join `MasterReconciler`；单轮 session fencing、批量
+  segment cleanup、按 session 撤销 pending write、Graceful deadline 和安全重新加入已经实现；
 - client 超时后 object、segment、task、offload queue 和 metadata service 注册信息的
   清理顺序；
 - NoF heartbeat probe、超时、连续失败阈值与自动摘除；
@@ -166,8 +165,9 @@ controller，但产品 server 没有上游的持续后台控制：
 - graceful drain 和 segment drain job。
 
 `SegmentPool::attach/quiesce/reactivate/remove/invalidate_owners` 是这些流程的底层
-capability；当前 `ClientManager` 已实现 Memory/CXL `ReMountSegment` 的原子激活、回滚
-以及超时后的批量 pending-write revoke 与 segment/object 逻辑失效。task 和 LocalSSD
+capability；当前 `ClientManager` 已实现 Memory/CXL `MountSegment`/`ReMountSegment` 的
+原子激活与回滚、立即/Graceful 单 segment 摘除，以及超时后的批量 pending-write revoke
+与 segment/object 逻辑失效。task 和 LocalSSD
 workflow 仍未接入。详细约束见
 [client_lifecycle_and_task_queue.md](client_lifecycle_and_task_queue.md)。
 
@@ -306,16 +306,19 @@ composition/configuration，也不应成为上游兼容行为的唯一入口。
 | 分组 | 上游路由数 | 当前 contract/adapter | 结论 |
 | --- | ---: | ---: | --- |
 | 对象、metadata 与查询 | 23 | 7 | 16 个缺失 |
-| Segment、client lifecycle 与配置 | 15 | 2 | 13 个缺失 |
+| Segment、client lifecycle 与配置 | 15 | 5 | 10 个缺失 |
 | LocalSSD offload/promotion | 11 | 0 | 全部缺失 |
 | Copy/Move 与异步任务 | 11 | 0 | 全部缺失 |
-| **合计** | **60** | **9** | **51 个路由缺失；最新完整 wire 兼容为 9/60** |
+| **合计** | **60** | **12** | **48 个路由缺失；最新完整 wire 兼容为 12/60** |
 
-### 已有的九个路由
+### 已有的十二个路由
 
 ```text
 Ping
+MountSegment
 ReMountSegment
+UnmountSegment
+GracefulUnmountSegment
 ExistKey
 GetReplicaList
 BatchExistKey
@@ -325,7 +328,7 @@ BatchPutEnd
 BatchPutRevoke
 ```
 
-### 缺少的 51 个路由
+### 缺少的 48 个路由
 
 对象与 metadata（16）：
 
@@ -348,14 +351,11 @@ RemoveAll
 BatchRemove
 ```
 
-Segment、client lifecycle 与配置（13）：
+Segment、client lifecycle 与配置（10）：
 
 ```text
-MountSegment
 MountNoFSegment
 ReMountNoFSegment
-UnmountSegment
-GracefulUnmountSegment
 UnmountNoFSegment
 GetAllNoFSegments
 GetNoFSegmentsByName

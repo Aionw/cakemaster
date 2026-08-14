@@ -1,4 +1,4 @@
-use cakemaster::client::{ClientId, ClientLifecycleConfig};
+use cakemaster::client::{ClientId, ClientLifecycleConfig, ClientTick};
 use cakemaster::object::error::LookupError;
 use cakemaster::object::reclamation::CollectBudget;
 use cakemaster::object::{
@@ -10,7 +10,7 @@ use cakemaster::segment::{
     MemoryRegion, SegmentId, SegmentIdentity, SegmentPool, SegmentSpec, TransportEndpoint,
     TransportProtocol,
 };
-use cakemaster_proto::mooncake::WrappedMasterService;
+use cakemaster_proto::mooncake::{Uuid, WrappedMasterService};
 use cakemaster_server::{
     DEFAULT_OBJECT_COLLECTION_BUDGET, DEFAULT_RECONCILE_INTERVAL, MasterClock,
     MasterReconcileConfig, MasterReconcileConfigError, ObjectCatalogRpcService,
@@ -319,6 +319,121 @@ async fn periodic_reconcile_waits_for_the_first_tick_and_skips_missed_ticks() {
         1,
         "shutdown must not run a final reconcile step"
     );
+}
+
+#[tokio::test(start_paused = true)]
+async fn graceful_deadline_wakes_before_the_periodic_interval() {
+    let (pool, _manager, service) = single_service(10_000, 16);
+    let spec = segment(CLIENT, 1);
+    let id = spec.identity().id();
+    service
+        .client_manager()
+        .mount_segment(CLIENT, spec, service.clock().client_now())
+        .unwrap();
+    let reconciler = service.reconciler(
+        MasterReconcileConfig::new(Duration::from_secs(1), DEFAULT_OBJECT_COLLECTION_BUDGET)
+            .unwrap(),
+    );
+    let service = Arc::new(service);
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let task = tokio::spawn(reconciler.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    tokio::task::yield_now().await;
+
+    assert_eq!(
+        service
+            .graceful_unmount_segment(
+                Uuid {
+                    high: id.high(),
+                    low: id.low(),
+                },
+                Uuid {
+                    high: CLIENT.high(),
+                    low: CLIENT.low(),
+                },
+                37,
+            )
+            .await
+            .unwrap(),
+        Ok(())
+    );
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_millis(36)).await;
+    tokio::task::yield_now().await;
+    assert!(pool.segment(id).is_some());
+
+    tokio::time::advance(Duration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(pool.segment(id).is_none());
+
+    let after_shutdown = segment(CLIENT, 2);
+    let after_shutdown_id = after_shutdown.identity().id();
+    service
+        .client_manager()
+        .mount_segment(CLIENT, after_shutdown, service.clock().client_now())
+        .unwrap();
+    service
+        .graceful_unmount_segment(
+            Uuid {
+                high: after_shutdown_id.high(),
+                low: after_shutdown_id.low(),
+            },
+            Uuid {
+                high: CLIENT.high(),
+                low: CLIENT.low(),
+            },
+            50,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    shutdown_tx.send(()).unwrap();
+    task.await.unwrap();
+    tokio::time::advance(Duration::from_millis(100)).await;
+    assert!(pool.segment(after_shutdown_id).is_some());
+}
+
+#[tokio::test(start_paused = true)]
+async fn client_expiry_cancels_same_step_graceful_work_before_object_collection() {
+    let (pool, manager, service) = single_service(10, 16);
+    let spec = segment(CLIENT, 1);
+    let id = spec.identity().id();
+    service
+        .client_manager()
+        .mount_segment(CLIENT, spec, service.clock().client_now())
+        .unwrap();
+    let object = identity("expiry-wins");
+    manager
+        .start_put(
+            object.clone(),
+            service.client_manager().write_admission(CLIENT).unwrap(),
+            plan(4096),
+            service.clock().now(),
+        )
+        .unwrap();
+    manager
+        .finish_put(
+            &object,
+            service.client_manager().write_owner(CLIENT).unwrap(),
+            ReplicaSelector::All,
+        )
+        .unwrap();
+    service
+        .client_manager()
+        .schedule_graceful_unmount(CLIENT, id, ClientTick::new(10))
+        .unwrap();
+
+    tokio::time::advance(Duration::from_millis(10)).await;
+    let report = service
+        .reconciler(MasterReconcileConfig::default())
+        .reconcile_once();
+    assert_eq!(report.client_cleanup.unwrap().completed_sessions, 1);
+    assert_eq!(report.graceful_unmount.completed, 0);
+    assert_eq!(report.graceful_unmount.stale_or_cancelled, 1);
+    assert_eq!(report.graceful_unmount.retried, 0);
+    assert_eq!(report.object_collection.catalog.invalidated_published, 1);
+    assert!(pool.is_empty());
 }
 
 #[tokio::test(start_paused = true)]

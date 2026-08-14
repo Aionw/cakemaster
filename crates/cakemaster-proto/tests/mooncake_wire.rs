@@ -21,12 +21,21 @@ type BatchPutRevokeRequest = (Uuid, Vec<String>, ReplicaType, String);
 type BatchVoidResponse = Vec<ExpectedVoid>;
 type PingRequest = Uuid;
 type RemountRequest = (Vec<Segment>, Uuid);
+type MountSegmentRequest = (Segment, Uuid);
+type UnmountSegmentRequest = (Uuid, Uuid);
+type GracefulUnmountSegmentRequest = (Uuid, Uuid, u64);
 
 #[test]
 fn mooncake_rpc_schema_matches_yalantinglibs_metadata() {
     assert_type::<PingRequest>("fd04048989ff", 1_013_810_144);
     assert_eq!(type_hash::<ExpectedPingResponse>(), 1_948_946_258);
     assert_eq!(type_hash::<RemountRequest>(), 3_334_892_424);
+    assert_type::<MountSegmentRequest>(
+        "fdfdfd04048989ff800c0404800c800c800cfffd04048989ffff",
+        2_666_991_022,
+    );
+    assert_type::<UnmountSegmentRequest>("fdfd04048989fffd04048989ffff", 3_569_685_216);
+    assert_type::<GracefulUnmountSegmentRequest>("fdfd04048989fffd04048989ff04ff", 2_382_966_428);
     assert_eq!(type_hash::<ExpectedVoid>(), 2_938_661_068);
     assert_type::<SingleKeyRequest>("fd800c800cff", 2_096_701_144);
     assert_type::<SingleExistsResponse>("870b01", 2_431_123_666);
@@ -62,6 +71,18 @@ fn mooncake_rpc_routes_match_wrapped_master_service() {
     assert_eq!(
         function_id("mooncake::WrappedMasterService::ReMountSegment"),
         184_892_274
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::MountSegment"),
+        1_048_495_291
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::UnmountSegment"),
+        1_863_365_733
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::GracefulUnmountSegment"),
+        2_766_942_581
     );
     assert_eq!(
         function_id("mooncake::WrappedMasterService::ExistKey"),

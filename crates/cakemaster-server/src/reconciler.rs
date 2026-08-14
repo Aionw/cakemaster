@@ -1,13 +1,16 @@
 //! Periodic convergence of client and object lifecycle state.
 
 use crate::MasterClock;
-use cakemaster::client::{ClientCleanupReport, ClientManager, ClientManagerError};
+use cakemaster::client::{
+    ClientCleanupReport, ClientManager, ClientManagerError, GracefulUnmountReport,
+};
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{ObjectManager, ObjectManagerMaintenance, TenantObjectManager};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::sync::Notify;
 use tokio::time::{Instant, MissedTickBehavior};
 
 /// Default delay between bounded reconciliation steps.
@@ -69,6 +72,8 @@ pub enum MasterReconcileConfigError {
 pub struct ReconcileStepReport {
     /// Client cleanup outcome. Object collection still runs when this is an error.
     pub client_cleanup: Result<ClientCleanupReport, ClientManagerError>,
+    /// Due segment-level graceful removals processed after client cleanup.
+    pub graceful_unmount: GracefulUnmountReport,
     /// Object retirement and reclamation work completed by this step.
     pub object_collection: ObjectManagerMaintenance,
 }
@@ -110,6 +115,7 @@ pub struct MasterReconciler {
     clients: ClientManager,
     objects: Arc<dyn ObjectReconcileBackend>,
     clock: MasterClock,
+    reconcile_notify: Arc<Notify>,
     config: MasterReconcileConfig,
 }
 
@@ -118,12 +124,14 @@ impl MasterReconciler {
         clients: ClientManager,
         objects: Arc<ObjectManager>,
         clock: MasterClock,
+        reconcile_notify: Arc<Notify>,
         config: MasterReconcileConfig,
     ) -> Self {
         Self {
             clients,
             objects,
             clock,
+            reconcile_notify,
             config,
         }
     }
@@ -132,12 +140,14 @@ impl MasterReconciler {
         clients: ClientManager,
         objects: Arc<TenantObjectManager>,
         clock: MasterClock,
+        reconcile_notify: Arc<Notify>,
         config: MasterReconcileConfig,
     ) -> Self {
         Self {
             clients,
             objects,
             clock,
+            reconcile_notify,
             config,
         }
     }
@@ -155,11 +165,13 @@ impl MasterReconciler {
         let client_now = self.clock.client_now();
         let catalog_now = self.clock.now();
         let client_cleanup = self.clients.run_cleanup_step(client_now, catalog_now);
+        let graceful_unmount = self.clients.run_graceful_unmount_step(client_now);
         let object_collection = self
             .objects
             .reconcile_objects(catalog_now, self.config.object_budget());
         ReconcileStepReport {
             client_cleanup,
+            graceful_unmount,
             object_collection,
         }
     }
@@ -175,20 +187,38 @@ impl MasterReconciler {
         tokio::pin!(shutdown);
 
         loop {
+            let notified = self.reconcile_notify.notified();
+            let deadline = self.clients.next_graceful_unmount_deadline();
+            let deadline_wait = async {
+                match deadline {
+                    Some(deadline) => {
+                        tokio::time::sleep(self.clock.delay_until_client_tick(deadline)).await
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(notified);
+            tokio::pin!(deadline_wait);
             tokio::select! {
                 biased;
                 _ = &mut shutdown => break,
                 _ = interval.tick() => {
-                    let report = self.reconcile_once();
-                    if let Err(error) = &report.client_cleanup {
-                        log::error!(
-                            target: "cakemaster_server::reconciler",
-                            cleanup_error:% = error;
-                            "master reconciliation client cleanup failed"
-                        );
-                    }
-                }
+                    self.reconcile_and_log();
+                },
+                _ = &mut deadline_wait => self.reconcile_and_log(),
+                _ = &mut notified => {},
             }
+        }
+    }
+
+    fn reconcile_and_log(&self) {
+        let report = self.reconcile_once();
+        if let Err(error) = &report.client_cleanup {
+            log::error!(
+                target: "cakemaster_server::reconciler",
+                cleanup_error:% = error;
+                "master reconciliation client cleanup failed"
+            );
         }
     }
 }

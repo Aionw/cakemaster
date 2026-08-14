@@ -19,8 +19,8 @@ use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::fmt;
 use std::ops::Deref;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -41,6 +41,17 @@ pub struct SegmentPool {
 pub struct SegmentHandle {
     pool_id: u64,
     entry: Arc<SegmentEntry>,
+}
+
+/// Weak identity for one concrete segment attachment.
+///
+/// Keeping this token alive does not retain the segment resource. It is used
+/// by deferred lifecycle work to fence a later attachment that reuses the same
+/// logical segment id.
+#[derive(Clone)]
+pub(crate) struct SegmentIncarnation {
+    pool_id: u64,
+    entry: Weak<SegmentEntry>,
 }
 
 impl SegmentHandle {
@@ -72,6 +83,13 @@ impl SegmentHandle {
         self.entry.local_ssd_stats()
     }
 
+    pub(crate) fn incarnation(&self) -> SegmentIncarnation {
+        SegmentIncarnation {
+            pool_id: self.pool_id,
+            entry: Arc::downgrade(&self.entry),
+        }
+    }
+
     pub fn direct_candidate(&self) -> Option<DirectCandidate> {
         self.entry
             .supports_direct_reservation()
@@ -84,6 +102,17 @@ impl SegmentHandle {
         self.entry.supports_offload().then(|| OffloadTarget {
             segment: self.clone(),
         })
+    }
+}
+
+impl SegmentIncarnation {
+    pub(crate) fn matches(&self, segment: &SegmentHandle) -> bool {
+        self.pool_id == segment.pool_id
+            && Weak::ptr_eq(&self.entry, &Arc::downgrade(&segment.entry))
+    }
+
+    pub(crate) fn same_as(&self, other: &Self) -> bool {
+        self.pool_id == other.pool_id && Weak::ptr_eq(&self.entry, &other.entry)
     }
 }
 

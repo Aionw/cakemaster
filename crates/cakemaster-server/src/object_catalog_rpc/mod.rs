@@ -18,9 +18,13 @@ use cakemaster_proto::mooncake::{
     ReplicaStatus, ReplicaType, ReplicateConfig, Segment, Uuid, WrappedMasterService,
 };
 use coro_rpc::RpcFailure;
-use request::{PutPlanTemplate, client_id_from_uuid, replica_selector, segment_spec_from_wire};
+use request::{
+    PutPlanTemplate, client_id_from_uuid, replica_selector, segment_id_from_uuid,
+    segment_spec_from_wire,
+};
 use response::{replica_descriptor, started_replica_descriptor};
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 pub const DEFAULT_MASTER_VIEW_VERSION: i64 = 1;
 
@@ -28,6 +32,7 @@ pub struct ObjectCatalogRpcService<B = ObjectManager> {
     backend: Arc<B>,
     clients: ClientManager,
     clock: MasterClock,
+    reconcile_notify: Arc<Notify>,
     view_version: i64,
 }
 
@@ -42,6 +47,7 @@ impl<B> ObjectCatalogRpcService<B> {
             backend,
             clients,
             clock,
+            reconcile_notify: Arc::new(Notify::new()),
             view_version,
         }
     }
@@ -89,6 +95,7 @@ impl ObjectCatalogRpcService<ObjectManager> {
             self.clients.clone(),
             self.backend.clone(),
             self.clock.clone(),
+            self.reconcile_notify.clone(),
             config,
         )
     }
@@ -114,6 +121,7 @@ impl ObjectCatalogRpcService<TenantObjectManager> {
             self.clients.clone(),
             self.backend.clone(),
             self.clock.clone(),
+            self.reconcile_notify.clone(),
             config,
         )
     }
@@ -132,6 +140,23 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
             view_version_id: self.view_version,
             client_status,
         }))
+    }
+
+    async fn mount_segment(
+        &self,
+        segment: Segment,
+        client_id: Uuid,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        let client_id = client_id_from_uuid(&client_id);
+        let segment = match segment_spec_from_wire(segment, client_id) {
+            Ok(segment) => segment,
+            Err(error) => return Ok(Err(error)),
+        };
+        Ok(self
+            .clients
+            .mount_segment(client_id, segment, self.clock.client_now())
+            .map(|_| ())
+            .map_err(mount_segment_error))
     }
 
     async fn re_mount_segment(
@@ -153,6 +178,39 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
             .remount(client_id, segments, self.clock.client_now())
             .map(|_| ())
             .map_err(client_manager_error))
+    }
+
+    async fn unmount_segment(
+        &self,
+        segment_id: Uuid,
+        client_id: Uuid,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        let result = self.clients.unmount_segment(
+            client_id_from_uuid(&client_id),
+            segment_id_from_uuid(&segment_id),
+        );
+        if result.is_ok() {
+            self.reconcile_notify.notify_one();
+        }
+        Ok(result.map(|_| ()).map_err(client_manager_error))
+    }
+
+    async fn graceful_unmount_segment(
+        &self,
+        segment_id: Uuid,
+        client_id: Uuid,
+        grace_period_ms: u64,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        let deadline = self.clock.client_now().saturating_add(grace_period_ms);
+        let result = self.clients.schedule_graceful_unmount(
+            client_id_from_uuid(&client_id),
+            segment_id_from_uuid(&segment_id),
+            deadline,
+        );
+        if result.is_ok() {
+            self.reconcile_notify.notify_one();
+        }
+        Ok(result.map_err(client_manager_error))
     }
 
     async fn exist_key(&self, key: String, tenant_id: String) -> Result<ExpectedBool, RpcFailure> {
@@ -341,14 +399,40 @@ fn client_manager_error(error: ClientManagerError) -> ErrorCode {
             | ClientLifecycleError::GenerationExhausted,
         )
         | ClientManagerError::InconsistentSlot
-        | ClientManagerError::Rollback { .. }
-        | ClientManagerError::SegmentState(_) => ErrorCode::InternalError,
+        | ClientManagerError::Rollback { .. } => ErrorCode::InternalError,
+        ClientManagerError::SegmentUnavailable(_) => ErrorCode::UnavailableInCurrentStatus,
+        ClientManagerError::SegmentState(
+            cakemaster::segment::error::SegmentStateError::OwnerMismatch { .. },
+        ) => ErrorCode::InvalidParams,
+        ClientManagerError::SegmentState(
+            cakemaster::segment::error::SegmentStateError::NotFound(segment),
+        ) => {
+            if segment.is_nil() {
+                ErrorCode::InvalidParams
+            } else {
+                ErrorCode::SegmentNotFound
+            }
+        }
+        ClientManagerError::SegmentState(
+            cakemaster::segment::error::SegmentStateError::StillAccepting(_)
+            | cakemaster::segment::error::SegmentStateError::Busy { .. },
+        ) => ErrorCode::UnavailableInCurrentStatus,
         ClientManagerError::Attach(AttachError::ConflictingSegmentId(_)) => {
             ErrorCode::SegmentAlreadyExists
         }
         ClientManagerError::Attach(_) | ClientManagerError::ActiveRemountConflict => {
             ErrorCode::InvalidParams
         }
+    }
+}
+
+fn mount_segment_error(error: ClientManagerError) -> ErrorCode {
+    match error {
+        ClientManagerError::ActiveRemountConflict
+        | ClientManagerError::Attach(AttachError::ConflictingSegmentId(_)) => {
+            ErrorCode::SegmentAlreadyExists
+        }
+        error => client_manager_error(error),
     }
 }
 

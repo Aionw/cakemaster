@@ -18,4 +18,7 @@ pub use lifecycle::{
     ActivateOutcome, CleanupReason, ClientCleanup, ClientRegistry, ClientSession, ClientState,
     ClientTick, HeartbeatOutcome,
 };
-pub use manager::{ClientCleanupReport, ClientManager, ClientManagerError};
+pub use manager::{
+    ClientCleanupReport, ClientManager, ClientManagerError, GracefulUnmountReport,
+    SegmentUnmountOutcome,
+};
