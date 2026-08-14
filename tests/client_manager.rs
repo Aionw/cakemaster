@@ -1,6 +1,7 @@
 use cakemaster::client::{
     ActivateOutcome, CleanupReason, ClientCleanupReport, ClientId, ClientLifecycleConfig,
     ClientManager, ClientManagerError, ClientState, ClientTick, HeartbeatOutcome,
+    SegmentUnmountOutcome,
 };
 use cakemaster::object::reclamation::CatalogTick;
 use cakemaster::object::{
@@ -142,6 +143,30 @@ fn activation_failure_restores_existing_quiesced_segments() {
         pool.segment(SegmentId::new(3, 1)).unwrap().stats().state,
         SegmentState::Quiesced
     );
+    assert_eq!(
+        clients.heartbeat(CLIENT, ClientTick::ZERO),
+        HeartbeatOutcome::NeedRemount
+    );
+}
+
+#[test]
+fn first_mount_activation_failure_removes_the_new_attachment() {
+    let config = ClientLifecycleConfig::new(1)
+        .with_ttl(10_000)
+        .with_cleanup_scan_budget(1);
+    let pool = Arc::new(SegmentPool::new());
+    let objects = ObjectManager::new(pool.clone());
+    let clients =
+        ClientManager::with_config(pool.clone(), objects.pending_write_revoker(), config).unwrap();
+    remount(&clients, ClientId::new(7, 99), Vec::new()).unwrap();
+
+    assert!(matches!(
+        clients.mount_segment(CLIENT, segment(1, 0x1000), ClientTick::ZERO),
+        Err(ClientManagerError::Lifecycle(
+            cakemaster::client::ClientLifecycleError::CapacityExceeded { max_clients: 1 }
+        ))
+    ));
+    assert!(pool.is_empty());
     assert_eq!(
         clients.heartbeat(CLIENT, ClientTick::ZERO),
         HeartbeatOutcome::NeedRemount
@@ -341,4 +366,217 @@ fn batch_drain_revokes_only_the_target_sessions() {
         )
         .unwrap();
     assert_eq!(objects.catalog().stats().pending_objects, 0);
+}
+
+#[test]
+fn mount_segment_establishes_a_session_and_appends_atomically() {
+    let (clients, pool) = client_manager(10_000);
+    let first = segment(1, 0x1000);
+    let second = segment(2, 0x3000);
+
+    let session = clients
+        .mount_segment(CLIENT, first.clone(), ClientTick::ZERO)
+        .unwrap()
+        .session();
+    assert!(matches!(
+        clients.mount_segment(CLIENT, second.clone(), ClientTick::new(1)),
+        Ok(ActivateOutcome::AlreadyActive(current)) if current == session
+    ));
+    assert!(matches!(
+        clients.mount_segment(CLIENT, second.clone(), ClientTick::new(2)),
+        Ok(ActivateOutcome::AlreadyActive(current)) if current == session
+    ));
+
+    let conflicting = segment(2, 0x5000);
+    assert!(matches!(
+        clients.mount_segment(CLIENT, conflicting, ClientTick::new(3)),
+        Err(ClientManagerError::ActiveRemountConflict)
+    ));
+    let overlapping = segment(3, 0x3800);
+    assert!(matches!(
+        clients.mount_segment(CLIENT, overlapping, ClientTick::new(4)),
+        Err(ClientManagerError::Attach(
+            AttachError::OverlappingAddressRange { existing }
+        )) if existing == second.identity().id()
+    ));
+    assert_eq!(pool.len(), 2);
+    assert_eq!(
+        pool.segment(second.identity().id()).unwrap().spec(),
+        &second
+    );
+}
+
+#[test]
+fn unmount_segment_only_removes_the_target_and_keeps_the_session_active() {
+    let (clients, pool) = client_manager(10_000);
+    let first = segment(1, 0x1000);
+    let second = segment(2, 0x3000);
+    let session = remount(&clients, CLIENT, vec![first.clone(), second.clone()])
+        .unwrap()
+        .session();
+
+    assert_eq!(
+        clients
+            .unmount_segment(CLIENT, first.identity().id())
+            .unwrap(),
+        SegmentUnmountOutcome::Unmounted
+    );
+    assert!(pool.segment(first.identity().id()).is_none());
+    assert!(pool.reserve_on(second.identity().id(), 512).is_ok());
+    assert_eq!(
+        clients.write_owner(CLIENT).unwrap(),
+        WriteOwner::for_session(session)
+    );
+    assert_eq!(
+        clients
+            .unmount_segment(CLIENT, first.identity().id())
+            .unwrap(),
+        SegmentUnmountOutcome::AlreadyAbsent
+    );
+}
+
+#[test]
+fn graceful_unmount_quiesces_now_and_invalidates_at_the_earliest_deadline() {
+    let (clients, pool) = client_manager(10_000);
+    let spec = segment(1, 0x1000);
+    let id = spec.identity().id();
+    clients
+        .mount_segment(CLIENT, spec, ClientTick::ZERO)
+        .unwrap();
+    let reservation = pool.reserve_on(id, 512).unwrap();
+
+    clients
+        .schedule_graceful_unmount(CLIENT, id, ClientTick::new(100))
+        .unwrap();
+    clients
+        .schedule_graceful_unmount(CLIENT, id, ClientTick::new(40))
+        .unwrap();
+    clients
+        .schedule_graceful_unmount(CLIENT, id, ClientTick::new(80))
+        .unwrap();
+    assert_eq!(
+        pool.segment(id).unwrap().stats().state,
+        SegmentState::Quiesced
+    );
+    assert!(reservation.is_live());
+    assert!(matches!(
+        pool.reserve_on(id, 1),
+        Err(cakemaster::segment::error::ReserveError::NotAccepting(current)) if current == id
+    ));
+    assert_eq!(
+        clients.next_graceful_unmount_deadline(),
+        Some(ClientTick::new(40))
+    );
+    assert_eq!(
+        clients.run_graceful_unmount_step(ClientTick::new(39)),
+        Default::default()
+    );
+    assert!(reservation.is_live());
+
+    let report = clients.run_graceful_unmount_step(ClientTick::new(40));
+    assert_eq!(report.completed, 1);
+    assert_eq!(report.stale_or_cancelled, 0);
+    assert_eq!(report.retried, 0);
+    assert!(!reservation.is_live());
+    assert!(pool.segment(id).is_none());
+}
+
+#[test]
+fn cancelled_graceful_job_cannot_remove_a_reused_segment_id() {
+    let (clients, pool) = client_manager(10_000);
+    let spec = segment(1, 0x1000);
+    let id = spec.identity().id();
+    clients
+        .mount_segment(CLIENT, spec.clone(), ClientTick::ZERO)
+        .unwrap();
+    clients
+        .schedule_graceful_unmount(CLIENT, id, ClientTick::new(100))
+        .unwrap();
+    clients.unmount_segment(CLIENT, id).unwrap();
+    clients
+        .mount_segment(CLIENT, spec, ClientTick::new(1))
+        .unwrap();
+
+    assert_eq!(clients.next_graceful_unmount_deadline(), None);
+    let report = clients.run_graceful_unmount_step(ClientTick::new(100));
+    assert_eq!(report.completed, 0);
+    assert_eq!(report.stale_or_cancelled, 1);
+    assert_eq!(report.retried, 0);
+    assert_eq!(
+        pool.segment(id).unwrap().stats().state,
+        SegmentState::Accepting
+    );
+}
+
+#[test]
+fn unexpected_graceful_transition_is_retried_after_100_ticks() {
+    let (clients, pool) = client_manager(10_000);
+    let spec = segment(1, 0x1000);
+    let id = spec.identity().id();
+    clients
+        .mount_segment(CLIENT, spec, ClientTick::ZERO)
+        .unwrap();
+    clients
+        .schedule_graceful_unmount(CLIENT, id, ClientTick::new(10))
+        .unwrap();
+
+    // Simulate an unexpected external transition after scheduling. The
+    // graceful worker restores quiescence but preserves the job for retry.
+    pool.reactivate(CLIENT, id).unwrap();
+    let first = clients.run_graceful_unmount_step(ClientTick::new(10));
+    assert_eq!(first.completed, 0);
+    assert_eq!(first.stale_or_cancelled, 0);
+    assert_eq!(first.retried, 1);
+    assert_eq!(
+        clients.next_graceful_unmount_deadline(),
+        Some(ClientTick::new(110))
+    );
+    assert_eq!(
+        pool.segment(id).unwrap().stats().state,
+        SegmentState::Quiesced
+    );
+
+    let second = clients.run_graceful_unmount_step(ClientTick::new(110));
+    assert_eq!(second.completed, 1);
+    assert_eq!(second.stale_or_cancelled, 0);
+    assert_eq!(second.retried, 0);
+    assert!(pool.segment(id).is_none());
+}
+
+#[test]
+fn segment_unmount_immediately_changes_object_read_liveness() {
+    let (clients, objects, _) = client_manager_with_objects(10_000);
+    let spec = segment(1, 0x1000);
+    let id = spec.identity().id();
+    clients
+        .mount_segment(CLIENT, spec, ClientTick::ZERO)
+        .unwrap();
+    let object = ObjectIdentity::new(NamespaceId::DEFAULT, "unmount-liveness");
+    let plan = ObjectPutPlan::new(
+        ObjectContent::new(512),
+        PlacementRequest::new(AllocationSpec::new(512), ReplicaPolicy::new(1)),
+    );
+    objects
+        .start_put(
+            object.clone(),
+            clients.write_admission(CLIENT).unwrap(),
+            plan,
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    objects
+        .finish_put(
+            &object,
+            clients.write_owner(CLIENT).unwrap(),
+            ReplicaSelector::All,
+        )
+        .unwrap();
+    assert!(objects.get(object.as_lookup(), CatalogTick::ZERO).is_ok());
+
+    clients.unmount_segment(CLIENT, id).unwrap();
+    assert!(matches!(
+        objects.get(object.as_lookup(), CatalogTick::ZERO),
+        Err(cakemaster::object::error::LookupError::NotFound)
+    ));
+    assert_eq!(objects.catalog().stats().published_objects, 1);
 }

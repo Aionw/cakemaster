@@ -377,6 +377,29 @@ impl ClientRegistry {
             .ok_or(ClientLifecycleError::ClientNotActive)
     }
 
+    /// Removes an exact session that was published by a resource transaction
+    /// which could not complete. Stale deadline records are discarded by the
+    /// normal generation check when they become due.
+    pub(crate) fn rollback_activation(
+        &self,
+        session: ClientSession,
+    ) -> Result<(), ClientLifecycleError> {
+        let mut registry = self.inner.state.lock();
+        let entry = registry
+            .entries
+            .get(&session.client_id)
+            .ok_or(ClientLifecycleError::ClientNotActive)?;
+        entry.ensure_session(session)?;
+        if !entry.is_active() {
+            return Err(ClientLifecycleError::CleanupInProgress {
+                state: entry.state(),
+            });
+        }
+        entry.guard.invalidate();
+        registry.entries.remove(&session.client_id);
+        Ok(())
+    }
+
     /// Fences a session and claims its cleanup when no worker owns it.
     pub fn begin_drain(
         &self,

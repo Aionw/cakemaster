@@ -1,11 +1,13 @@
 use cakemaster::client::{ClientId, ClientLifecycleConfig, ClientTick};
 use cakemaster::object::ObjectManager;
+use cakemaster::segment::stats::SegmentState;
 use cakemaster::segment::{SegmentId, SegmentPool};
 use cakemaster_proto::mooncake::{
     ClientStatus, ErrorCode, Segment, Uuid, WrappedMasterServiceClient, WrappedMasterServiceServer,
 };
-use cakemaster_server::{MasterClock, ObjectCatalogRpcService};
+use cakemaster_server::{MasterClock, MasterReconcileConfig, ObjectCatalogRpcService};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::oneshot;
 
 const CLIENT: ClientId = ClientId::new(11, 12);
@@ -84,4 +86,131 @@ async fn ping_remount_and_expiry_follow_client_session_state() {
 
     shutdown_tx.send(()).unwrap();
     server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_mount_unmount_and_graceful_unmount_follow_segment_lifecycle() {
+    let pool = Arc::new(SegmentPool::new());
+    let manager = Arc::new(ObjectManager::new(pool.clone()));
+    let service = ObjectCatalogRpcService::new(manager);
+    let reconciler = service.reconciler(MasterReconcileConfig::default());
+    let server = WrappedMasterServiceServer::new(service)
+        .into_rpc_server()
+        .unwrap();
+    let bound = server.bind("127.0.0.1:0").await.unwrap();
+    let address = bound.local_addr().unwrap();
+    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
+    let server_task = tokio::spawn(bound.run_until(async {
+        let _ = server_shutdown_rx.await;
+    }));
+    let (reconcile_shutdown_tx, reconcile_shutdown_rx) = oneshot::channel();
+    let reconcile_task = tokio::spawn(reconciler.run_until(async {
+        let _ = reconcile_shutdown_rx.await;
+    }));
+    let client = WrappedMasterServiceClient::connect(address).await.unwrap();
+    let client_id = Uuid {
+        high: CLIENT.high(),
+        low: CLIENT.low(),
+    };
+    let segment_id = Uuid {
+        high: SEGMENT.high(),
+        low: SEGMENT.low(),
+    };
+
+    assert_eq!(
+        client
+            .mount_segment(wire_segment(), client_id.clone())
+            .await
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        client
+            .mount_segment(wire_segment(), client_id.clone())
+            .await
+            .unwrap(),
+        Ok(())
+    );
+    let mut conflicting = wire_segment();
+    conflicting.size += 1;
+    assert_eq!(
+        client
+            .mount_segment(conflicting, client_id.clone())
+            .await
+            .unwrap(),
+        Err(ErrorCode::SegmentAlreadyExists)
+    );
+    assert_eq!(
+        client
+            .graceful_unmount_segment(Uuid { high: 99, low: 99 }, client_id.clone(), 10,)
+            .await
+            .unwrap(),
+        Err(ErrorCode::SegmentNotFound)
+    );
+    let wrong_client = Uuid { high: 44, low: 55 };
+    assert_eq!(
+        client
+            .unmount_segment(segment_id.clone(), wrong_client.clone())
+            .await
+            .unwrap(),
+        Err(ErrorCode::InvalidParams)
+    );
+    assert_eq!(
+        client
+            .graceful_unmount_segment(segment_id.clone(), wrong_client, 10)
+            .await
+            .unwrap(),
+        Err(ErrorCode::InvalidParams)
+    );
+
+    assert_eq!(
+        client
+            .graceful_unmount_segment(segment_id.clone(), client_id.clone(), 100)
+            .await
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        pool.segment(SEGMENT).unwrap().stats().state,
+        SegmentState::Quiesced
+    );
+    assert_eq!(
+        client
+            .mount_segment(wire_segment(), client_id.clone())
+            .await
+            .unwrap(),
+        Err(ErrorCode::UnavailableInCurrentStatus)
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while pool.segment(SEGMENT).is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(
+        client
+            .mount_segment(wire_segment(), client_id.clone())
+            .await
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        client
+            .unmount_segment(segment_id.clone(), client_id.clone())
+            .await
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        client.unmount_segment(segment_id, client_id).await.unwrap(),
+        Ok(())
+    );
+    assert!(pool.is_empty());
+
+    server_shutdown_tx.send(()).unwrap();
+    reconcile_shutdown_tx.send(()).unwrap();
+    server_task.await.unwrap().unwrap();
+    reconcile_task.await.unwrap();
 }

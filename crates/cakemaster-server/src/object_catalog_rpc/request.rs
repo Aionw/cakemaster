@@ -129,6 +129,10 @@ pub(super) fn client_id_from_uuid(client_id: &Uuid) -> ClientId {
     ClientId::new(client_id.high, client_id.low)
 }
 
+pub(super) fn segment_id_from_uuid(segment_id: &Uuid) -> SegmentId {
+    SegmentId::new(segment_id.high, segment_id.low)
+}
+
 pub(super) fn segment_spec_from_wire(
     segment: Segment,
     owner: ClientId,

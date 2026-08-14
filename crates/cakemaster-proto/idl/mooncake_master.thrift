@@ -230,10 +230,26 @@ service WrappedMasterService {
     1: required UUID client_id
   ) (coro_rpc.name = "mooncake::WrappedMasterService::Ping")
 
+  ExpectedVoid MountSegment(
+    1: required Segment segment,
+    2: required UUID client_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::MountSegment")
+
   ExpectedVoid ReMountSegment(
     1: required list<Segment> segments,
     2: required UUID client_id
   ) (coro_rpc.name = "mooncake::WrappedMasterService::ReMountSegment")
+
+  ExpectedVoid UnmountSegment(
+    1: required UUID segment_id,
+    2: required UUID client_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::UnmountSegment")
+
+  ExpectedVoid GracefulUnmountSegment(
+    1: required UUID segment_id,
+    2: required UUID client_id,
+    3: required u64 grace_period_ms
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::GracefulUnmountSegment")
 
   ExpectedBool ExistKey(
     1: required string key,

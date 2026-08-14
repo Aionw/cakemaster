@@ -2,6 +2,7 @@
 
 use cakemaster::client::ClientTick;
 use cakemaster::object::reclamation::CatalogTick;
+use std::time::Duration;
 use tokio::time::Instant;
 
 /// A cloneable time origin for catalog leases, deadlines, and maintenance.
@@ -27,6 +28,10 @@ impl MasterClock {
 
     pub fn client_now(&self) -> ClientTick {
         ClientTick::new(self.elapsed_millis())
+    }
+
+    pub(crate) fn delay_until_client_tick(&self, deadline: ClientTick) -> Duration {
+        Duration::from_millis(deadline.get().saturating_sub(self.client_now().get()))
     }
 
     fn elapsed_millis(&self) -> u64 {

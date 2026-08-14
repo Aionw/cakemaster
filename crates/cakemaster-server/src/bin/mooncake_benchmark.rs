@@ -14,6 +14,9 @@ use futures_util::future::join_all;
 use tokio::runtime::Builder;
 
 const EXIST_KEY: &str = "mooncake::WrappedMasterService::ExistKey";
+const MOUNT_SEGMENT: &str = "mooncake::WrappedMasterService::MountSegment";
+const UNMOUNT_SEGMENT: &str = "mooncake::WrappedMasterService::UnmountSegment";
+const GRACEFUL_UNMOUNT_SEGMENT: &str = "mooncake::WrappedMasterService::GracefulUnmountSegment";
 const GET_REPLICA_LIST: &str = "mooncake::WrappedMasterService::GetReplicaList";
 const BATCH_EXIST_KEY: &str = "mooncake::WrappedMasterService::BatchExistKey";
 const BATCH_GET_REPLICA_LIST: &str = "mooncake::WrappedMasterService::BatchGetReplicaList";
@@ -32,6 +35,9 @@ type BatchPutStartResponse = Vec<ExpectedReplicaDescriptors>;
 type BatchPutEndRequest = (Uuid, Vec<ObjectMeta>, ReplicaType, String);
 type BatchPutRevokeRequest = (Uuid, Vec<String>, ReplicaType, String);
 type BatchVoidResponse = Vec<ExpectedVoid>;
+type MountSegmentRequest = (Segment, Uuid);
+type UnmountSegmentRequest = (Uuid, Uuid);
+type GracefulUnmountSegmentRequest = (Uuid, Uuid, u64);
 
 #[derive(Clone, Copy)]
 enum Operation {
@@ -92,10 +98,35 @@ impl WrappedMasterService for BenchmarkMasterService {
         }))
     }
 
+    async fn mount_segment(
+        &self,
+        _segment: Segment,
+        _client_id: Uuid,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        Ok(Ok(()))
+    }
+
     async fn re_mount_segment(
         &self,
         _segments: Vec<Segment>,
         _client_id: Uuid,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        Ok(Ok(()))
+    }
+
+    async fn unmount_segment(
+        &self,
+        _segment_id: Uuid,
+        _client_id: Uuid,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        Ok(Ok(()))
+    }
+
+    async fn graceful_unmount_segment(
+        &self,
+        _segment_id: Uuid,
+        _client_id: Uuid,
+        _grace_period_ms: u64,
     ) -> Result<ExpectedVoid, RpcFailure> {
         Ok(Ok(()))
     }
@@ -241,6 +272,9 @@ fn print_metadata() {
     print_type::<BatchPutEndRequest>("batch_put_end_request");
     print_type::<BatchPutRevokeRequest>("batch_put_revoke_request");
     print_type::<BatchVoidResponse>("batch_void_response");
+    print_type::<MountSegmentRequest>("mount_segment_request");
+    print_type::<UnmountSegmentRequest>("unmount_segment_request");
+    print_type::<GracefulUnmountSegmentRequest>("graceful_unmount_segment_request");
     print_bytes(
         "batch_put_end_sample",
         &serialize(&(
@@ -276,6 +310,12 @@ fn print_metadata() {
     println!("batch_put_start_route={}", function_id(BATCH_PUT_START));
     println!("batch_put_end_route={}", function_id(BATCH_PUT_END));
     println!("batch_put_revoke_route={}", function_id(BATCH_PUT_REVOKE));
+    println!("mount_segment_route={}", function_id(MOUNT_SEGMENT));
+    println!("unmount_segment_route={}", function_id(UNMOUNT_SEGMENT));
+    println!(
+        "graceful_unmount_segment_route={}",
+        function_id(GRACEFUL_UNMOUNT_SEGMENT)
+    );
 }
 
 fn print_type<T: StructPack>(label: &str) {

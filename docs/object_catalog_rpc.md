@@ -2,7 +2,8 @@
 
 这条接口只把 Mooncake `WrappedMasterService` 的元数据 RPC 接到现有领域层，不在 RPC
 handler 中复制 catalog、placement 或事务规则。当前实现提供 client lifecycle 的
-`Ping`、`ReMountSegment`，单 key `ExistKey`、`GetReplicaList`，以及
+`Ping`、`MountSegment`、`ReMountSegment`、`UnmountSegment`、
+`GracefulUnmountSegment`，单 key `ExistKey`、`GetReplicaList`，以及
 `BatchExistKey`、`BatchGetReplicaList`、`BatchPutStart`、`BatchPutEnd` 和
 `BatchPutRevoke`。
 
@@ -10,7 +11,7 @@ handler 中复制 catalog、placement 或事务规则。当前实现提供 clien
 
 ```text
 async WrappedMasterService handler
-        ├── Ping / ReMountSegment → ClientManager → ClientRegistry + SegmentPool
+        ├── Ping / segment lifecycle → ClientManager → ClientRegistry + SegmentPool
         └── object RPC → ObjectManager / TenantObjectManager
                          ├── ObjectCatalog：key 生命周期、owner、lease、回收状态
                          └── ReplicaAllocator：placement 与 SegmentPool reservation
@@ -28,16 +29,22 @@ tenant、调用领域 batch API 并映射返回值。RPC 与后台 controller �
 不同时间原点产生的 `CatalogTick` 交给同一个 manager。批内每个 key 独立成功或失败，
 只有连接/编解码失败才返回 transport-level `RpcFailure`。
 
-`Ping` 和 `ReMountSegment` 使用同一个 core `ClientManager`：前者只刷新已有 session 的
+所有 client/segment lifecycle RPC 使用同一个 core `ClientManager`：`Ping` 只刷新已有 session 的
 heartbeat，未知 client 返回 `NEED_REMOUNT`；后者把 wire segment 转成 `SegmentSpec`，
 在 per-client 锁下完成 attach/reactivate 与 session 激活，失败时回滚本次资源变更。
 segment 全部 reactivate 后才发布 active session，因此 object write 不会观察到半挂载状态。
+`MountSegment` 也允许 absent client 原子建立首次 session，active client 则可动态追加；
+普通 `UnmountSegment` 立即 quiesce/remove 目标 segment，但保留 client session 和其他
+segment。`GracefulUnmountSegment` 立即 quiesce，在 grace window 内保留已有 replica 的
+liveness，到期后才 remove；它不等待 allocation 清零，也不执行数据迁移。
 
 每次 RPC 的 maintenance candidate budget 至少等于当前 batch item 数，因此批量写入
 不会固定每批加入 333 个 timeout candidate、却长期只清理默认的 64 个；reclaim 和空
 slot budget 仍使用固定上限。没有请求时，composition root 可从 service 构造
-`MasterReconciler`，默认每 100ms 先执行一轮 client cleanup，再执行有界 object
-maintenance。它使用 `MissedTickBehavior::Skip` 且由调用方显式运行和停止；同步
+`MasterReconciler`，默认每 100ms 依次执行 client cleanup、到期 Graceful unmount 和
+有界 object maintenance。RPC service 与 reconciler 共享 `Notify`：新增或提前 deadline
+会重算 timer，因此 Graceful 不受 100ms 周期量化。它使用 `MissedTickBehavior::Skip` 且
+由调用方显式运行、停止并 join；同步
 领域 manager 和单个 handler 不会隐式启动后台任务。
 
 服务类型为 `ObjectCatalogRpcService<B>`，默认 backend 是 `ObjectManager`。RPC
@@ -121,7 +128,10 @@ pending write、淘汰、物理回收和空 slot；它不会在一次调用中�
 | `ObjectMeta.object_checksum=Some(...)` | `INVALID_PARAMS` |
 | Get/BatchGet checksum | 永远返回 `None` |
 | `Ping` | 返回 view version；已激活 session 为 `OK`，其余为 `NEED_REMOUNT` |
+| `MountSegment` | absent client 原子建立 session；active client 动态追加；相同配置幂等，冲突返回 `SEGMENT_ALREADY_EXISTS` |
 | `ReMountSegment` | 支持 Memory/CXL segment 的原子激活与幂等重挂载；NoF 和冲突配置返回错误 |
+| `UnmountSegment` | 立即摘除单个 segment；不存在幂等成功，client session 保持 active |
+| `GracefulUnmountSegment` | 立即停止新分配并在 grace deadline 摘除；不存在返回 `SEGMENT_NOT_FOUND`；依赖显式运行的 `MasterReconciler` |
 | tenant id（single 构造） | 忽略并统一映射到 `NamespaceId::DEFAULT` |
 | tenant id（multi 构造） | 映射到隔离 namespace；未知租户和超额分别返回现有 tenant 错误码 |
 

@@ -126,11 +126,11 @@ Registry 只持有正在建立服务关系或等待清理的 entry；完全移�
 不能再被 heartbeat 改回 `Active`。清理完成后删除 entry；下一次 remount 才创建更高
 generation 的 session。
 
-普通 `MountSegment` 应只服务 active client。首次连接和 TTL 后恢复走
-`ReMountSegment`；仅挂载 LocalSSD 的 client 可以由成功的
-`MountLocalDiskSegment` 建立 session。如果实际 C++ 初始化路径还会对 absent client
-直接调用 `MountSegment`，RPC adapter 可以把该调用路由到同一个“建立 session”事务，
-但不能让普通 `Ping` 或 object RPC 隐式注册 client。
+`MountSegment` 对 active client 动态追加单个 segment；对 absent client 则显式执行
+`attach_quiesced → activate session → reactivate` 的首次建立事务，任何失败都会回滚本次
+attachment/session。TTL 进入 `Expired` 后仍必须先完成 cleanup，随后
+`MountSegment` 或 `ReMountSegment` 才能创建更高 generation。普通 `Ping` 和 object RPC
+不会隐式注册 client。
 
 ## 时间与 TTL
 
@@ -340,8 +340,9 @@ per-client mutex，mount slot 也只在 register/remount 路径创建，或使�
 删除 registry entry 再留下仍可分配的孤儿资源。
 
 `ClientManager::run_cleanup_step` 已实现 1 到 7 和 9 的同步单轮入口；
-server 层的 `MasterReconciler` 默认每 100ms 显式调度一轮 client cleanup 和
-object maintenance，但仍由 composition root 统一管理其启动、shutdown 和 join。
+server 层的 `MasterReconciler` 默认每 100ms 显式调度一轮 client cleanup、Graceful
+unmount 和 object maintenance；RPC 新增或提前 Graceful deadline 时会通过共享 `Notify`
+精确唤醒重算 timer，但仍由 composition root 统一管理其启动、shutdown 和 join。
 task ledger 和 LocalSSD workflow 尚未接入。cleanup 完成表示资源已经逻辑失效，
 不表示所有外部 object handle 都已释放或物理回收结束。
 
@@ -365,10 +366,17 @@ object lifecycle CAS 竞争，谁先成功谁决定最终状态，完整 `(Clien
 
 ### 主动卸载与 shutdown
 
-最后一个 segment 主动卸载或 server graceful shutdown 时，使用相同流程，但状态为
-`Draining`，reason 分别为 `GracefulUnmount` 或 `ServerShutdown`。进入 Draining 后
-不接受新工作；已经进入同步 handler 的有界操作可以完成，随后 cleanup worker 统一
-收尾。
+单 segment 的普通 `UnmountSegment` 不进入 client `Draining`：它只校验当前 session、
+slot 与 owner，然后立即 `quiesce → remove`，其他 segment 和 session 继续可用。
+`GracefulUnmountSegment` 同样不关闭 client session；它立即 quiesce，并以
+`(ClientSession, SegmentId)` 保存最早 deadline。deadline 只持有弱 incarnation token，
+到期时同时校验 session generation 与 segment incarnation，避免旧任务删除复用相同 ID
+的新挂载。普通 unmount 和 client expiry 都会取消 pending job。
+
+整个 client 或 server graceful shutdown 才进入 `Draining`，reason 使用
+`GracefulUnmount` 或 `ServerShutdown`。进入 Draining 后不接受新工作；已经进入同步
+handler 的有界操作可以完成，随后 cleanup worker 统一收尾。segment deadline 由显式
+运行的 `MasterReconciler` 驱动，不在 RPC handler 内启动独立 worker。
 
 ## 与 TaskQueue 的连接
 
