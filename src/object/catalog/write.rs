@@ -16,12 +16,13 @@
 //! revalidates both index membership and the current pointer before returning.
 
 use super::*;
+use std::collections::HashSet;
 
 impl ObjectCatalog {
     pub fn claim_put(
         &self,
         identity: ObjectIdentity,
-        owner: WriteOwner,
+        admission: WriteAdmission,
         now: CatalogTick,
     ) -> Result<PutClaim, PutError> {
         if identity.key().is_empty() {
@@ -38,7 +39,7 @@ impl ObjectCatalog {
                 Entry::Occupied(entry) => entry.get().clone(),
                 Entry::Vacant(entry) => {
                     let id = WriteId::new(1);
-                    let node = Arc::new(CatalogNode::claimed(id, owner));
+                    let node = Arc::new(CatalogNode::claimed(id, admission.owner()));
                     // Publish an already-claimed slot into the index so the
                     // fresh-key fast path never invokes an ArcSwap writer.
                     let slot = Arc::new(ObjectSlot {
@@ -56,7 +57,7 @@ impl ObjectCatalog {
                         node: Some(node),
                         identity: slot.identity.clone(),
                         id,
-                        owner,
+                        admission: admission.clone(),
                         started_at: now,
                     });
                 }
@@ -76,7 +77,7 @@ impl ObjectCatalog {
             }
 
             let id = slot.next_write_id();
-            let node = Arc::new(CatalogNode::claimed(id, owner));
+            let node = Arc::new(CatalogNode::claimed(id, admission.owner()));
             let previous = slot
                 .current
                 .compare_and_swap(&None::<Arc<CatalogNode>>, Some(node.clone()));
@@ -98,7 +99,7 @@ impl ObjectCatalog {
                     node: Some(node),
                     identity: slot.identity.clone(),
                     id,
-                    owner,
+                    admission,
                     started_at: now,
                 });
             }
@@ -167,6 +168,12 @@ impl ObjectCatalog {
                     .collector
                     .young
                     .push(GcCandidate::new(&slot, &ticket.node));
+                if !ticket.node.record().replicas.is_live() {
+                    self.inner
+                        .collector
+                        .liveness_scan_requested
+                        .store(true, Ordering::Release);
+                }
                 Ok(ObjectHandle {
                     node: ticket.node.clone(),
                 })
@@ -211,6 +218,23 @@ impl ObjectCatalog {
         }
         self.inner.retire_pending(slot, ticket.node.clone(), now);
         Ok(())
+    }
+
+    /// Revokes every currently pending write owned by the fenced sessions.
+    ///
+    /// Callers fence every owner before invoking this method. Races with an
+    /// already-publishing write are resolved by the lifecycle CAS: either
+    /// publication or revocation wins.
+    pub(in super::super) fn revoke_pending_owners(
+        &self,
+        owners: impl IntoIterator<Item = WriteOwner>,
+        now: CatalogTick,
+    ) -> usize {
+        let owners: HashSet<_> = owners
+            .into_iter()
+            .filter(|owner| owner.session_generation() != 0)
+            .collect();
+        self.inner.revoke_pending_owners(&owners, now)
     }
 
     pub(in super::super) fn inspect_write(
@@ -259,8 +283,8 @@ impl PutClaim {
         &self.identity
     }
 
-    pub const fn owner(&self) -> WriteOwner {
-        self.owner
+    pub fn owner(&self) -> WriteOwner {
+        self.admission.owner()
     }
 
     pub fn stage(
@@ -286,6 +310,9 @@ impl PutClaim {
         replicas: ReplicaSet,
         accounting: Option<QuotaReservationGuard>,
     ) -> Result<PutTicket, StageError> {
+        if !self.admission.is_active() {
+            return Err(StageError::OwnerInactive);
+        }
         if content.logical_bytes() == 0 {
             return Err(StageError::ZeroSize);
         }
@@ -319,7 +346,7 @@ impl PutClaim {
             return Err(StageError::ClaimLost);
         }
         if node.control.write_id != self.id
-            || node.control.owner != self.owner
+            || node.control.owner != self.admission.owner()
             || node.control.lifecycle.load(Ordering::Acquire) != OBJECT_CLAIMED
         {
             return Err(StageError::ClaimLost);
@@ -356,12 +383,32 @@ impl PutClaim {
         catalog.lifecycle.on_stage(reserved_bytes);
         let node = node.clone();
         let candidate = GcCandidate::new(&slot, &node);
+        // Session cleanup takes the exclusive side of this gate before
+        // snapshotting the queue. Concurrent stages share the read side.
+        let _stage = catalog.collector.pending_stage_gate.read();
         catalog.collector.pending.push(PendingCandidate {
             candidate,
             deadline: self
                 .started_at
                 .saturating_add(catalog.config.pending_timeout_ticks),
         });
+        // Cleanup fences the guard before scanning the pending queue. Enqueue
+        // first so cleanup either sees this node or this side revokes it.
+        if !self.admission.is_active() {
+            let ticket = PutTicket {
+                catalog: Arc::downgrade(&catalog),
+                slot: Arc::downgrade(&slot),
+                node: node.clone(),
+                id: self.id,
+            };
+            self.node = None;
+            let _ = ObjectCatalog {
+                inner: catalog.clone(),
+            }
+            .revoke(&ticket, self.started_at);
+            return Err(StageError::OwnerInactive);
+        }
+
         self.node = None;
 
         Ok(PutTicket {
@@ -397,7 +444,7 @@ impl fmt::Debug for PutClaim {
             .debug_struct("PutClaim")
             .field("identity", &self.identity)
             .field("id", &self.id)
-            .field("owner", &self.owner)
+            .field("owner", &self.admission.owner())
             .finish_non_exhaustive()
     }
 }

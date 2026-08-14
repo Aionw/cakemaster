@@ -4,7 +4,7 @@ use cakemaster::object::reclamation::CatalogTick;
 use cakemaster::object::{
     NamespaceId, ObjectCatalogConfig, ObjectContent, ObjectIdentity, ObjectKind, ObjectManager,
     ObjectPutPlan, ReplicaSelector, ResolvedTenant, TenantConfig, TenantId, TenantObjectManager,
-    TenantPolicy, TenantPutRequest, TenantQuotaLimits, WriteOwner,
+    TenantPolicy, TenantPutRequest, TenantQuotaLimits, WriteAdmission, WriteOwner,
 };
 use cakemaster::segment::placement::{
     AllocationSpec, FulfillmentPolicy, PlacementRequest, ReplicaPolicy,
@@ -290,7 +290,7 @@ fn benchmark_raw_put(batch_size: usize, items: usize, round: usize) -> Sample {
                 let (key, plan) = request.into_parts();
                 manager.start_put(
                     ObjectIdentity::new(NamespaceId::DEFAULT, key),
-                    owner(),
+                    admission(),
                     plan,
                     CatalogTick::ZERO,
                 )
@@ -351,7 +351,7 @@ fn benchmark_tenant_put(
         let batch_started = Instant::now();
         for result in manager.start_put_batch(
             &tenants[batch.tenant],
-            owner(),
+            admission(),
             batch.requests,
             CatalogTick::ZERO,
         ) {
@@ -419,7 +419,7 @@ fn benchmark_raw_put_breakdown(items: usize, round: usize) -> PutBreakdownSample
                 let (key, plan) = request.into_parts();
                 manager.start_put(
                     ObjectIdentity::new(NamespaceId::DEFAULT, key),
-                    owner(),
+                    admission(),
                     plan,
                     CatalogTick::ZERO,
                 )
@@ -484,7 +484,7 @@ fn benchmark_tenant_put_breakdown(
         let phase_started = Instant::now();
         for result in manager.start_put_batch(
             &tenants[batch.tenant],
-            owner(),
+            admission(),
             batch.requests,
             CatalogTick::ZERO,
         ) {
@@ -587,7 +587,7 @@ fn preload_raw(manager: &ObjectManager) -> Vec<ObjectIdentity> {
         .map(|index| {
             let identity = ObjectIdentity::new(NamespaceId::DEFAULT, format!("hot-{index}"));
             manager
-                .start_put(identity.clone(), owner(), plan(), CatalogTick::ZERO)
+                .start_put(identity.clone(), admission(), plan(), CatalogTick::ZERO)
                 .unwrap();
             manager
                 .finish_put(&identity, owner(), ReplicaSelector::All)
@@ -610,7 +610,7 @@ fn preload_multi(
                 .map(|index| {
                     let key: Arc<str> = format!("hot-{tenant_index}-{index}").into();
                     manager
-                        .start_put(tenant, key.clone(), owner(), plan(), CatalogTick::ZERO)
+                        .start_put(tenant, key.clone(), admission(), plan(), CatalogTick::ZERO)
                         .unwrap();
                     manager
                         .finish_put(tenant, &key, owner(), ReplicaSelector::All)
@@ -659,6 +659,10 @@ fn plan() -> ObjectPutPlan {
 
 fn owner() -> WriteOwner {
     WriteOwner::new(OWNER)
+}
+
+fn admission() -> WriteAdmission {
+    WriteAdmission::unmanaged(OWNER)
 }
 
 fn median_sample(mut samples: Vec<Sample>) -> Sample {

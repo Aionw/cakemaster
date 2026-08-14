@@ -9,8 +9,8 @@ pub enum ClientLifecycleConfigError {
     ZeroTtl,
     #[error("`max_clients` must be greater than zero")]
     ZeroMaxClients,
-    #[error("`maintenance_budget` must be greater than zero")]
-    ZeroMaintenanceBudget,
+    #[error("`cleanup_scan_budget` must be greater than zero")]
+    ZeroCleanupScanBudget,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

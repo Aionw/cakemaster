@@ -4,7 +4,8 @@ use cakemaster::object::error::{
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     DirectReplica, LocalSsdReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit,
-    ObjectContent, ObjectIdentity, ObjectLookup, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
+    ObjectContent, ObjectIdentity, ObjectLookup, ReplicaId, ReplicaLease, ReplicaSet,
+    WriteAdmission, WriteOwner,
 };
 use cakemaster::segment::placement::{
     AllocationSpec, PlacementRequest, ReplicaAllocator, ReplicaPolicy,
@@ -37,6 +38,10 @@ fn identity(key: impl Into<Arc<str>>) -> ObjectIdentity {
 
 fn owner() -> WriteOwner {
     WriteOwner::new(OWNER)
+}
+
+fn admission() -> WriteAdmission {
+    WriteAdmission::unmanaged(OWNER)
 }
 
 fn replica(pool: &SegmentPool, bytes: u64) -> ReplicaSet {
@@ -146,7 +151,11 @@ fn pending_object_reclamation_releases_local_ssd_capacity() {
     )
     .unwrap();
     let ticket = catalog
-        .claim_put(identity("local-ssd-pending"), owner(), CatalogTick::ZERO)
+        .claim_put(
+            identity("local-ssd-pending"),
+            admission(),
+            CatalogTick::ZERO,
+        )
         .unwrap()
         .stage(ObjectContent::new(4096), replicas)
         .unwrap();
@@ -170,17 +179,17 @@ fn dropped_claim_reopens_the_stable_slot() {
     .unwrap();
 
     let first = catalog
-        .claim_put(identity("same-key"), owner(), CatalogTick::new(1))
+        .claim_put(identity("same-key"), admission(), CatalogTick::new(1))
         .unwrap();
     assert!(matches!(
-        catalog.claim_put(identity("same-key"), owner(), CatalogTick::new(1)),
+        catalog.claim_put(identity("same-key"), admission(), CatalogTick::new(1)),
         Err(PutError::WriteInProgress)
     ));
     let first_id = first.id();
     drop(first);
 
     let second = catalog
-        .claim_put(identity("same-key"), owner(), CatalogTick::new(2))
+        .claim_put(identity("same-key"), admission(), CatalogTick::new(2))
         .unwrap();
     assert!(second.id().generation() > first_id.generation());
     drop(second);
@@ -201,7 +210,7 @@ fn publish_lookup_remove_and_reclaim_preserve_lease_and_ownership() {
     .unwrap();
     let object = identity("published");
     let ticket = catalog
-        .claim_put(object.clone(), owner(), CatalogTick::ZERO)
+        .claim_put(object.clone(), admission(), CatalogTick::ZERO)
         .unwrap()
         .stage(ObjectContent::new(4096), replica(&pool, 4096))
         .unwrap();
@@ -268,7 +277,7 @@ fn pending_timeout_reclaims_memory_without_a_batch_pause() {
     .unwrap();
     let object = identity("abandoned-write");
     let ticket = catalog
-        .claim_put(object.clone(), owner(), CatalogTick::ZERO)
+        .claim_put(object.clone(), admission(), CatalogTick::ZERO)
         .unwrap()
         .stage(ObjectContent::new(1024), replica(&pool, 1024))
         .unwrap();
@@ -292,12 +301,12 @@ fn pending_expiration_has_no_future_deadline_head_of_line_blocking() {
     let catalog =
         ObjectCatalog::with_config(ObjectCatalogConfig::new(16).with_pending_timeout(10)).unwrap();
     let future = catalog
-        .claim_put(identity("future"), owner(), CatalogTick::new(100))
+        .claim_put(identity("future"), admission(), CatalogTick::new(100))
         .unwrap()
         .stage(ObjectContent::new(1024), replica(&pool, 1024))
         .unwrap();
     let expired = catalog
-        .claim_put(identity("expired"), owner(), CatalogTick::ZERO)
+        .claim_put(identity("expired"), admission(), CatalogTick::ZERO)
         .unwrap()
         .stage(ObjectContent::new(1024), replica(&pool, 1024))
         .unwrap();
@@ -320,7 +329,7 @@ fn invalid_staging_rolls_back_claim_and_reservation_by_raii() {
     let catalog = ObjectCatalog::new();
     let object = identity("undersized");
     let result = catalog
-        .claim_put(object.clone(), owner(), CatalogTick::ZERO)
+        .claim_put(object.clone(), admission(), CatalogTick::ZERO)
         .unwrap()
         .stage(ObjectContent::new(4096), replica(&pool, 1024));
 
@@ -336,7 +345,7 @@ fn invalid_staging_rolls_back_claim_and_reservation_by_raii() {
     assert_eq!(catalog.stats().claims, 0);
     assert!(
         catalog
-            .claim_put(object, owner(), CatalogTick::new(1))
+            .claim_put(object, admission(), CatalogTick::new(1))
             .is_ok()
     );
 }
@@ -349,12 +358,12 @@ fn invalidated_segment_replicas_cannot_be_staged_or_published() {
     let stage_object = identity("invalidate-before-stage");
 
     let ticket = catalog
-        .claim_put(publish_object, owner(), CatalogTick::ZERO)
+        .claim_put(publish_object, admission(), CatalogTick::ZERO)
         .unwrap()
         .stage(ObjectContent::new(1024), replica(&pool, 1024))
         .unwrap();
     let claim = catalog
-        .claim_put(stage_object, owner(), CatalogTick::ZERO)
+        .claim_put(stage_object, admission(), CatalogTick::ZERO)
         .unwrap();
     let unstaged_replicas = replica(&pool, 1024);
 
@@ -384,7 +393,7 @@ fn reclamation_promotes_recent_objects_and_defers_pinned_resources() {
     let cold = identity("cold");
 
     let hot_ticket = catalog
-        .claim_put(hot.clone(), owner(), CatalogTick::ZERO)
+        .claim_put(hot.clone(), admission(), CatalogTick::ZERO)
         .unwrap()
         .stage(ObjectContent::new(4096), replica(&pool, 4096))
         .unwrap();
@@ -392,7 +401,7 @@ fn reclamation_promotes_recent_objects_and_defers_pinned_resources() {
         .publish(&hot_ticket, ObjectCommit::default())
         .unwrap();
     let cold_ticket = catalog
-        .claim_put(cold.clone(), owner(), CatalogTick::ZERO)
+        .claim_put(cold.clone(), admission(), CatalogTick::ZERO)
         .unwrap()
         .stage(ObjectContent::new(4096), replica(&pool, 4096))
         .unwrap();
@@ -462,7 +471,11 @@ fn high_concurrency_put_get_and_incremental_collection_leave_no_resources() {
                     if operation & 1 == 0 {
                         let key = format!("object-{sequence}");
                         let ticket = catalog
-                            .claim_put(identity(key), owner(), CatalogTick::new(operation as u64))
+                            .claim_put(
+                                identity(key),
+                                admission(),
+                                CatalogTick::new(operation as u64),
+                            )
                             .unwrap()
                             .stage(ObjectContent::new(64), replica(&pool, 64))
                             .unwrap();

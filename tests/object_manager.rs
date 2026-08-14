@@ -2,7 +2,7 @@ use cakemaster::object::error::{LookupError, ObjectManagerError};
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     NamespaceId, ObjectCatalogConfig, ObjectContent, ObjectIdentity, ObjectKind, ObjectManager,
-    ObjectPutPlan, ReplicaSelector, WriteOwner,
+    ObjectPutPlan, ReplicaSelector, WriteAdmission, WriteOwner,
 };
 use cakemaster::segment::placement::{
     AllocationSpec, FulfillmentPolicy, PlacementRequest, ReplicaPolicy,
@@ -49,6 +49,10 @@ fn owner(client: ClientId) -> WriteOwner {
     WriteOwner::new(client)
 }
 
+fn admission(client: ClientId) -> WriteAdmission {
+    WriteAdmission::unmanaged(client)
+}
+
 fn plan(
     bytes: u64,
     replicas: usize,
@@ -73,7 +77,7 @@ fn manager_owns_the_complete_pending_to_published_lifecycle() {
     let started = manager
         .start_put(
             object.clone(),
-            owner(OWNER),
+            admission(OWNER),
             plan(4096, 1, ReplicaClass::Memory, FulfillmentPolicy::BestEffort),
             CatalogTick::ZERO,
         )
@@ -139,7 +143,7 @@ fn manager_owns_the_complete_pending_to_published_lifecycle() {
 }
 
 #[test]
-fn published_objects_observe_segment_invalidation_without_catalog_retirement() {
+fn published_objects_become_invisible_and_are_retired_after_segment_invalidation() {
     let pool = pool(true, false);
     let segment = pool.segment(MEMORY_ID).unwrap();
     let manager = ObjectManager::new(pool.clone());
@@ -148,7 +152,7 @@ fn published_objects_observe_segment_invalidation_without_catalog_retirement() {
     manager
         .start_put(
             object.clone(),
-            owner(OWNER),
+            admission(OWNER),
             plan(
                 4096,
                 1,
@@ -170,18 +174,53 @@ fn published_objects_observe_segment_invalidation_without_catalog_retirement() {
     assert!(pool.segment(MEMORY_ID).is_none());
     assert!(!read.is_live());
 
-    // Liveness is observational in this focused change. Catalog retirement
-    // and key replacement remain governed by the existing catalog policy.
-    let reread = manager
-        .get(object.as_lookup(), CatalogTick::new(2))
-        .unwrap();
-    assert!(!reread.is_live());
+    assert!(matches!(
+        manager.get(object.as_lookup(), CatalogTick::new(2)),
+        Err(cakemaster::object::error::LookupError::NotFound)
+    ));
+    assert!(!manager.exists(object.as_lookup(), CatalogTick::new(2)));
     assert_eq!(manager.catalog().stats().published_objects, 1);
 
+    let report = manager.maintenance(CatalogTick::new(2), CollectBudget::new(8, 8, 0));
+    assert_eq!(report.catalog.invalidated_published, 1);
+    assert_eq!(manager.catalog().stats().published_objects, 0);
     drop(read);
-    drop(reread);
+    let report = manager.maintenance(CatalogTick::new(3), CollectBudget::new(0, 8, 0));
+    assert_eq!(report.catalog.reclaimed_objects, 1);
     drop(manager);
     assert_eq!(segment.stats().usage.active_allocations, 0);
+}
+
+#[test]
+fn bounded_liveness_scan_does_not_skip_objects_promoted_between_generations() {
+    let pool = pool(true, false);
+    let manager = ObjectManager::new(pool.clone());
+    let first = identity("recent-before-invalidation");
+    let second = identity("unscanned-before-invalidation");
+    for object in [&first, &second] {
+        manager
+            .start_put(
+                object.clone(),
+                admission(OWNER),
+                plan(1, 1, ReplicaClass::Memory, FulfillmentPolicy::AllOrNothing),
+                CatalogTick::ZERO,
+            )
+            .unwrap();
+        manager
+            .finish_put(object, owner(OWNER), ReplicaSelector::All)
+            .unwrap();
+    }
+    let _recent = manager.get(first.as_lookup(), CatalogTick::ZERO).unwrap();
+    pool.invalidate_owner(OWNER);
+
+    let first_step = manager.maintenance(CatalogTick::new(1), CollectBudget::new(1, 0, 0));
+    assert_eq!(first_step.catalog.scanned_candidates, 1);
+    assert_eq!(manager.catalog().stats().liveness_scan_remaining, 1);
+    let second_step = manager.maintenance(CatalogTick::new(2), CollectBudget::new(1, 0, 0));
+
+    assert_eq!(second_step.catalog.scanned_candidates, 1);
+    assert_eq!(manager.catalog().stats().published_objects, 0);
+    assert_eq!(manager.catalog().stats().liveness_scan_remaining, 0);
 }
 
 #[test]
@@ -193,7 +232,7 @@ fn invalidated_pending_put_cannot_publish_but_can_be_revoked() {
     manager
         .start_put(
             object.clone(),
-            owner(OWNER),
+            admission(OWNER),
             plan(
                 4096,
                 1,
@@ -222,6 +261,85 @@ fn invalidated_pending_put_cannot_publish_but_can_be_revoked() {
 }
 
 #[test]
+fn invalidated_pending_put_is_retired_before_its_timeout() {
+    let pool = pool(true, false);
+    let manager = ObjectManager::with_config(
+        pool.clone(),
+        ObjectCatalogConfig::new(32).with_pending_timeout(10_000),
+    )
+    .unwrap();
+    let object = identity("pending-cleanup-on-dead-segment");
+    manager
+        .start_put(
+            object.clone(),
+            admission(OWNER),
+            plan(
+                4096,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+
+    assert_eq!(pool.invalidate_owner(OWNER), 1);
+    let report = manager.maintenance(CatalogTick::new(1), CollectBudget::new(8, 8, 0));
+    assert_eq!(report.expired_writes, 0);
+    assert_eq!(report.catalog.invalidated_pending, 1);
+    assert_eq!(report.catalog.expired_pending, 0);
+    assert_eq!(report.catalog.reclaimed_objects, 1);
+    assert_eq!(manager.catalog().stats().pending_objects, 0);
+}
+
+#[test]
+fn segment_invalidation_racing_maintenance_still_retires_published_objects() {
+    use std::sync::{Arc, Barrier};
+
+    for round in 0..128 {
+        let pool = pool(true, false);
+        let manager = Arc::new(ObjectManager::new(pool.clone()));
+        let object =
+            ObjectIdentity::new(NamespaceId::DEFAULT, format!("invalidation-race-{round}"));
+        manager
+            .start_put(
+                object.clone(),
+                admission(OWNER),
+                plan(
+                    4096,
+                    1,
+                    ReplicaClass::Memory,
+                    FulfillmentPolicy::AllOrNothing,
+                ),
+                CatalogTick::ZERO,
+            )
+            .unwrap();
+        manager
+            .finish_put(&object, owner(OWNER), ReplicaSelector::All)
+            .unwrap();
+
+        let barrier = Arc::new(Barrier::new(2));
+        std::thread::scope(|scope| {
+            let manager = manager.clone();
+            let worker_barrier = barrier.clone();
+            scope.spawn(move || {
+                worker_barrier.wait();
+                for tick in 1..=8 {
+                    manager.maintenance(CatalogTick::new(tick), CollectBudget::new(8, 8, 0));
+                }
+            });
+            barrier.wait();
+            pool.invalidate_owner(OWNER);
+        });
+
+        for tick in 9..=16 {
+            manager.maintenance(CatalogTick::new(tick), CollectBudget::new(8, 8, 0));
+        }
+        assert_eq!(manager.catalog().stats().published_objects, 0);
+    }
+}
+
+#[test]
 fn manager_revoke_and_timeout_release_reservations_for_reuse() {
     let pool = pool(true, false);
     let manager = ObjectManager::with_config(
@@ -242,7 +360,7 @@ fn manager_revoke_and_timeout_release_reservations_for_reuse() {
     manager
         .start_put(
             object.clone(),
-            owner(OWNER),
+            admission(OWNER),
             put_plan.clone(),
             CatalogTick::ZERO,
         )
@@ -264,7 +382,12 @@ fn manager_revoke_and_timeout_release_reservations_for_reuse() {
     );
 
     manager
-        .start_put(object.clone(), owner(OWNER), put_plan, CatalogTick::new(6))
+        .start_put(
+            object.clone(),
+            admission(OWNER),
+            put_plan,
+            CatalogTick::new(6),
+        )
         .unwrap();
     manager
         .revoke_put(
@@ -293,7 +416,7 @@ fn completed_writes_leave_no_timeout_backlog_after_one_bounded_step() {
         manager
             .start_put(
                 object.clone(),
-                owner(OWNER),
+                admission(OWNER),
                 plan(1, 1, ReplicaClass::Memory, FulfillmentPolicy::AllOrNothing),
                 CatalogTick::ZERO,
             )
@@ -316,7 +439,7 @@ fn allocator_policy_is_selected_by_the_normalized_plan() {
     let started = memory_manager
         .start_put(
             identity("best-effort"),
-            owner(OWNER),
+            admission(OWNER),
             plan(4096, 2, ReplicaClass::Memory, FulfillmentPolicy::BestEffort),
             CatalogTick::ZERO,
         )
@@ -328,7 +451,7 @@ fn allocator_policy_is_selected_by_the_normalized_plan() {
     assert_eq!(
         nof_manager.start_put(
             identity("all-or-nothing"),
-            owner(OWNER),
+            admission(OWNER),
             plan(4096, 2, ReplicaClass::Nof, FulfillmentPolicy::AllOrNothing,),
             CatalogTick::ZERO,
         ),
@@ -349,7 +472,7 @@ fn concurrent_start_for_one_key_has_one_winner() {
             barrier.wait();
             manager.start_put(
                 identity("one-winner"),
-                owner(OWNER),
+                admission(OWNER),
                 plan(
                     4096,
                     1,

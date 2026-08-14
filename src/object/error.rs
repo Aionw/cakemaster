@@ -44,6 +44,8 @@ pub enum StageError {
     CatalogDropped,
     #[error("object write claim was lost")]
     ClaimLost,
+    #[error("the client session that owns the write is no longer active")]
+    OwnerInactive,
     #[error("object content size must not be zero")]
     ZeroSize,
     #[error("object must have at least one replica")]
@@ -169,6 +171,7 @@ impl From<StageError> for ObjectManagerError {
             StageError::CatalogDropped
             | StageError::ClaimLost
             | StageError::ReplicaTooSmall { .. } => Self::Internal,
+            StageError::OwnerInactive => Self::InvalidWrite,
         }
     }
 }
