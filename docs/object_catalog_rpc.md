@@ -5,12 +5,14 @@ handler 中复制 catalog、placement 或事务规则。当前实现提供 clien
 `Ping`、`MountSegment`、`ReMountSegment`、`UnmountSegment`、
 `GracefulUnmountSegment`，单 key `ExistKey`、`GetReplicaList`，以及
 `BatchExistKey`、`BatchGetReplicaList`、`BatchPutStart`、`BatchPutEnd` 和
-`BatchPutRevoke`。
+`BatchPutRevoke`。此外，`ServiceReady` 和 `GetStorageConfig` 提供上游 Client 初始化所需
+的版本握手与无持久化配置。
 
 ## 分层与同步/异步边界
 
 ```text
 async WrappedMasterService handler
+        ├── ServiceReady / GetStorageConfig → 固定 wire 兼容配置
         ├── Ping / segment lifecycle → ClientManager → ClientRegistry + SegmentPool
         └── object RPC → ObjectManager / TenantObjectManager
                          ├── ObjectCatalog：key 生命周期、owner、lease、回收状态
@@ -49,6 +51,13 @@ slot budget 仍使用固定上限。没有请求时，composition root 可从 se
 会重算 timer，因此 Graceful 不受 100ms 周期量化。它使用 `MissedTickBehavior::Skip` 且
 由调用方显式运行、停止并 join；同步
 领域 manager 和单个 handler 不会隐式启动后台任务。
+
+`ServiceReady` 返回固定上游基线的握手版本 `2.0.0`；该字符串集中定义在
+`cakemaster-proto::MOONCAKE_STORE_VERSION`，与上游 `MasterClient::Connect()` 的严格相等
+校验一致。`GetStorageConfig` 固定返回 `fsdir=""`、`enable_disk_eviction=false`、
+`quota_bytes=0`，表示不创建 storage backend。上游当前仅在该 RPC 失败时回退到旧
+`GetFsdir`；因此空配置成功响应足以初始化无持久化 Client，兼容 fallback `GetFsdir`
+仍未实现。
 
 服务类型为 `ObjectCatalogRpcService<B>`，默认 backend 是 `ObjectManager`。RPC
 adapter 内部用私有 `ObjectBatchBackend` trait 统一 batch 接口：single backend 的
@@ -130,6 +139,9 @@ pending write、淘汰、物理回收和空 slot；它不会在一次调用中�
 | Disk/LocalDisk selector | `INVALID_PARAMS` |
 | `ObjectMeta.object_checksum=Some(...)` | `INVALID_PARAMS` |
 | Get/BatchGet checksum | 永远返回 `None` |
+| `ServiceReady` | 返回固定基线握手版本 `2.0.0`，满足上游 `MasterClient::Connect()` 的严格版本校验 |
+| `GetStorageConfig` | 返回空 `fsdir`、关闭 disk eviction、quota 为 0；不初始化持久化 backend |
+| `GetFsdir` | 尚未实现；它只是在 `GetStorageConfig` 调用失败时供旧 Client 使用的兼容 fallback |
 | `Ping` | 返回 view version；已激活 session 为 `OK`，其余为 `NEED_REMOUNT` |
 | `MountSegment` | absent client 原子建立 session；active client 动态追加；相同配置幂等，冲突返回 `SEGMENT_ALREADY_EXISTS` |
 | `ReMountSegment` | 支持 Memory/CXL segment 的原子激活与幂等重挂载；NoF 和冲突配置返回错误 |

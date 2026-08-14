@@ -35,11 +35,11 @@ wire 的 single/batch RPC adapter；它还不是可以替换 `mooncake_master` �
 完整的 Mooncake Store。
 
 - 上游实际在 `RegisterRpcService` 中注册 **60** 个 coro_rpc 路由；本仓库 contract 和
-  adapter 有 **12** 个，缺少 **48** 个路由。
-- 这 12 个路由只由 benchmark/test server 组合起来；默认 `cakemaster server` 运行的是
+  adapter 有 **14** 个，缺少 **46** 个路由。
+- 这 14 个路由只由 benchmark/test server 组合起来；默认 `cakemaster server` 运行的是
   `DemoService`，没有可部署的 Mooncake Master composition root。
-- 12 个路由均已对齐固定的最新上游 wire；`BatchPutStart` 的 `SoftPinAction`/TTL schema
-  drift 已修复。
+- 14 个路由均已对齐固定的最新上游 wire；`BatchPutStart` 的 `SoftPinAction`/TTL schema
+  drift 已修复，`ServiceReady`/`GetStorageConfig` 已足够让无持久化 Client 完成初始化。
 - 已有 `ObjectCatalog`、`SegmentPool`、tenant quota 和 LocalSSD primitive 能复用，但
   client 生命周期、完整对象 API、分层存储任务、HA/恢复、数据面和运维面仍未完成。
 
@@ -54,7 +54,7 @@ wire 的 single/batch RPC adapter；它还不是可以替换 `mooncake_master` �
 | Segment/placement | `ClientManager` 已把 `Ping`、Memory/CXL `MountSegment`/`ReMountSegment`、立即/Graceful unmount、session TTL fencing 和批量 cleanup 接到 `SegmentPool`；`MasterReconciler` 兼有 100ms 周期维护和 Graceful deadline 唤醒 | 尚未接入 production composition；没有 NoF lifecycle RPC、探活和真实 I/O |
 | Placement | 支持 preferred segment、free-capacity 排序、replica failure domain 和 RAII 回滚 | 不是上游可配置的五种策略；不支持 mixed Memory+NoF 和 host-local placement |
 | Tenant | `TenantObjectManager` 已有 namespace 隔离、Memory/NoF 分账、quota admission、RAII accounting 和定向回收 | 没有上游 policy connector、HTTP admin、持久化和启动恢复 |
-| Mooncake RPC | 有 `Ping`、四个 Memory/CXL segment lifecycle 路由、单 key `ExistKey`/`GetReplicaList` 和五个 batch exists/get/put 路由 | 只在 benchmark/测试入口组合；尚无 production composition |
+| Mooncake RPC | 有 `ServiceReady`、禁用持久化的 `GetStorageConfig`、`Ping`、四个 Memory/CXL segment lifecycle 路由、单 key `ExistKey`/`GetReplicaList` 和五个 batch exists/get/put 路由 | `GetFsdir` 兼容 fallback 未实现；只在 benchmark/测试入口组合，尚无 production composition |
 | RPC runtime | TCP 上兼容 coro_rpc v0/struct_pack，支持 multiplexing、attachment、timeout、取消和流式拆帧 | 没有上游可选的 RDMA RPC socket、leader-aware client pool 和 Store API |
 | Task/client primitive | `ClientRegistry` 已封装在 core `ClientManager` 后，并有 generation-fenced cleanup；另有单 client 有界 `ClientTaskQueue<T>` | 没有任务事实表、重试、恢复、task/LocalSSD cleanup hook 或 task RPC |
 
@@ -161,7 +161,8 @@ controller，但产品 server 没有上游的持续后台控制：
   清理顺序；
 - NoF heartbeat probe、超时、连续失败阈值与自动摘除；
 - `GetAllNoFSegments`、`GetNoFSegmentsByName`、`QuerySegmentStatus*`、
-  `GetStorageConfig`、`GetFsdir`、`ServiceReady`；
+  `GetFsdir`；其中 `GetFsdir` 仍是 `GetStorageConfig` 失败后的旧版兼容 fallback，当前
+  `GetStorageConfig` 的空成功响应已足够让无持久化 Client 初始化；
 - graceful drain 和 segment drain job。
 
 `SegmentPool::attach/quiesce/reactivate/remove/invalidate_owners` 是这些流程的底层
@@ -306,12 +307,12 @@ composition/configuration，也不应成为上游兼容行为的唯一入口。
 | 分组 | 上游路由数 | 当前 contract/adapter | 结论 |
 | --- | ---: | ---: | --- |
 | 对象、metadata 与查询 | 23 | 7 | 16 个缺失 |
-| Segment、client lifecycle 与配置 | 15 | 5 | 10 个缺失 |
+| Segment、client lifecycle 与配置 | 15 | 7 | 8 个缺失 |
 | LocalSSD offload/promotion | 11 | 0 | 全部缺失 |
 | Copy/Move 与异步任务 | 11 | 0 | 全部缺失 |
-| **合计** | **60** | **12** | **48 个路由缺失；最新完整 wire 兼容为 12/60** |
+| **合计** | **60** | **14** | **46 个路由缺失；最新完整 wire 兼容为 14/60** |
 
-### 已有的十二个路由
+### 已有的十四个路由
 
 ```text
 Ping
@@ -326,9 +327,11 @@ BatchGetReplicaList
 BatchPutStart
 BatchPutEnd
 BatchPutRevoke
+GetStorageConfig
+ServiceReady
 ```
 
-### 缺少的 48 个路由
+### 缺少的 46 个路由
 
 对象与 metadata（16）：
 
@@ -351,7 +354,7 @@ RemoveAll
 BatchRemove
 ```
 
-Segment、client lifecycle 与配置（10）：
+Segment、client lifecycle 与配置（8）：
 
 ```text
 MountNoFSegment
@@ -362,8 +365,6 @@ GetNoFSegmentsByName
 GetFsdir
 QuerySegmentStatus
 QuerySegmentStatusById
-GetStorageConfig
-ServiceReady
 ```
 
 LocalSSD offload/promotion（11）：
@@ -426,7 +427,7 @@ MarkTaskToComplete
 - TaskLedger、copy/move 和 client task runtime；
 - LocalSSD offload/promotion、disk eviction 和 storage backend；
 - tenant connector/admin/persistence；
-- HTTP admin、health、readiness 和 KV events。
+- HTTP admin、production health/readiness lifecycle 和 KV events。
 
 ### M3：可靠性与完整产品能力
 

@@ -12,10 +12,12 @@ use cakemaster::client::{
 };
 use cakemaster::object::{ObjectManager, ObjectRead, TenantObjectManager, TenantPutRequest};
 use cakemaster::segment::error::AttachError;
+use cakemaster_proto::MOONCAKE_STORE_VERSION;
 use cakemaster_proto::mooncake::{
-    ClientStatus, ErrorCode, ExpectedBool, ExpectedGetReplicaListResponse, ExpectedPingResponse,
-    ExpectedReplicaDescriptors, ExpectedVoid, GetReplicaListResponse, ObjectMeta, PingResponse,
-    ReplicaStatus, ReplicaType, ReplicateConfig, Segment, Uuid, WrappedMasterService,
+    ClientStatus, ErrorCode, ExpectedBool, ExpectedGetReplicaListResponse,
+    ExpectedGetStorageConfigResponse, ExpectedPingResponse, ExpectedReplicaDescriptors,
+    ExpectedString, ExpectedVoid, GetReplicaListResponse, GetStorageConfigResponse, ObjectMeta,
+    PingResponse, ReplicaStatus, ReplicaType, ReplicateConfig, Segment, Uuid, WrappedMasterService,
 };
 use coro_rpc::RpcFailure;
 use request::{
@@ -140,6 +142,18 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
             view_version_id: self.view_version,
             client_status,
         }))
+    }
+
+    async fn get_storage_config(&self) -> Result<ExpectedGetStorageConfigResponse, RpcFailure> {
+        Ok(Ok(GetStorageConfigResponse {
+            fsdir: String::new(),
+            enable_disk_eviction: false,
+            quota_bytes: 0,
+        }))
+    }
+
+    async fn service_ready(&self) -> Result<ExpectedString, RpcFailure> {
+        Ok(Ok(MOONCAKE_STORE_VERSION.to_owned()))
     }
 
     async fn mount_segment(

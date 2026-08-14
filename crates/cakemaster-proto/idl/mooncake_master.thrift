@@ -136,6 +136,12 @@ struct PingResponse {
   2: required ClientStatus client_status
 }
 
+struct GetStorageConfigResponse {
+  1: required string fsdir
+  2: required bool enable_disk_eviction
+  3: required u64 quota_bytes
+}
+
 struct BufferDescriptor {
   1: required u64 size
   2: required u64 buffer_address
@@ -221,6 +227,16 @@ union ExpectedPingResponse {
   2: ErrorCode error
 } (coro_rpc.expected)
 
+union ExpectedGetStorageConfigResponse {
+  1: GetStorageConfigResponse value
+  2: ErrorCode error
+} (coro_rpc.expected)
+
+union ExpectedString {
+  1: string value
+  2: ErrorCode error
+} (coro_rpc.expected)
+
 union ExpectedVoid {
   1: ErrorCode error
 } (coro_rpc.expected)
@@ -229,6 +245,12 @@ service WrappedMasterService {
   ExpectedPingResponse Ping(
     1: required UUID client_id
   ) (coro_rpc.name = "mooncake::WrappedMasterService::Ping")
+
+  ExpectedGetStorageConfigResponse GetStorageConfig()
+    (coro_rpc.name = "mooncake::WrappedMasterService::GetStorageConfig")
+
+  ExpectedString ServiceReady()
+    (coro_rpc.name = "mooncake::WrappedMasterService::ServiceReady")
 
   ExpectedVoid MountSegment(
     1: required Segment segment,
