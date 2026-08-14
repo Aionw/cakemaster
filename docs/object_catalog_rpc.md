@@ -36,7 +36,10 @@ segment 全部 reactivate 后才发布 active session，因此 object write 不�
 `MountSegment` 也允许 absent client 原子建立首次 session，active client 则可动态追加；
 普通 `UnmountSegment` 立即 quiesce/remove 目标 segment，但保留 client session 和其他
 segment。`GracefulUnmountSegment` 立即 quiesce，在 grace window 内保留已有 replica 的
-liveness，到期后才 remove；它不等待 allocation 清零，也不执行数据迁移。
+liveness，到期后才 remove；它不等待 allocation 清零，也不执行数据迁移。segment remove
+之后，读路径只返回仍 live 的 replica；catalog maintenance 会从 published object 原地剪掉
+stale replica 并同步释放容量和 tenant quota。只要至少一个 replica 存活，对象仍然可见；
+最后一个 replica 失效时才退休整个对象。当前不会自动补齐被剪掉的 replica。
 
 每次 RPC 的 maintenance candidate budget 至少等于当前 batch item 数，因此批量写入
 不会固定每批加入 333 个 timeout candidate、却长期只清理默认的 64 个；reclaim 和空

@@ -329,9 +329,10 @@ per-client mutex，mount slot 也只在 register/remount 路径创建，或使�
    PENDING 的 write；
 6. coordinator 将本轮到期 client 批量提交给 `SegmentPool::invalidate_owners`，一次持锁
    失效并摘除其 segment，一次重建 placement snapshot；
-7. 失效 segment 上的 pending write 无需等待 write timeout，published object 也不再
-   对 Get/Exist 可见；catalog maintenance 通过有界 liveness pass 退休这些 metadata，
-   外部 handle 仍可通过 RAII 延迟物理释放；
+7. 失效 segment 上的 pending write 无需等待 write timeout；published object 的读路径
+   立即过滤 stale replica，catalog maintenance 通过有界 liveness pass 剪掉并释放这些
+   replica。只要仍有 live replica，Get/Exist 继续可见；最后一个 replica 失效时才退休
+   metadata，外部 handle 仍可通过 RAII 延迟物理释放；
 8. processing task、mailbox 和 LocalSSD workflow 在对应 subsystem 接入后由 manager
    边界扩展清理；
 9. 删除已清空且无人使用的 mount slot，最后调用 `cleanup.finish()`。

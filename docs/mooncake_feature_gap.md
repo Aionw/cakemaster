@@ -50,7 +50,7 @@ wire 的 single/batch RPC adapter；它还不是可以替换 `mooncake_master` �
 
 | 能力 | 当前实现 | 边界 |
 | --- | --- | --- |
-| Object metadata | `ObjectCatalog` 和 `ObjectManager` 已有 claim、pending、publish、revoke、get/exists、lease、pending timeout、按 client session 主动 revoke 和有界回收 | 没有完整上游 API；checksum、pin、group、upsert 等语义未接入 |
+| Object metadata | `ObjectCatalog` 和 `ObjectManager` 已有 claim、pending、publish、revoke、get/exists、lease、pending timeout、按 client session 主动 revoke、有界回收，以及 segment 失效后的 replica 级剪枝 | 没有 replica 自动修复/补齐和完整上游 API；checksum、pin、group、upsert 等语义未接入 |
 | Segment/placement | `ClientManager` 已把 `Ping`、Memory/CXL `MountSegment`/`ReMountSegment`、立即/Graceful unmount、session TTL fencing 和批量 cleanup 接到 `SegmentPool`；`MasterReconciler` 兼有 100ms 周期维护和 Graceful deadline 唤醒 | 尚未接入 production composition；没有 NoF lifecycle RPC、探活和真实 I/O |
 | Placement | 支持 preferred segment、free-capacity 排序、replica failure domain 和 RAII 回滚 | 不是上游可配置的五种策略；不支持 mixed Memory+NoF 和 host-local placement |
 | Tenant | `TenantObjectManager` 已有 namespace 隔离、Memory/NoF 分账、quota admission、RAII accounting 和定向回收 | 没有上游 policy connector、HTTP admin、持久化和启动恢复 |

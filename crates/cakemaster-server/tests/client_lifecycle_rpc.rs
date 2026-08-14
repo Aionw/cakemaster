@@ -3,7 +3,8 @@ use cakemaster::object::ObjectManager;
 use cakemaster::segment::stats::SegmentState;
 use cakemaster::segment::{SegmentId, SegmentPool};
 use cakemaster_proto::mooncake::{
-    ClientStatus, ErrorCode, Segment, Uuid, WrappedMasterServiceClient, WrappedMasterServiceServer,
+    ClientStatus, ErrorCode, ObjectDataType, ObjectMeta, ReplicaType, ReplicateConfig, Segment,
+    SoftPinAction, Uuid, WrappedMasterServiceClient, WrappedMasterServiceServer,
 };
 use cakemaster_server::{MasterClock, MasterReconcileConfig, ObjectCatalogRpcService};
 use std::sync::Arc;
@@ -12,6 +13,7 @@ use tokio::sync::oneshot;
 
 const CLIENT: ClientId = ClientId::new(11, 12);
 const SEGMENT: SegmentId = SegmentId::new(13, 14);
+const SECOND_SEGMENT: SegmentId = SegmentId::new(13, 15);
 
 fn wire_segment() -> Segment {
     Segment {
@@ -25,6 +27,38 @@ fn wire_segment() -> Segment {
         te_endpoint: "127.0.0.1:12345".to_owned(),
         protocol: "tcp".to_owned(),
         host_id: "host-a".to_owned(),
+    }
+}
+
+fn second_wire_segment() -> Segment {
+    Segment {
+        id: Uuid {
+            high: SECOND_SEGMENT.high(),
+            low: SECOND_SEGMENT.low(),
+        },
+        name: "rpc-memory-b".to_owned(),
+        base: 0x3_0000_0000,
+        size: 1 << 20,
+        te_endpoint: "127.0.0.1:12346".to_owned(),
+        protocol: "tcp".to_owned(),
+        host_id: "host-b".to_owned(),
+    }
+}
+
+fn replicated_memory_config() -> ReplicateConfig {
+    ReplicateConfig {
+        replica_num: 2,
+        nof_replica_num: 0,
+        soft_pin_action: SoftPinAction::Preserve,
+        soft_pin_ttl_ms: None,
+        with_hard_pin: false,
+        preferred_segments: Vec::new(),
+        preferred_segment: String::new(),
+        preferred_nof_segments: Vec::new(),
+        prefer_alloc_in_same_node: false,
+        data_type: ObjectDataType::Kvcache,
+        host_id: String::new(),
+        group_ids: None,
     }
 }
 
@@ -208,6 +242,151 @@ async fn tcp_mount_unmount_and_graceful_unmount_follow_segment_lifecycle() {
         Ok(())
     );
     assert!(pool.is_empty());
+
+    server_shutdown_tx.send(()).unwrap();
+    reconcile_shutdown_tx.send(()).unwrap();
+    server_task.await.unwrap().unwrap();
+    reconcile_task.await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn tcp_unmount_prunes_only_the_target_replica() {
+    let pool = Arc::new(SegmentPool::new());
+    let manager = Arc::new(ObjectManager::new(pool.clone()));
+    let service = ObjectCatalogRpcService::new(manager);
+    let reconciler = service.reconciler(MasterReconcileConfig::default());
+    let server = WrappedMasterServiceServer::new(service)
+        .into_rpc_server()
+        .unwrap();
+    let bound = server.bind("127.0.0.1:0").await.unwrap();
+    let address = bound.local_addr().unwrap();
+    let (server_shutdown_tx, server_shutdown_rx) = oneshot::channel();
+    let server_task = tokio::spawn(bound.run_until(async {
+        let _ = server_shutdown_rx.await;
+    }));
+    let (reconcile_shutdown_tx, reconcile_shutdown_rx) = oneshot::channel();
+    let reconcile_task = tokio::spawn(reconciler.run_until(async {
+        let _ = reconcile_shutdown_rx.await;
+    }));
+    let client = WrappedMasterServiceClient::connect(address).await.unwrap();
+    let client_id = Uuid {
+        high: CLIENT.high(),
+        low: CLIENT.low(),
+    };
+    let first_id = Uuid {
+        high: SEGMENT.high(),
+        low: SEGMENT.low(),
+    };
+    let second_id = Uuid {
+        high: SECOND_SEGMENT.high(),
+        low: SECOND_SEGMENT.low(),
+    };
+
+    assert_eq!(
+        client
+            .mount_segment(wire_segment(), client_id.clone())
+            .await
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        client
+            .mount_segment(second_wire_segment(), client_id.clone())
+            .await
+            .unwrap(),
+        Ok(())
+    );
+    let first_segment = pool.segment(SEGMENT).unwrap();
+    let started = client
+        .batch_put_start(
+            client_id.clone(),
+            vec!["replicated".to_owned()],
+            vec![4096],
+            replicated_memory_config(),
+            String::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(started[0].as_ref().unwrap().len(), 2);
+    assert_eq!(
+        client
+            .batch_put_end(
+                client_id.clone(),
+                vec![ObjectMeta {
+                    key: "replicated".to_owned(),
+                    object_checksum: None,
+                }],
+                ReplicaType::Memory,
+                String::new(),
+            )
+            .await
+            .unwrap(),
+        vec![Ok(())]
+    );
+    assert_eq!(
+        client
+            .get_replica_list("replicated".to_owned(), String::new())
+            .await
+            .unwrap()
+            .unwrap()
+            .replicas
+            .len(),
+        2
+    );
+
+    assert_eq!(
+        client
+            .unmount_segment(first_id, client_id.clone())
+            .await
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        client
+            .exist_key("replicated".to_owned(), String::new())
+            .await
+            .unwrap(),
+        Ok(true)
+    );
+    let surviving = client
+        .get_replica_list("replicated".to_owned(), String::new())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(surviving.replicas.len(), 1);
+    assert_eq!(first_segment.stats().usage.active_allocations, 0);
+
+    assert_eq!(
+        client
+            .graceful_unmount_segment(second_id, client_id, 100)
+            .await
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        client
+            .get_replica_list("replicated".to_owned(), String::new())
+            .await
+            .unwrap()
+            .unwrap()
+            .replicas
+            .len(),
+        1
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while pool.segment(SECOND_SEGMENT).is_some() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        client
+            .get_replica_list("replicated".to_owned(), String::new())
+            .await
+            .unwrap(),
+        Err(ErrorCode::ObjectNotFound)
+    );
 
     server_shutdown_tx.send(()).unwrap();
     reconcile_shutdown_tx.send(()).unwrap();

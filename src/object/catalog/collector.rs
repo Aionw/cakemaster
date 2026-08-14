@@ -19,19 +19,24 @@ impl ObjectCatalog {
             .inner
             .lookup_slot(lookup)
             .ok_or(RemoveError::NotFound)?;
-        let node = slot.current.load_full().ok_or(RemoveError::NotFound)?;
-        match node.control.lifecycle.compare_exchange(
-            OBJECT_PUBLISHED,
-            OBJECT_RETIRING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        ) {
-            Ok(_) => {}
-            Err(OBJECT_CLAIMED | OBJECT_PENDING | OBJECT_PUBLISHING) => {
-                return Err(RemoveError::NotReady);
+        let node = loop {
+            let node = slot.current.load_full().ok_or(RemoveError::NotFound)?;
+            match node.control.lifecycle.compare_exchange(
+                OBJECT_PUBLISHED,
+                OBJECT_RETIRING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break node,
+                Err(OBJECT_CLAIMED | OBJECT_PENDING | OBJECT_PUBLISHING) => {
+                    return Err(RemoveError::NotReady);
+                }
+                Err(OBJECT_PRUNING) => {
+                    node.record().wait_for_pruning();
+                }
+                Err(_) => return Err(RemoveError::NotFound),
             }
-            Err(_) => return Err(RemoveError::NotFound),
-        }
+        };
 
         let lease_until = CatalogTick::new(node.control.lease_until.load(Ordering::Acquire));
         if lease_until > now {
@@ -160,6 +165,10 @@ impl CatalogInner {
                 &self.collector.liveness_protected_remaining,
             ),
         ];
+        // Budgets may intentionally be unbounded (`usize::MAX`) for drain-style
+        // collection. Grow this cold-path batch from the replicas we actually
+        // prune instead of treating the budget as an allocation size.
+        let mut resources = ReplicaReclaimBatch::default();
         let mut remaining_budget = budget.max_candidates;
         let mut scanned = 0;
         for (queue, remaining) in generations {
@@ -185,7 +194,15 @@ impl CatalogInner {
                 {
                     continue;
                 }
-                if node.record().replicas.is_live() {
+                let record = node.record();
+                let mut replicas = record.replicas.write();
+                if node.control.lifecycle.load(Ordering::Acquire) != OBJECT_PUBLISHED
+                    || !slot_points_to(&slot, &node)
+                {
+                    continue;
+                }
+                if replicas.all_live() {
+                    drop(replicas);
                     queue.push(candidate);
                     continue;
                 }
@@ -194,32 +211,69 @@ impl CatalogInner {
                     .lifecycle
                     .compare_exchange(
                         OBJECT_PUBLISHED,
-                        OBJECT_RETIRING,
+                        OBJECT_PRUNING,
                         Ordering::AcqRel,
                         Ordering::Acquire,
                     )
                     .is_err()
                 {
-                    queue.push(candidate);
                     continue;
                 }
-                if !clear_slot(&slot, &node) {
-                    node.control
-                        .lifecycle
-                        .store(OBJECT_PUBLISHED, Ordering::Release);
-                    queue.push(candidate);
-                    continue;
+                let current = std::mem::take(&mut *replicas);
+                match current.partition_by_liveness() {
+                    ReplicaPartition::AllLive(current) => {
+                        *replicas = current;
+                        node.control
+                            .lifecycle
+                            .store(OBJECT_PUBLISHED, Ordering::Release);
+                        drop(replicas);
+                        queue.push(candidate);
+                    }
+                    ReplicaPartition::AllStale(current) => {
+                        *replicas = current;
+                        node.control
+                            .lifecycle
+                            .store(OBJECT_RETIRING, Ordering::Release);
+                        drop(replicas);
+                        if !clear_slot(&slot, &node) {
+                            node.control
+                                .lifecycle
+                                .store(OBJECT_PUBLISHED, Ordering::Release);
+                            queue.push(candidate);
+                            continue;
+                        }
+                        let bytes = record.reserved_bytes();
+                        self.retire_published(slot, node, now);
+                        report.invalidated_published += 1;
+                        report.retired_objects += 1;
+                        report.retired_bytes = report.retired_bytes.saturating_add(bytes);
+                    }
+                    ReplicaPartition::Mixed { live, stale } => {
+                        let stale_count = stale.len();
+                        let stale_bytes = stale.reserved_bytes();
+                        *replicas = live;
+                        atomic_saturating_sub(&record.reserved_bytes, stale_bytes);
+                        node.release_pruned_accounting(&stale);
+                        self.lifecycle.on_prune_published(stale_bytes);
+                        self.collector.on_reclaim(stale_bytes);
+                        node.control
+                            .lifecycle
+                            .store(OBJECT_PUBLISHED, Ordering::Release);
+                        drop(replicas);
+                        resources.extend(stale);
+                        report.pruned_objects += 1;
+                        report.pruned_replicas += stale_count;
+                        report.pruned_replica_bytes =
+                            report.pruned_replica_bytes.saturating_add(stale_bytes);
+                        queue.push(candidate);
+                    }
                 }
-                let bytes = node.record().reserved_bytes;
-                self.retire_published(slot, node, now);
-                report.invalidated_published += 1;
-                report.retired_objects += 1;
-                report.retired_bytes = report.retired_bytes.saturating_add(bytes);
             }
             if remaining_budget == 0 {
                 break;
             }
         }
+        resources.release();
         scanned
     }
 
@@ -241,7 +295,7 @@ impl CatalogInner {
             .record
             .get()
             .expect("only staged objects can be retired");
-        let bytes = record.reserved_bytes;
+        let bytes = record.reserved_bytes();
         node.abort_accounting();
         self.lifecycle.on_retire_pending(bytes);
         self.collector.retired.push(RetiredObject {
@@ -333,7 +387,7 @@ impl CatalogInner {
             .record
             .get()
             .expect("only published objects can be retired");
-        let bytes = record.reserved_bytes;
+        let bytes = record.reserved_bytes();
         node.mark_accounting_retiring();
         self.lifecycle.on_retire_published(bytes);
         self.collector.retired.push(RetiredObject {
@@ -358,7 +412,7 @@ impl CatalogInner {
             let Some((slot, node)) = self.resolve_pending_candidate(&pending) else {
                 continue;
             };
-            if !node.record().replicas.is_live() {
+            if !node.record().replicas.read().all_live() {
                 if self.try_retire_pending(slot, node, now) {
                     report.invalidated_pending += 1;
                 }
@@ -499,7 +553,7 @@ impl CatalogInner {
                         } => {
                             record.accounting.is_some()
                                 && record.identity.namespace() == *namespace
-                                && record.direct_replica_class() == Some(*replica_class)
+                                && record.current_direct_replica_class() == Some(*replica_class)
                         }
                     }
             })
@@ -561,7 +615,7 @@ impl CatalogInner {
                 .record
                 .get()
                 .expect("published objects always have records")
-                .reserved_bytes;
+                .reserved_bytes();
             let quota_bytes = node
                 .record
                 .get()
@@ -608,7 +662,7 @@ impl CatalogInner {
                         .record
                         .take()
                         .expect("retired objects always have records");
-                    resources.extend(record.replicas);
+                    resources.extend(record.replicas.into_inner());
                     self.lifecycle.on_reclaim(retired.reserved_bytes);
                     self.collector.on_reclaim(retired.reserved_bytes);
                     report.reclaimed_objects += 1;

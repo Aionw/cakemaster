@@ -138,6 +138,73 @@ fn tenants_isolate_keys_and_charge_actual_logical_replica_bytes() {
 }
 
 #[test]
+fn pruning_one_replica_releases_only_its_committed_tenant_charge() {
+    let pool = pool();
+    pool.attach(SegmentSpec::memory(
+        SegmentIdentity::new(SECOND_MEMORY_ID, OWNER, "memory-2"),
+        MemoryRegion::new(0x4_0000_0000, CAPACITY),
+        TransportEndpoint::new(TransportProtocol::Tcp, "127.0.0.1:12346"),
+    ))
+    .unwrap();
+    let manager = TenantObjectManager::new(
+        pool.clone(),
+        TenantConfig::multi(vec![(tenant_id("a"), policy(8192, 0))]),
+    )
+    .unwrap();
+    let tenant = manager.resolve_tenant(&tenant_id("a")).unwrap();
+
+    let started = manager
+        .start_put(
+            &tenant,
+            "replicated",
+            admission(),
+            plan_for(
+                4096,
+                2,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    assert_eq!(started.replicas().len(), 2);
+    manager
+        .finish_put(&tenant, "replicated", owner(), ReplicaSelector::All)
+        .unwrap();
+    let snapshot = manager.tenant_snapshot(&tenant_id("a")).unwrap();
+    assert_eq!(snapshot.memory.used_bytes, 8192);
+    assert_eq!(snapshot.memory.demand_bytes, 8192);
+
+    pool.quiesce(OWNER, MEMORY_ID).unwrap();
+    pool.remove(OWNER, MEMORY_ID).unwrap();
+    assert!(
+        manager
+            .exists(&tenant, "replicated", CatalogTick::new(1))
+            .unwrap()
+    );
+    let report = manager.maintenance(CatalogTick::new(1), CollectBudget::new(8, 8, 0));
+    assert_eq!(report.catalog.pruned_replicas, 1);
+    let snapshot = manager.tenant_snapshot(&tenant_id("a")).unwrap();
+    assert_eq!(snapshot.memory.used_bytes, 4096);
+    assert_eq!(snapshot.memory.demand_bytes, 4096);
+    assert_eq!(snapshot.memory.retiring_bytes, 0);
+
+    pool.quiesce(OWNER, SECOND_MEMORY_ID).unwrap();
+    pool.remove(OWNER, SECOND_MEMORY_ID).unwrap();
+    assert!(
+        !manager
+            .exists(&tenant, "replicated", CatalogTick::new(2))
+            .unwrap()
+    );
+    let report = manager.maintenance(CatalogTick::new(2), CollectBudget::new(8, 8, 0));
+    assert_eq!(report.catalog.invalidated_published, 1);
+    let snapshot = manager.tenant_snapshot(&tenant_id("a")).unwrap();
+    assert_eq!(snapshot.memory.used_bytes, 0);
+    assert_eq!(snapshot.memory.demand_bytes, 0);
+    assert_eq!(snapshot.memory.retiring_bytes, 0);
+}
+
+#[test]
 fn revoke_returns_reserved_quota_and_unknown_tenants_are_rejected() {
     let manager = manager(4096, 4096);
     let a = manager.resolve_tenant(&tenant_id("a")).unwrap();
