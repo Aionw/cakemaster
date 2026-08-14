@@ -318,6 +318,18 @@ impl TenantQuotaCharge {
         phase.store(CHARGE_RETIRING, Ordering::Release);
     }
 
+    pub(crate) fn release_committed_partial(
+        &self,
+        phase: &AtomicU8,
+        replica_class: ReplicaClass,
+        bytes: u64,
+    ) {
+        debug_assert_eq!(phase.load(Ordering::Acquire), CHARGE_COMMITTED);
+        let account = self.account(replica_class);
+        atomic_saturating_sub(&account.used, bytes);
+        atomic_saturating_sub(&account.demand, bytes);
+    }
+
     pub(crate) fn release_reserved(&self, replica_class: ReplicaClass, bytes: u64) {
         self.account(replica_class).release_reserved(bytes);
     }

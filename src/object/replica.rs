@@ -219,6 +219,13 @@ pub struct ReplicaSet {
     storage: ReplicaStorage,
 }
 
+#[derive(Debug)]
+pub(crate) enum ReplicaPartition {
+    AllLive(ReplicaSet),
+    AllStale(ReplicaSet),
+    Mixed { live: ReplicaSet, stale: ReplicaSet },
+}
+
 #[derive(Debug, Default)]
 enum ReplicaStorage {
     #[default]
@@ -259,6 +266,20 @@ impl ReplicaSet {
         }
     }
 
+    fn from_vec(mut replicas: Vec<ReplicaLease>) -> Self {
+        match replicas.len() {
+            0 => Self::default(),
+            1 => Self::one(
+                replicas
+                    .pop()
+                    .expect("one-replica vectors contain one replica"),
+            ),
+            _ => Self {
+                storage: ReplicaStorage::Many(replicas.into_boxed_slice()),
+            },
+        }
+    }
+
     pub fn from_reservations(reservations: ReservationSet) -> Self {
         Self::new(
             reservations
@@ -291,11 +312,49 @@ impl ReplicaSet {
         matches!(self.storage, ReplicaStorage::Empty)
     }
 
-    /// Objects currently use strict replica validity: losing any associated
-    /// segment invalidates the object rather than silently degrading its
-    /// replication contract.
-    pub(crate) fn is_live(&self) -> bool {
+    pub(crate) fn all_live(&self) -> bool {
         !self.is_empty() && self.replicas().iter().all(ReplicaLease::is_live)
+    }
+
+    pub(crate) fn has_live(&self) -> bool {
+        self.replicas().iter().any(ReplicaLease::is_live)
+    }
+
+    pub(crate) fn live_iter(&self) -> impl Iterator<Item = &ReplicaLease> {
+        self.replicas().iter().filter(|replica| replica.is_live())
+    }
+
+    pub(crate) fn partition_by_liveness(self) -> ReplicaPartition {
+        let live_count = self.live_iter().count();
+        if live_count == 0 {
+            return ReplicaPartition::AllStale(self);
+        }
+        if live_count == self.len() {
+            return ReplicaPartition::AllLive(self);
+        }
+
+        let mut live = Vec::with_capacity(live_count);
+        let mut stale = Vec::with_capacity(self.len() - live_count);
+        let mut push = |replica: ReplicaLease| {
+            if replica.is_live() {
+                live.push(replica);
+            } else {
+                stale.push(replica);
+            }
+        };
+        match self.storage {
+            ReplicaStorage::Empty => {}
+            ReplicaStorage::One(replica) => push(replica),
+            ReplicaStorage::Many(replicas) => {
+                for replica in replicas {
+                    push(replica);
+                }
+            }
+        }
+        ReplicaPartition::Mixed {
+            live: Self::from_vec(live),
+            stale: Self::from_vec(stale),
+        }
     }
 
     pub fn reserved_bytes(&self) -> u64 {
@@ -339,5 +398,84 @@ impl ReplicaReclaimBatch {
     pub(crate) fn release(self) {
         Reservation::release_batch(self.direct);
         drop(self.local_ssd);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::segment::{
+        ClientId, MemoryRegion, SegmentIdentity, SegmentPool, SegmentSpec, TransportEndpoint,
+        TransportProtocol,
+    };
+
+    const OWNER: ClientId = ClientId::new(1, 1);
+    const FIRST: SegmentId = SegmentId::new(1, 1);
+    const SECOND: SegmentId = SegmentId::new(1, 2);
+
+    fn memory_segment(id: SegmentId, base: u64, endpoint: &str) -> SegmentSpec {
+        SegmentSpec::memory(
+            SegmentIdentity::new(id, OWNER, endpoint),
+            MemoryRegion::new(base, 4096),
+            TransportEndpoint::new(TransportProtocol::Tcp, endpoint),
+        )
+    }
+
+    fn two_replicas() -> (SegmentPool, ReplicaSet) {
+        let pool = SegmentPool::new();
+        pool.attach(memory_segment(FIRST, 0x1000, "first")).unwrap();
+        pool.attach(memory_segment(SECOND, 0x3000, "second"))
+            .unwrap();
+        let replicas = ReplicaSet::new([
+            ReplicaLease::Direct(DirectReplica::new(
+                ReplicaId::new(10),
+                pool.reserve_on(FIRST, 512).unwrap(),
+            )),
+            ReplicaLease::Direct(DirectReplica::new(
+                ReplicaId::new(20),
+                pool.reserve_on(SECOND, 512).unwrap(),
+            )),
+        ]);
+        (pool, replicas)
+    }
+
+    #[test]
+    fn partitions_all_live_and_all_stale_without_rebuilding_ids() {
+        let (pool, replicas) = two_replicas();
+        let replicas = match replicas.partition_by_liveness() {
+            ReplicaPartition::AllLive(replicas) => replicas,
+            partition => panic!("unexpected partition: {partition:?}"),
+        };
+
+        pool.quiesce(OWNER, FIRST).unwrap();
+        pool.remove(OWNER, FIRST).unwrap();
+        pool.quiesce(OWNER, SECOND).unwrap();
+        pool.remove(OWNER, SECOND).unwrap();
+        match replicas.partition_by_liveness() {
+            ReplicaPartition::AllStale(replicas) => {
+                assert_eq!(replicas.len(), 2);
+                assert_eq!(replicas.replicas()[0].id(), ReplicaId::new(10));
+                assert_eq!(replicas.replicas()[1].id(), ReplicaId::new(20));
+            }
+            partition => panic!("unexpected partition: {partition:?}"),
+        }
+    }
+
+    #[test]
+    fn mixed_partition_preserves_order_and_separates_resources() {
+        let (pool, replicas) = two_replicas();
+        pool.quiesce(OWNER, FIRST).unwrap();
+        pool.remove(OWNER, FIRST).unwrap();
+
+        match replicas.partition_by_liveness() {
+            ReplicaPartition::Mixed { live, stale } => {
+                assert_eq!(live.len(), 1);
+                assert_eq!(live.replicas()[0].id(), ReplicaId::new(20));
+                assert_eq!(stale.len(), 1);
+                assert_eq!(stale.replicas()[0].id(), ReplicaId::new(10));
+                assert_eq!(stale.reserved_bytes(), 512);
+            }
+            partition => panic!("unexpected partition: {partition:?}"),
+        }
     }
 }

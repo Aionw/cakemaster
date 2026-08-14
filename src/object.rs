@@ -22,7 +22,9 @@ mod replica;
 mod tenant;
 mod write;
 
-pub use catalog::{ObjectCatalog, ObjectHandle, ObjectRead, PutClaim, PutTicket};
+pub use catalog::{
+    LiveReplicaView, ObjectCatalog, ObjectHandle, ObjectRead, PutClaim, PutTicket, ReplicaSetView,
+};
 pub use config::ObjectCatalogConfig;
 pub use content::{ObjectContent, ObjectKind};
 pub use identity::{NamespaceId, ObjectIdentity, ObjectKey, ObjectLookup};

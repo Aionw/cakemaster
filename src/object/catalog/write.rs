@@ -112,7 +112,7 @@ impl ObjectCatalog {
                 .load(Ordering::Acquire);
             return Err(match lifecycle {
                 OBJECT_CLAIMED | OBJECT_PENDING | OBJECT_PUBLISHING => PutError::WriteInProgress,
-                OBJECT_PUBLISHED | OBJECT_RETIRING => PutError::AlreadyExists,
+                OBJECT_PUBLISHED | OBJECT_RETIRING | OBJECT_PRUNING => PutError::AlreadyExists,
                 _ => unreachable!("object lifecycle is validated internally"),
             });
         }
@@ -134,7 +134,7 @@ impl ObjectCatalog {
         if ticket.node.control.write_id != ticket.id || ticket.node.record.get().is_none() {
             return Err(PublishError::ObjectGone);
         }
-        if !ticket.node.record().replicas.is_live() {
+        if !ticket.node.record().replicas.read().all_live() {
             return Err(PublishError::ReplicasInvalidated);
         }
 
@@ -151,12 +151,7 @@ impl ObjectCatalog {
                     .commit
                     .set(commit)
                     .expect("the publishing transition has a single owner");
-                let reserved_bytes = ticket
-                    .node
-                    .record
-                    .get()
-                    .expect("pending objects always have records")
-                    .reserved_bytes;
+                let reserved_bytes = ticket.node.record().reserved_bytes();
                 ticket.node.commit_accounting();
                 self.inner.lifecycle.on_publish(reserved_bytes);
                 ticket
@@ -168,7 +163,7 @@ impl ObjectCatalog {
                     .collector
                     .young
                     .push(GcCandidate::new(&slot, &ticket.node));
-                if !ticket.node.record().replicas.is_live() {
+                if !ticket.node.record().replicas.read().all_live() {
                     self.inner
                         .collector
                         .liveness_scan_requested
@@ -208,7 +203,7 @@ impl ObjectCatalog {
             Ordering::Acquire,
         ) {
             Ok(_) => {}
-            Err(OBJECT_PUBLISHING | OBJECT_PUBLISHED) => {
+            Err(OBJECT_PUBLISHING | OBJECT_PUBLISHED | OBJECT_PRUNING) => {
                 return Err(RevokeError::AlreadyPublished);
             }
             Err(_) => return Err(RevokeError::ObjectGone),
@@ -251,6 +246,10 @@ impl ObjectCatalog {
             match lifecycle {
                 OBJECT_CLAIMED | OBJECT_PUBLISHING => return Err(LookupError::NotReady),
                 OBJECT_RETIRING => return Err(LookupError::NotFound),
+                OBJECT_PRUNING => {
+                    node.record().wait_for_pruning();
+                    continue;
+                }
                 OBJECT_PENDING | OBJECT_PUBLISHED => {}
                 _ => unreachable!("object lifecycle is validated internally"),
             }
@@ -356,8 +355,8 @@ impl PutClaim {
         let record = ObjectRecord {
             identity: self.identity.clone(),
             content,
-            replicas,
-            reserved_bytes,
+            replicas: RwLock::new(replicas),
+            reserved_bytes: AtomicU64::new(reserved_bytes),
             accounting: accounting.map(QuotaReservationGuard::into_charge),
         };
         if let Err(record) = node.record.set(record) {
@@ -462,8 +461,8 @@ impl PutTicket {
         self.node.record().content
     }
 
-    pub fn replicas(&self) -> &[ReplicaLease] {
-        self.node.record().replicas.replicas()
+    pub fn replicas(&self) -> ReplicaSetView<'_> {
+        ReplicaSetView::new(self.node.record().replicas.read())
     }
 
     pub fn owner(&self) -> WriteOwner {

@@ -17,6 +17,10 @@ impl ObjectCatalog {
                     return Err(LookupError::NotReady);
                 }
                 OBJECT_RETIRING => return Err(LookupError::NotFound),
+                OBJECT_PRUNING => {
+                    node.record().wait_for_pruning();
+                    continue;
+                }
                 OBJECT_PUBLISHED => {}
                 _ => unreachable!("object lifecycle is validated internally"),
             }
@@ -26,9 +30,10 @@ impl ObjectCatalog {
                 self.inner.config.lease_refresh_ticks,
             );
             node.control.recent.store(true, Ordering::Relaxed);
+            let has_live_replica = node.record().replicas.read().has_live();
             if node.control.lifecycle.load(Ordering::Acquire) == OBJECT_PUBLISHED
                 && slot_points_to(&slot, &node)
-                && node.record().replicas.is_live()
+                && has_live_replica
             {
                 return Ok(ObjectRead {
                     object: ObjectHandle { node },
@@ -69,14 +74,14 @@ impl ObjectHandle {
             .expect("published objects always have commit metadata")
     }
 
-    pub fn replicas(&self) -> &[ReplicaLease] {
-        self.node.record().replicas.replicas()
+    pub fn replicas(&self) -> LiveReplicaView<'_> {
+        LiveReplicaView::new(self.node.record().replicas.read())
     }
 
-    /// Whether every replica still belongs to its original live segment
+    /// Whether at least one replica still belongs to its original live segment
     /// incarnation.
     pub fn is_live(&self) -> bool {
-        self.node.record().replicas.is_live()
+        self.node.record().replicas.read().has_live()
     }
 
     pub fn owner(&self) -> WriteOwner {

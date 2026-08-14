@@ -365,7 +365,8 @@ fn validate_pending(
     if ticket.owner() != owner {
         return Err(ObjectManagerError::IllegalOwner);
     }
-    validate_replicas(ticket.replicas(), selector)
+    let replicas = ticket.replicas();
+    validate_replicas(replicas.iter(), selector)
 }
 
 fn validate_published(
@@ -376,21 +377,22 @@ fn validate_published(
     if object.owner() != owner {
         return Err(ObjectManagerError::IllegalOwner);
     }
-    validate_replicas(object.replicas(), selector)
+    let replicas = object.replicas();
+    validate_replicas(replicas.iter(), selector)
 }
 
-fn validate_replicas(
-    replicas: &[ReplicaLease],
+fn validate_replicas<'a>(
+    mut replicas: impl Iterator<Item = &'a ReplicaLease>,
     selector: ReplicaSelector,
 ) -> Result<(), ObjectManagerError> {
-    let Some(replica) = replicas.first() else {
+    let Some(replica) = replicas.next() else {
         return Err(ObjectManagerError::Internal);
     };
     let actual = replica
         .direct()
         .map(|replica| replica.replica_class())
         .unwrap_or(ReplicaClass::LocalSsd);
-    if replicas.iter().any(|replica| {
+    if replicas.any(|replica| {
         replica
             .direct()
             .map(|replica| replica.replica_class())

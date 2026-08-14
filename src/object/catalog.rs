@@ -7,15 +7,16 @@ use super::error::{
 };
 use super::identity::{ObjectIdentity, ObjectLookup};
 use super::reclamation::{CatalogTick, CollectBudget, CollectReport, ReclaimFilter, ReclaimTarget};
-use super::replica::{ReplicaLease, ReplicaReclaimBatch, ReplicaSet};
+use super::replica::{ReplicaLease, ReplicaPartition, ReplicaReclaimBatch, ReplicaSet};
 use super::tenant::{CHARGE_RESERVED, QuotaReservationGuard, TenantQuotaCharge};
 use super::write::{ObjectCommit, WriteAdmission, WriteId, WriteOwner};
 use arc_swap::ArcSwapOption;
 use crossbeam_queue::SegQueue;
-use parking_lot::{Mutex, RwLock};
+use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use scc::HashMap;
 use scc::hash_map::Entry;
 use std::fmt;
+use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -31,6 +32,7 @@ const OBJECT_PENDING: u8 = 1;
 const OBJECT_PUBLISHING: u8 = 2;
 const OBJECT_PUBLISHED: u8 = 3;
 const OBJECT_RETIRING: u8 = 4;
+const OBJECT_PRUNING: u8 = 5;
 
 #[derive(Clone)]
 pub struct ObjectCatalog {
@@ -79,8 +81,9 @@ struct ObjectSlot {
     current: ArcSwapOption<CatalogNode>,
 }
 
-/// Stable across claim, stage, and publish. The immutable record is initialized
-/// once; successful puts only advance the lifecycle and never replace this Arc.
+/// Stable across claim, stage, and publish. The record is initialized once;
+/// published replica pruning mutates only its lock-protected replica set and
+/// matching byte counter without replacing this Arc.
 struct CatalogNode {
     record: OnceLock<ObjectRecord>,
     control: ObjectControl,
@@ -89,8 +92,8 @@ struct CatalogNode {
 struct ObjectRecord {
     identity: Arc<ObjectIdentity>,
     content: ObjectContent,
-    replicas: ReplicaSet,
-    reserved_bytes: u64,
+    replicas: RwLock<ReplicaSet>,
+    reserved_bytes: AtomicU64,
     accounting: Option<TenantQuotaCharge>,
 }
 
@@ -148,6 +151,14 @@ pub struct PutTicket {
 #[derive(Clone)]
 pub struct ObjectHandle {
     node: Arc<CatalogNode>,
+}
+
+pub struct ReplicaSetView<'a> {
+    guard: RwLockReadGuard<'a, ReplicaSet>,
+}
+
+pub struct LiveReplicaView<'a> {
+    guard: RwLockReadGuard<'a, ReplicaSet>,
 }
 
 #[derive(Clone, Debug)]
@@ -297,6 +308,10 @@ impl LifecycleCounters {
             .fetch_add(reserved_bytes, Ordering::Relaxed);
     }
 
+    fn on_prune_published(&self, reserved_bytes: u64) {
+        atomic_saturating_sub(&self.live_bytes, reserved_bytes);
+    }
+
     fn on_reclaim(&self, reserved_bytes: u64) {
         atomic_saturating_sub(&self.retired_bytes, reserved_bytes);
     }
@@ -369,6 +384,24 @@ impl CatalogNode {
             charge.release(&self.control.accounting_phase, class, bytes);
         }
     }
+
+    fn release_pruned_accounting(&self, stale: &ReplicaSet) {
+        let record = self.record();
+        let Some(charge) = record.accounting.as_ref() else {
+            return;
+        };
+        let Some(replica_class) = ObjectRecord::direct_replica_class(stale) else {
+            return;
+        };
+        let replica_count = u64::try_from(stale.len())
+            .expect("replica count was representable when the object was staged");
+        let bytes = record
+            .content
+            .logical_bytes()
+            .checked_mul(replica_count)
+            .expect("tenant replica charge was representable when the object was staged");
+        charge.release_committed_partial(&self.control.accounting_phase, replica_class, bytes);
+    }
 }
 
 impl Drop for CatalogNode {
@@ -379,15 +412,76 @@ impl Drop for CatalogNode {
 
 impl ObjectRecord {
     fn tenant_accounting(&self) -> Option<(&TenantQuotaCharge, crate::segment::ReplicaClass, u64)> {
+        let replicas = self.replicas.read();
         let charge = self.accounting.as_ref()?;
-        let replica_class = self.direct_replica_class()?;
-        let replica_count = u64::try_from(self.replicas.len()).ok()?;
+        let replica_class = Self::direct_replica_class(&replicas)?;
+        let replica_count = u64::try_from(replicas.len()).ok()?;
         let bytes = self.content.logical_bytes().checked_mul(replica_count)?;
         Some((charge, replica_class, bytes))
     }
 
-    fn direct_replica_class(&self) -> Option<crate::segment::ReplicaClass> {
-        Some(self.replicas.replicas().first()?.direct()?.replica_class())
+    fn direct_replica_class(replicas: &ReplicaSet) -> Option<crate::segment::ReplicaClass> {
+        Some(replicas.replicas().first()?.direct()?.replica_class())
+    }
+
+    fn current_direct_replica_class(&self) -> Option<crate::segment::ReplicaClass> {
+        Self::direct_replica_class(&self.replicas.read())
+    }
+
+    fn reserved_bytes(&self) -> u64 {
+        self.reserved_bytes.load(Ordering::Relaxed)
+    }
+
+    fn wait_for_pruning(&self) {
+        drop(self.replicas.read());
+    }
+}
+
+impl<'a> ReplicaSetView<'a> {
+    fn new(guard: RwLockReadGuard<'a, ReplicaSet>) -> Self {
+        Self { guard }
+    }
+}
+
+impl Deref for ReplicaSetView<'_> {
+    type Target = [ReplicaLease];
+
+    fn deref(&self) -> &Self::Target {
+        self.guard.replicas()
+    }
+}
+
+impl fmt::Debug for ReplicaSetView<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<'a> LiveReplicaView<'a> {
+    fn new(guard: RwLockReadGuard<'a, ReplicaSet>) -> Self {
+        Self { guard }
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &ReplicaLease> {
+        self.guard.live_iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.iter().count()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.first().is_none()
+    }
+
+    pub fn first(&self) -> Option<&ReplicaLease> {
+        self.iter().next()
+    }
+}
+
+impl fmt::Debug for LiveReplicaView<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.debug_list().entries(self.iter()).finish()
     }
 }
 

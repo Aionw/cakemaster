@@ -453,9 +453,11 @@ fn get_replica_list_response(
     now: cakemaster::object::reclamation::CatalogTick,
 ) -> ExpectedGetReplicaListResponse {
     let read = read?;
-    let replicas = read
-        .object()
-        .replicas()
+    let replica_view = read.object().replicas();
+    if replica_view.is_empty() {
+        return Err(ErrorCode::ObjectNotFound);
+    }
+    let replicas = replica_view
         .iter()
         .map(|replica| replica_descriptor(replica, ReplicaStatus::Complete))
         .collect::<Result<Vec<_>, _>>()?;
