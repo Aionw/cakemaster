@@ -1,3 +1,4 @@
+use cakemaster::client::ClientTick;
 use cakemaster::object::{
     ObjectCatalogConfig, ObjectManager, TenantConfig, TenantId, TenantObjectManager, TenantPolicy,
     TenantQuotaLimits,
@@ -64,6 +65,14 @@ async fn generated_mooncake_rpc_drives_the_real_object_manager() {
         .unwrap(),
     );
     let service = ObjectCatalogRpcService::new(manager.clone());
+    service
+        .client_manager()
+        .remount(OWNER, Vec::new(), ClientTick::ZERO)
+        .unwrap();
+    service
+        .client_manager()
+        .remount(ClientId::new(17, 24), Vec::new(), ClientTick::ZERO)
+        .unwrap();
     assert!(Arc::ptr_eq(service.manager(), &manager));
     let server = WrappedMasterServiceServer::new(service)
         .into_rpc_server()
@@ -363,6 +372,10 @@ async fn multi_tenant_rpc_resolves_once_per_batch_and_maps_tenant_errors() {
         .unwrap(),
     );
     let service = ObjectCatalogRpcService::with_tenants(manager.clone());
+    service
+        .client_manager()
+        .remount(OWNER, Vec::new(), ClientTick::ZERO)
+        .unwrap();
     assert!(Arc::ptr_eq(service.tenant_manager(), &manager));
     let writer = Uuid { high: 17, low: 23 };
 

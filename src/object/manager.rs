@@ -10,14 +10,35 @@ use super::identity::{ObjectIdentity, ObjectLookup};
 use super::reclamation::{CatalogTick, CollectBudget, CollectReport, ReclaimTarget};
 use super::replica::{ReplicaId, ReplicaLease, ReplicaSet};
 use super::tenant::QuotaReservationGuard;
-use super::write::{ObjectCommit, WriteOwner};
+use super::write::{ObjectCommit, WriteAdmission, WriteOwner};
 use crate::segment::placement::{PlacementRequest, ReplicaAllocator};
 use crate::segment::{ReplicaClass, ReservationDescriptor, SegmentPool};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub struct ObjectManager {
     catalog: ObjectCatalog,
     allocator: ReplicaAllocator,
+    observed_segment_epoch: AtomicU64,
+}
+
+/// Narrow capability for revoking pending writes after their sessions fence.
+#[derive(Clone)]
+pub struct PendingWriteRevoker {
+    catalog: ObjectCatalog,
+}
+
+impl PendingWriteRevoker {
+    /// Revokes pending writes for multiple fenced sessions with one catalog
+    /// queue pass.
+    pub(crate) fn revoke_sessions(
+        &self,
+        sessions: impl IntoIterator<Item = crate::client::ClientSession>,
+        now: CatalogTick,
+    ) -> usize {
+        self.catalog
+            .revoke_pending_owners(sessions.into_iter().map(WriteOwner::for_session), now)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -116,14 +137,22 @@ impl ObjectManager {
         pool: Arc<SegmentPool>,
         config: ObjectCatalogConfig,
     ) -> Result<Self, ObjectCatalogConfigError> {
+        let observed_segment_epoch = pool.invalidation_epoch();
         Ok(Self {
             catalog: ObjectCatalog::with_config(config)?,
             allocator: ReplicaAllocator::new(pool),
+            observed_segment_epoch: AtomicU64::new(observed_segment_epoch),
         })
     }
 
     pub const fn catalog(&self) -> &ObjectCatalog {
         &self.catalog
+    }
+
+    pub fn pending_write_revoker(&self) -> PendingWriteRevoker {
+        PendingWriteRevoker {
+            catalog: self.catalog.clone(),
+        }
     }
 
     pub fn pool(&self) -> &Arc<SegmentPool> {
@@ -133,11 +162,11 @@ impl ObjectManager {
     pub fn start_put(
         &self,
         identity: ObjectIdentity,
-        owner: WriteOwner,
+        admission: WriteAdmission,
         plan: ObjectPutPlan,
         now: CatalogTick,
     ) -> Result<StartedPut, ObjectManagerError> {
-        let prepared = self.prepare_put(identity, owner, plan, now)?;
+        let prepared = self.prepare_put(identity, admission, plan, now)?;
         self.finalize_start_put(prepared, None)
     }
 
@@ -145,12 +174,12 @@ impl ObjectManager {
     pub(super) fn prepare_put(
         &self,
         identity: ObjectIdentity,
-        owner: WriteOwner,
+        admission: WriteAdmission,
         plan: ObjectPutPlan,
         now: CatalogTick,
     ) -> Result<PreparedPut, ObjectManagerError> {
         self.validate_plan(&plan)?;
-        let claim = self.catalog.claim_put(identity, owner, now)?;
+        let claim = self.catalog.claim_put(identity, admission, now)?;
         let reservations = self.allocator.reserve(plan.placement())?;
         let replicas = ReplicaSet::from_reservations(reservations);
         if replicas.is_empty() {
@@ -298,6 +327,14 @@ impl ObjectManager {
         budget: CollectBudget,
         targets: &[ReclaimTarget],
     ) -> ObjectManagerMaintenance {
+        let segment_epoch = self.pool().invalidation_epoch();
+        if self
+            .observed_segment_epoch
+            .swap(segment_epoch, Ordering::AcqRel)
+            != segment_epoch
+        {
+            self.catalog.request_liveness_scan();
+        }
         let catalog = self.catalog.collect_step_with_targets(now, budget, targets);
         ObjectManagerMaintenance {
             expired_writes: catalog.expired_pending,

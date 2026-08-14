@@ -1,10 +1,10 @@
-use cakemaster::client::{ClientId, ClientLifecycleConfig, ClientRegistry, ClientTick};
+use cakemaster::client::{ClientId, ClientLifecycleConfig, ClientTick};
 use cakemaster::object::ObjectManager;
 use cakemaster::segment::{SegmentId, SegmentPool};
 use cakemaster_proto::mooncake::{
     ClientStatus, ErrorCode, Segment, Uuid, WrappedMasterServiceClient, WrappedMasterServiceServer,
 };
-use cakemaster_server::{ClientRuntime, MasterClock, ObjectCatalogRpcService};
+use cakemaster_server::{MasterClock, ObjectCatalogRpcService};
 use std::sync::Arc;
 use tokio::sync::oneshot;
 
@@ -30,17 +30,16 @@ fn wire_segment() -> Segment {
 async fn ping_remount_and_expiry_follow_client_session_state() {
     let pool = Arc::new(SegmentPool::new());
     let manager = Arc::new(ObjectManager::new(pool.clone()));
-    let registry = Arc::new(
-        ClientRegistry::with_config(
-            ClientLifecycleConfig::new(16)
-                .with_ttl(10_000)
-                .with_maintenance_budget(16),
-        )
-        .unwrap(),
-    );
-    let runtime =
-        ClientRuntime::with_registry(pool.clone(), registry.clone(), MasterClock::new(), 29);
-    let service = ObjectCatalogRpcService::new_with_runtime(manager, runtime.clone());
+    let service = ObjectCatalogRpcService::new_with_client_config(
+        manager,
+        ClientLifecycleConfig::new(16)
+            .with_ttl(10_000)
+            .with_cleanup_scan_budget(16),
+        MasterClock::new(),
+        29,
+    )
+    .unwrap();
+    let clients = service.client_manager().clone();
     let server = WrappedMasterServiceServer::new(service)
         .into_rpc_server()
         .unwrap();
@@ -59,7 +58,6 @@ async fn ping_remount_and_expiry_follow_client_session_state() {
     let ping = client.ping(client_id.clone()).await.unwrap().unwrap();
     assert_eq!(ping.view_version_id, 29);
     assert_eq!(ping.client_status, ClientStatus::NeedRemount);
-    assert_eq!(runtime.slot_count().await, 0);
 
     assert_eq!(
         client
@@ -73,8 +71,7 @@ async fn ping_remount_and_expiry_follow_client_session_state() {
     let ping = client.ping(client_id.clone()).await.unwrap().unwrap();
     assert_eq!(ping.client_status, ClientStatus::Ok);
 
-    let cleanup = registry.maintenance(ClientTick::new(u64::MAX), 16);
-    assert_eq!(cleanup.len(), 1);
+    clients.heartbeat(CLIENT, ClientTick::new(u64::MAX));
     let ping = client.ping(client_id.clone()).await.unwrap().unwrap();
     assert_eq!(ping.client_status, ClientStatus::NeedRemount);
     assert_eq!(

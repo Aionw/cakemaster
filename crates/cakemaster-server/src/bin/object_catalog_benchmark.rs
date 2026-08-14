@@ -3,7 +3,7 @@
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     DirectReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
-    ObjectIdentity, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
+    ObjectIdentity, ReplicaId, ReplicaLease, ReplicaSet, WriteAdmission,
 };
 use cakemaster::segment::config::DEFAULT_MAX_ALLOCATOR_NODES_PER_SEGMENT;
 use cakemaster::segment::{
@@ -244,7 +244,7 @@ fn run_worker(
                 .reserve(&candidate, OBJECT_BYTES)
                 .expect("benchmark segment must have capacity");
             let ticket = catalog
-                .claim_put(identity, WriteOwner::new(OWNER), now)
+                .claim_put(identity, WriteAdmission::unmanaged(OWNER), now)
                 .expect("benchmark keys are unique")
                 .stage(
                     ObjectContent::new(OBJECT_BYTES),
@@ -357,7 +357,11 @@ fn preload_hot_objects(
             .reserve(&snapshot.candidates()[index % snapshot.len()], OBJECT_BYTES)
             .unwrap();
         let ticket = catalog
-            .claim_put(identity.clone(), WriteOwner::new(OWNER), CatalogTick::ZERO)
+            .claim_put(
+                identity.clone(),
+                WriteAdmission::unmanaged(OWNER),
+                CatalogTick::ZERO,
+            )
             .unwrap()
             .stage(
                 ObjectContent::new(OBJECT_BYTES),

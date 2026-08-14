@@ -2,7 +2,7 @@ use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     ObjectCatalogConfig, ObjectContent, ObjectKind, ObjectPutPlan, ReplicaSelector,
     TenantAdminError, TenantConfig, TenantId, TenantObjectError, TenantObjectManager, TenantPolicy,
-    TenantPutRequest, TenantQuotaLimits, WriteOwner,
+    TenantPutRequest, TenantQuotaLimits, WriteAdmission, WriteOwner,
 };
 use cakemaster::segment::placement::{
     AllocationSpec, FulfillmentPolicy, PlacementRequest, ReplicaPolicy,
@@ -76,6 +76,10 @@ fn owner() -> WriteOwner {
     WriteOwner::new(OWNER)
 }
 
+fn admission() -> WriteAdmission {
+    WriteAdmission::unmanaged(OWNER)
+}
+
 #[test]
 fn tenants_isolate_keys_and_charge_actual_logical_replica_bytes() {
     let manager = manager(4096, 8192);
@@ -83,7 +87,13 @@ fn tenants_isolate_keys_and_charge_actual_logical_replica_bytes() {
     let b = manager.resolve_tenant(&tenant_id("b")).unwrap();
 
     let a_started = manager
-        .start_put(&a, "same-key", owner(), plan(4096, 2), CatalogTick::ZERO)
+        .start_put(
+            &a,
+            "same-key",
+            admission(),
+            plan(4096, 2),
+            CatalogTick::ZERO,
+        )
         .unwrap();
     // Best effort placement found one physical target, so quota follows the
     // actual replica count rather than the requested count.
@@ -92,7 +102,13 @@ fn tenants_isolate_keys_and_charge_actual_logical_replica_bytes() {
         .finish_put(&a, "same-key", owner(), ReplicaSelector::All)
         .unwrap();
     manager
-        .start_put(&b, "same-key", owner(), plan(4096, 1), CatalogTick::ZERO)
+        .start_put(
+            &b,
+            "same-key",
+            admission(),
+            plan(4096, 1),
+            CatalogTick::ZERO,
+        )
         .unwrap();
     manager
         .finish_put(&b, "same-key", owner(), ReplicaSelector::All)
@@ -105,7 +121,13 @@ fn tenants_isolate_keys_and_charge_actual_logical_replica_bytes() {
     assert_eq!(a_snapshot.memory.demand_bytes, 4096);
 
     assert_eq!(
-        manager.start_put(&a, "over-quota", owner(), plan(8192, 1), CatalogTick::ZERO),
+        manager.start_put(
+            &a,
+            "over-quota",
+            admission(),
+            plan(8192, 1),
+            CatalogTick::ZERO,
+        ),
         Err(TenantObjectError::TenantQuotaExceeded {
             class: cakemaster::object::TenantResourceClass::Memory,
             requested_bytes: 8192,
@@ -124,7 +146,7 @@ fn revoke_returns_reserved_quota_and_unknown_tenants_are_rejected() {
         Err(TenantObjectError::TenantNotRegistered)
     ));
     manager
-        .start_put(&a, "pending", owner(), plan(4096, 1), CatalogTick::ZERO)
+        .start_put(&a, "pending", admission(), plan(4096, 1), CatalogTick::ZERO)
         .unwrap();
     assert_eq!(
         manager
@@ -159,7 +181,7 @@ fn pending_timeout_returns_reserved_quota() {
     .unwrap();
     let a = manager.resolve_tenant(&tenant_id("a")).unwrap();
     manager
-        .start_put(&a, "expires", owner(), plan(4096, 1), CatalogTick::ZERO)
+        .start_put(&a, "expires", admission(), plan(4096, 1), CatalogTick::ZERO)
         .unwrap();
 
     let report = manager.maintenance(CatalogTick::new(1), CollectBudget::new(8, 8, 8));
@@ -201,7 +223,13 @@ fn resolved_tenant_handles_cannot_cross_manager_boundaries() {
         Err(TenantObjectError::InvalidTenantHandle)
     );
     assert_eq!(
-        second.start_put(&tenant, "key", owner(), plan(4096, 1), CatalogTick::ZERO,),
+        second.start_put(
+            &tenant,
+            "key",
+            admission(),
+            plan(4096, 1),
+            CatalogTick::ZERO,
+        ),
         Err(TenantObjectError::InvalidTenantHandle)
     );
 }
@@ -211,7 +239,7 @@ fn retiring_quota_is_released_only_after_the_last_read_handle() {
     let manager = manager(4096, 4096);
     let a = manager.resolve_tenant(&tenant_id("a")).unwrap();
     manager
-        .start_put(&a, "held", owner(), plan(4096, 1), CatalogTick::ZERO)
+        .start_put(&a, "held", admission(), plan(4096, 1), CatalogTick::ZERO)
         .unwrap();
     manager
         .finish_put(&a, "held", owner(), ReplicaSelector::All)
@@ -248,14 +276,20 @@ fn quota_shrink_reclaims_only_the_target_tenant_and_does_not_cancel_pending_puts
     let b = manager.resolve_tenant(&tenant_id("b")).unwrap();
     for (tenant, key) in [(&a, "published-a"), (&b, "published-b")] {
         manager
-            .start_put(tenant, key, owner(), plan(4096, 1), CatalogTick::ZERO)
+            .start_put(tenant, key, admission(), plan(4096, 1), CatalogTick::ZERO)
             .unwrap();
         manager
             .finish_put(tenant, key, owner(), ReplicaSelector::All)
             .unwrap();
     }
     manager
-        .start_put(&a, "pending-a", owner(), plan(4096, 1), CatalogTick::ZERO)
+        .start_put(
+            &a,
+            "pending-a",
+            admission(),
+            plan(4096, 1),
+            CatalogTick::ZERO,
+        )
         .unwrap();
 
     manager.upsert_tenant(tenant_id("a"), policy(0, 0)).unwrap();
@@ -322,7 +356,7 @@ fn single_mode_collapses_external_tenant_ids_without_quota() {
     let a = manager.resolve_tenant(&tenant_id("a")).unwrap();
     let b = manager.resolve_tenant(&tenant_id("b")).unwrap();
     manager
-        .start_put(&a, "shared", owner(), plan(4096, 1), CatalogTick::ZERO)
+        .start_put(&a, "shared", admission(), plan(4096, 1), CatalogTick::ZERO)
         .unwrap();
     manager
         .finish_put(&b, "shared", owner(), ReplicaSelector::All)
@@ -339,14 +373,14 @@ fn batch_admission_is_atomic_per_resource_class() {
         TenantPutRequest::new("one", plan(4096, 1)),
         TenantPutRequest::new("two", plan(4096, 1)),
     ];
-    let results = manager.start_put_batch(&a, owner(), requests, CatalogTick::ZERO);
+    let results = manager.start_put_batch(&a, admission(), requests, CatalogTick::ZERO);
     assert!(results.iter().all(Result::is_ok));
     let snapshot = manager.tenant_snapshot(&tenant_id("a")).unwrap();
     assert_eq!(snapshot.memory.reserved_bytes, 8192);
 
     let rejected = manager.start_put_batch(
         &a,
-        owner(),
+        admission(),
         vec![
             TenantPutRequest::new("three", plan(1, 1)),
             TenantPutRequest::new("four", plan(1, 1)),
@@ -370,7 +404,7 @@ fn accepting_capacity_changes_recompute_effective_quota_and_trigger_reclaim() {
     .unwrap();
     let a = manager.resolve_tenant(&tenant_id("a")).unwrap();
     manager
-        .start_put(&a, "object", owner(), plan(4096, 1), CatalogTick::ZERO)
+        .start_put(&a, "object", admission(), plan(4096, 1), CatalogTick::ZERO)
         .unwrap();
     manager
         .finish_put(&a, "object", owner(), ReplicaSelector::All)
@@ -415,7 +449,7 @@ fn best_effort_actual_replica_growth_rechecks_quota_and_rolls_back_placement() {
         manager.start_put(
             &a,
             "two-replicas",
-            owner(),
+            admission(),
             plan(4096, 2),
             CatalogTick::ZERO
         ),
@@ -455,7 +489,7 @@ fn memory_and_nof_quotas_are_admitted_and_accounted_independently() {
     .unwrap();
     let a = manager.resolve_tenant(&tenant_id("a")).unwrap();
     manager
-        .start_put(&a, "memory", owner(), plan(4096, 1), CatalogTick::ZERO)
+        .start_put(&a, "memory", admission(), plan(4096, 1), CatalogTick::ZERO)
         .unwrap();
     manager
         .finish_put(&a, "memory", owner(), ReplicaSelector::All)
@@ -464,7 +498,7 @@ fn memory_and_nof_quotas_are_admitted_and_accounted_independently() {
         .start_put(
             &a,
             "nof",
-            owner(),
+            admission(),
             plan_for(8192, 1, ReplicaClass::Nof, FulfillmentPolicy::AllOrNothing),
             CatalogTick::ZERO,
         )
@@ -477,7 +511,13 @@ fn memory_and_nof_quotas_are_admitted_and_accounted_independently() {
     assert_eq!(snapshot.memory.used_bytes, 4096);
     assert_eq!(snapshot.nof.used_bytes, 8192);
     assert!(matches!(
-        manager.start_put(&a, "memory-over", owner(), plan(1, 1), CatalogTick::ZERO),
+        manager.start_put(
+            &a,
+            "memory-over",
+            admission(),
+            plan(1, 1),
+            CatalogTick::ZERO,
+        ),
         Err(TenantObjectError::TenantQuotaExceeded {
             class: cakemaster::object::TenantResourceClass::Memory,
             ..
@@ -487,7 +527,7 @@ fn memory_and_nof_quotas_are_admitted_and_accounted_independently() {
         manager.start_put(
             &a,
             "nof-over",
-            owner(),
+            admission(),
             plan_for(1, 1, ReplicaClass::Nof, FulfillmentPolicy::AllOrNothing,),
             CatalogTick::ZERO,
         ),

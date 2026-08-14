@@ -4,10 +4,11 @@ use super::super::diagnostics::ObjectCatalogStats;
 use super::super::error::{LookupError, ObjectCatalogConfigError, ObjectManagerError};
 use super::super::identity::{ObjectIdentity, ObjectLookup};
 use super::super::manager::{
-    ObjectManager, ObjectManagerMaintenance, ObjectPutPlan, ReplicaSelector, StartedPut,
+    ObjectManager, ObjectManagerMaintenance, ObjectPutPlan, PendingWriteRevoker, ReplicaSelector,
+    StartedPut,
 };
 use super::super::reclamation::{CatalogTick, CollectBudget};
-use super::super::write::WriteOwner;
+use super::super::write::{WriteAdmission, WriteOwner};
 use super::quota::{QuotaReservationGuard, admission_charge};
 use super::registry::{ResolvedTenant, TenantRegistry};
 use super::{
@@ -119,6 +120,10 @@ impl TenantObjectManager {
         self.object.pool()
     }
 
+    pub fn pending_write_revoker(&self) -> PendingWriteRevoker {
+        self.object.pending_write_revoker()
+    }
+
     pub fn resolve_tenant(
         &self,
         tenant_id: &TenantId,
@@ -130,7 +135,7 @@ impl TenantObjectManager {
         &self,
         tenant: &ResolvedTenant,
         key: impl Into<Arc<str>>,
-        owner: WriteOwner,
+        admission: WriteAdmission,
         plan: ObjectPutPlan,
         now: CatalogTick,
     ) -> Result<StartedPut, TenantObjectError> {
@@ -140,23 +145,23 @@ impl TenantObjectManager {
         self.registry.validate_binding(tenant)?;
         let identity = ObjectIdentity::new(tenant.namespace, key);
         let Some(entry) = &tenant.entry else {
-            return Ok(self.object.start_put(identity, owner, plan, now)?);
+            return Ok(self.object.start_put(identity, admission, plan, now)?);
         };
         let (class, charge_bytes) = admission_charge(&plan)?;
         let reservation = entry.reserve(class, charge_bytes, tenant.version)?;
-        self.start_put_accounted(identity, owner, plan, now, reservation)
+        self.start_put_accounted(identity, admission, plan, now, reservation)
     }
 
     #[inline]
     fn start_put_accounted(
         &self,
         identity: ObjectIdentity,
-        owner: WriteOwner,
+        admission: WriteAdmission,
         plan: ObjectPutPlan,
         now: CatalogTick,
         mut reservation: QuotaReservationGuard,
     ) -> Result<StartedPut, TenantObjectError> {
-        let prepared = self.object.prepare_put(identity, owner, plan, now)?;
+        let prepared = self.object.prepare_put(identity, admission, plan, now)?;
         reservation.resize(prepared.actual_charge_bytes()?)?;
         Ok(self
             .object
@@ -169,7 +174,7 @@ impl TenantObjectManager {
     pub fn start_put_batch(
         &self,
         tenant: &ResolvedTenant,
-        owner: WriteOwner,
+        admission: WriteAdmission,
         requests: Vec<TenantPutRequest>,
         now: CatalogTick,
     ) -> Vec<Result<StartedPut, TenantObjectError>> {
@@ -178,7 +183,7 @@ impl TenantObjectManager {
                 .into_iter()
                 .next()
                 .expect("a one-item batch contains one request");
-            return vec![self.start_put(tenant, request.key, owner, request.plan, now)];
+            return vec![self.start_put(tenant, request.key, admission, request.plan, now)];
         }
         if let Err(error) = self.registry.validate(tenant) {
             return requests.into_iter().map(|_| Err(error)).collect();
@@ -189,7 +194,7 @@ impl TenantObjectManager {
                 .map(|request| -> Result<StartedPut, TenantObjectError> {
                     Ok(self.object.start_put(
                         ObjectIdentity::new(tenant.namespace, request.key),
-                        owner,
+                        admission.clone(),
                         request.plan,
                         now,
                     )?)
@@ -199,7 +204,7 @@ impl TenantObjectManager {
 
         let mut totals = [Some(0_u64), Some(0_u64)];
         let mut counts = [0_usize; 2];
-        let mut admissions = Vec::with_capacity(requests.len());
+        let mut charges = Vec::with_capacity(requests.len());
         for request in &requests {
             let admission = admission_charge(&request.plan);
             if let Ok((class, bytes)) = admission {
@@ -208,7 +213,7 @@ impl TenantObjectManager {
                     totals[class_index].and_then(|total| total.checked_add(bytes));
                 counts[class_index] += 1;
             }
-            admissions.push(admission);
+            charges.push(admission);
         }
 
         let mut class_errors = [None; 2];
@@ -229,16 +234,16 @@ impl TenantObjectManager {
 
         requests
             .into_iter()
-            .zip(admissions)
-            .map(|(request, admission)| {
-                let (class, bytes) = admission?;
+            .zip(charges)
+            .map(|(request, charge)| {
+                let (class, bytes) = charge?;
                 if let Some(error) = class_errors[class.index()] {
                     return Err(error);
                 }
                 let reservation = QuotaReservationGuard::from_reserved(entry.clone(), class, bytes);
                 self.start_put_accounted(
                     ObjectIdentity::new(tenant.namespace, request.key),
-                    owner,
+                    admission.clone(),
                     request.plan,
                     now,
                     reservation,

@@ -5,6 +5,7 @@
 //! grace period.
 
 use super::*;
+use std::collections::HashSet;
 
 enum ScopedCandidate {
     Stale,
@@ -55,6 +56,15 @@ impl ObjectCatalog {
         self.inner.collector.request_reclaim(bytes);
     }
 
+    /// Requests one bounded liveness sweep after segment membership changes.
+    /// Repeated requests extend the current sweep to cover the full queue.
+    pub(in crate::object) fn request_liveness_scan(&self) {
+        self.inner
+            .collector
+            .liveness_scan_requested
+            .store(true, Ordering::Release);
+    }
+
     pub fn collect_step(&self, now: CatalogTick, budget: CollectBudget) -> CollectReport {
         self.collect_step_with_targets(now, budget, &[])
     }
@@ -72,19 +82,61 @@ impl ObjectCatalog {
             };
         };
 
-        // Pending expiration and eviction use separate queue allowances:
-        // expiration applies max_candidates independently, while scoped and
-        // global eviction share one allowance with scoped debt served first.
-        // Reclaim and slot cleanup then use their dedicated budget fields.
+        if self
+            .inner
+            .collector
+            .liveness_scan_requested
+            .swap(false, Ordering::AcqRel)
+        {
+            self.inner
+                .collector
+                .liveness_young_remaining
+                .fetch_max(self.inner.collector.young.len(), Ordering::Release);
+            self.inner
+                .collector
+                .liveness_protected_remaining
+                .fetch_max(self.inner.collector.protected.len(), Ordering::Release);
+        }
+
+        // Pending expiration has its own queue allowance. Liveness, scoped
+        // eviction, and global eviction share the eviction allowance. Normal
+        // eviction stays paused while a liveness sweep is incomplete so it
+        // cannot move an unscanned candidate between generations.
         let mut report = CollectReport::default();
+        let liveness_scanned = self
+            .inner
+            .retire_invalidated_published(now, budget, &mut report);
         self.inner.expire_pending(now, budget, &mut report);
-        let scoped_scanned = self.inner.evict_scoped(now, budget, targets, &mut report);
-        let global_budget = CollectBudget::new(
-            budget.max_candidates.saturating_sub(scoped_scanned),
-            budget.max_reclaims,
-            budget.max_empty_slots,
-        );
-        self.inner.evict(now, global_budget, &mut report);
+        let liveness_incomplete = self
+            .inner
+            .collector
+            .liveness_young_remaining
+            .load(Ordering::Acquire)
+            != 0
+            || self
+                .inner
+                .collector
+                .liveness_protected_remaining
+                .load(Ordering::Acquire)
+                != 0;
+        if !liveness_incomplete {
+            let eviction_budget = CollectBudget::new(
+                budget.max_candidates.saturating_sub(liveness_scanned),
+                budget.max_reclaims,
+                budget.max_empty_slots,
+            );
+            let scoped_scanned =
+                self.inner
+                    .evict_scoped(now, eviction_budget, targets, &mut report);
+            let global_budget = CollectBudget::new(
+                eviction_budget
+                    .max_candidates
+                    .saturating_sub(scoped_scanned),
+                budget.max_reclaims,
+                budget.max_empty_slots,
+            );
+            self.inner.evict(now, global_budget, &mut report);
+        }
         self.inner.reclaim(now, budget, &mut report);
         self.inner.clean_empty_slots(now, budget, &mut report);
         report
@@ -92,6 +144,85 @@ impl ObjectCatalog {
 }
 
 impl CatalogInner {
+    pub(super) fn retire_invalidated_published(
+        &self,
+        now: CatalogTick,
+        budget: CollectBudget,
+        report: &mut CollectReport,
+    ) -> usize {
+        let generations = [
+            (
+                &self.collector.young,
+                &self.collector.liveness_young_remaining,
+            ),
+            (
+                &self.collector.protected,
+                &self.collector.liveness_protected_remaining,
+            ),
+        ];
+        let mut remaining_budget = budget.max_candidates;
+        let mut scanned = 0;
+        for (queue, remaining) in generations {
+            let candidates = remaining.load(Ordering::Acquire).min(remaining_budget);
+            for _ in 0..candidates {
+                let Some(candidate) = queue.pop() else {
+                    remaining.store(0, Ordering::Release);
+                    break;
+                };
+                remaining.fetch_sub(1, Ordering::AcqRel);
+                remaining_budget -= 1;
+                scanned += 1;
+                report.scanned_candidates += 1;
+                let Some(slot) = candidate.slot.upgrade() else {
+                    continue;
+                };
+                let Some(node) = candidate.node.upgrade() else {
+                    continue;
+                };
+                if node.control.lifecycle.load(Ordering::Acquire) != OBJECT_PUBLISHED
+                    || !slot_points_to(&slot, &node)
+                    || node.record.get().is_none()
+                {
+                    continue;
+                }
+                if node.record().replicas.is_live() {
+                    queue.push(candidate);
+                    continue;
+                }
+                if node
+                    .control
+                    .lifecycle
+                    .compare_exchange(
+                        OBJECT_PUBLISHED,
+                        OBJECT_RETIRING,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_err()
+                {
+                    queue.push(candidate);
+                    continue;
+                }
+                if !clear_slot(&slot, &node) {
+                    node.control
+                        .lifecycle
+                        .store(OBJECT_PUBLISHED, Ordering::Release);
+                    queue.push(candidate);
+                    continue;
+                }
+                let bytes = node.record().reserved_bytes;
+                self.retire_published(slot, node, now);
+                report.invalidated_published += 1;
+                report.retired_objects += 1;
+                report.retired_bytes = report.retired_bytes.saturating_add(bytes);
+            }
+            if remaining_budget == 0 {
+                break;
+            }
+        }
+        scanned
+    }
+
     pub(super) fn enqueue_empty(&self, slot: &Arc<ObjectSlot>, now: CatalogTick) {
         self.collector.empty_slots.push(EmptySlotCandidate {
             identity: slot.identity.clone(),
@@ -121,6 +252,82 @@ impl CatalogInner {
         self.enqueue_empty(&slot, now);
     }
 
+    fn resolve_pending_candidate(
+        &self,
+        pending: &PendingCandidate,
+    ) -> Option<(Arc<ObjectSlot>, Arc<CatalogNode>)> {
+        let slot = pending.candidate.slot.upgrade()?;
+        let node = pending.candidate.node.upgrade()?;
+        if node.control.lifecycle.load(Ordering::Acquire) != OBJECT_PENDING
+            || !slot_points_to(&slot, &node)
+            || node.record.get().is_none()
+        {
+            return None;
+        }
+        Some((slot, node))
+    }
+
+    fn try_retire_pending(
+        &self,
+        slot: Arc<ObjectSlot>,
+        node: Arc<CatalogNode>,
+        now: CatalogTick,
+    ) -> bool {
+        if node
+            .control
+            .lifecycle
+            .compare_exchange(
+                OBJECT_PENDING,
+                OBJECT_RETIRING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+            || !clear_slot(&slot, &node)
+        {
+            return false;
+        }
+        self.retire_pending(slot, node, now);
+        true
+    }
+
+    /// Removes pending candidates for a set of already-fenced sessions in one
+    /// pass. Producers enqueue before their final fence check, so a racing
+    /// stage is either present in this snapshot or revokes itself.
+    pub(super) fn revoke_pending_owners(
+        &self,
+        owners: &HashSet<WriteOwner>,
+        now: CatalogTick,
+    ) -> usize {
+        if owners.is_empty() {
+            return 0;
+        }
+
+        let _collector = self.collector.gate.lock();
+        let candidates = {
+            let _stages = self.collector.pending_stage_gate.write();
+            let mut candidates = Vec::with_capacity(self.collector.pending.len());
+            while let Some(pending) = self.collector.pending.pop() {
+                candidates.push(pending);
+            }
+            candidates
+        };
+        let mut revoked = 0;
+        for pending in candidates {
+            let Some((slot, node)) = self.resolve_pending_candidate(&pending) else {
+                continue;
+            };
+            if !owners.contains(&node.control.owner) {
+                self.collector.pending.push(pending);
+                continue;
+            }
+            if self.try_retire_pending(slot, node, now) {
+                revoked += 1;
+            }
+        }
+        revoked
+    }
+
     fn retire_published(&self, slot: Arc<ObjectSlot>, node: Arc<CatalogNode>, now: CatalogTick) {
         let record = node
             .record
@@ -148,39 +355,20 @@ impl CatalogInner {
             let Some(pending) = self.collector.pending.pop() else {
                 break;
             };
-            let Some(slot) = pending.candidate.slot.upgrade() else {
+            let Some((slot, node)) = self.resolve_pending_candidate(&pending) else {
                 continue;
             };
-            let Some(node) = pending.candidate.node.upgrade() else {
-                continue;
-            };
-            if node.control.lifecycle.load(Ordering::Acquire) != OBJECT_PENDING
-                || !slot_points_to(&slot, &node)
-            {
+            if !node.record().replicas.is_live() {
+                if self.try_retire_pending(slot, node, now) {
+                    report.invalidated_pending += 1;
+                }
                 continue;
             }
             if pending.deadline > now {
                 self.collector.pending.push(pending);
                 continue;
             }
-            if node.record.get().is_none() {
-                continue;
-            }
-            if node
-                .control
-                .lifecycle
-                .compare_exchange(
-                    OBJECT_PENDING,
-                    OBJECT_RETIRING,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .is_err()
-            {
-                continue;
-            }
-            if clear_slot(&slot, &node) {
-                self.retire_pending(slot, node, now);
+            if self.try_retire_pending(slot, node, now) {
                 report.expired_pending += 1;
             }
         }

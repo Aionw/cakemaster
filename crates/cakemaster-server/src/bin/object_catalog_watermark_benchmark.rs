@@ -3,7 +3,7 @@
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     DirectReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
-    ObjectIdentity, ReplicaId, ReplicaLease, ReplicaSet, WriteOwner,
+    ObjectIdentity, ReplicaId, ReplicaLease, ReplicaSet, WriteAdmission,
 };
 use cakemaster::segment::{
     ClientId, DirectCandidate, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool,
@@ -257,7 +257,11 @@ fn run_worker(
             let identity = keys.next().expect("one key exists for every put");
             let succeeded = match pool.reserve(&candidate, OBJECT_BYTES) {
                 Ok(reservation) => {
-                    match catalog.claim_put(identity, WriteOwner::new(OWNER), CatalogTick::ZERO) {
+                    match catalog.claim_put(
+                        identity,
+                        WriteAdmission::unmanaged(OWNER),
+                        CatalogTick::ZERO,
+                    ) {
                         Ok(claim) => match claim.stage(
                             ObjectContent::new(OBJECT_BYTES),
                             ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
@@ -432,7 +436,11 @@ fn preload_objects(
             .reserve(candidate, OBJECT_BYTES)
             .expect("prefill must fit below the high watermark");
         let ticket = catalog
-            .claim_put(identity, WriteOwner::new(OWNER), CatalogTick::ZERO)
+            .claim_put(
+                identity,
+                WriteAdmission::unmanaged(OWNER),
+                CatalogTick::ZERO,
+            )
             .expect("prefill keys are unique")
             .stage(
                 ObjectContent::new(OBJECT_BYTES),

@@ -1,4 +1,4 @@
-//! Client-registry TTL, capacity, and maintenance configuration.
+//! Client-registry TTL, capacity, and cleanup-scan configuration.
 
 use super::error::ClientLifecycleConfigError;
 
@@ -7,7 +7,7 @@ use super::error::ClientLifecycleConfigError;
 pub struct ClientLifecycleConfig {
     pub(super) ttl_ticks: u64,
     pub(super) max_clients: usize,
-    pub(super) maintenance_budget: usize,
+    pub(super) cleanup_scan_budget: usize,
 }
 
 impl ClientLifecycleConfig {
@@ -15,7 +15,7 @@ impl ClientLifecycleConfig {
         Self {
             ttl_ticks: 10_000,
             max_clients,
-            maintenance_budget: 256,
+            cleanup_scan_budget: 256,
         }
     }
 
@@ -24,8 +24,8 @@ impl ClientLifecycleConfig {
         self
     }
 
-    pub const fn with_maintenance_budget(mut self, maintenance_budget: usize) -> Self {
-        self.maintenance_budget = maintenance_budget;
+    pub const fn with_cleanup_scan_budget(mut self, cleanup_scan_budget: usize) -> Self {
+        self.cleanup_scan_budget = cleanup_scan_budget;
         self
     }
 
@@ -37,8 +37,8 @@ impl ClientLifecycleConfig {
         self.max_clients
     }
 
-    pub const fn maintenance_budget(self) -> usize {
-        self.maintenance_budget
+    pub const fn cleanup_scan_budget(self) -> usize {
+        self.cleanup_scan_budget
     }
 
     pub(super) fn validate(self) -> Result<(), ClientLifecycleConfigError> {
@@ -48,8 +48,8 @@ impl ClientLifecycleConfig {
         if self.max_clients == 0 {
             return Err(ClientLifecycleConfigError::ZeroMaxClients);
         }
-        if self.maintenance_budget == 0 {
-            return Err(ClientLifecycleConfigError::ZeroMaintenanceBudget);
+        if self.cleanup_scan_budget == 0 {
+            return Err(ClientLifecycleConfigError::ZeroCleanupScanBudget);
         }
         Ok(())
     }
