@@ -4,7 +4,7 @@ mod request;
 mod response;
 mod single_tenant;
 
-use crate::MasterClock;
+use crate::{MasterClock, MasterReconcileConfig, MasterReconciler};
 use backend::{ObjectBatchBackend, batch_error};
 use cakemaster::client::{
     ClientLifecycleConfig, ClientLifecycleConfigError, ClientLifecycleError, ClientManager,
@@ -82,6 +82,16 @@ impl ObjectCatalogRpcService<ObjectManager> {
     pub fn manager(&self) -> &Arc<ObjectManager> {
         &self.backend
     }
+
+    /// Creates an explicitly driven reconciler sharing this service's managers and clock.
+    pub fn reconciler(&self, config: MasterReconcileConfig) -> MasterReconciler {
+        MasterReconciler::for_object_manager(
+            self.clients.clone(),
+            self.backend.clone(),
+            self.clock.clone(),
+            config,
+        )
+    }
 }
 
 impl ObjectCatalogRpcService<TenantObjectManager> {
@@ -96,6 +106,16 @@ impl ObjectCatalogRpcService<TenantObjectManager> {
 
     pub fn tenant_manager(&self) -> &Arc<TenantObjectManager> {
         &self.backend
+    }
+
+    /// Creates an explicitly driven reconciler sharing this service's managers and clock.
+    pub fn reconciler(&self, config: MasterReconcileConfig) -> MasterReconciler {
+        MasterReconciler::for_tenant_object_manager(
+            self.clients.clone(),
+            self.backend.clone(),
+            self.clock.clone(),
+            config,
+        )
     }
 }
 

@@ -12,6 +12,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "arborium-sysroot"
 version = "2.18.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -105,6 +111,8 @@ dependencies = [
  "cakemaster-proto",
  "coro-rpc",
  "futures-util",
+ "log",
+ "logforth",
  "thiserror",
  "tokio",
 ]
@@ -332,6 +340,46 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
 
 [[package]]
+name = "logforth"
+version = "0.30.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "522000d3921e4b089de59204d2d3ca8792cd53f8ce5a54b5ac8b9a6e867259f0"
+dependencies = [
+ "logforth-append-async",
+ "logforth-bridge-log",
+ "logforth-core",
+]
+
+[[package]]
+name = "logforth-append-async"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05c2f35f57d9a476b768927b079e364674db9a19d6389f623b69f202376bfb1f"
+dependencies = [
+ "logforth-core",
+ "oneshot",
+]
+
+[[package]]
+name = "logforth-bridge-log"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9c7224c78547e542572ae4d1f787f96c4395a4c3f24513bf221bd8e49888f610"
+dependencies = [
+ "log",
+ "logforth-core",
+]
+
+[[package]]
+name = "logforth-core"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "400ba5305e0cb6819efa6c2c503020562eb5b47fd53c91c935be55af1ffd374e"
+dependencies = [
+ "anyhow",
+]
+
+[[package]]
 name = "md-5"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -379,6 +427,12 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "oneshot"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cfe21416a02c693fb9f980befcb230ecc70b0b3d1cc4abf88b9675c4c1457f0c"
 
 [[package]]
 name = "parking_lot"

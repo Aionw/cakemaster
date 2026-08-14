@@ -46,10 +46,27 @@ impl DemoService for DemoServiceImpl {
 
 #[tokio::main]
 async fn main() {
+    init_logging();
     if let Err(error) = run().await {
-        eprintln!("error: {error}");
+        log::error!(error:% = error; "cakemaster exited with an error");
+        log::logger().flush();
         std::process::exit(1);
     }
+    log::logger().flush();
+}
+
+fn init_logging() {
+    let stderr = logforth::append::asynchronous::AsyncBuilder::new("cakemaster-log")
+        .buffered_lines_limit(Some(8_192))
+        .overflow_block()
+        .append(logforth::append::Stderr::default())
+        .build();
+    let logger = logforth::core::builder()
+        .dispatch(|dispatch| dispatch.append(stderr))
+        .build();
+    let bridge = logforth::bridge::log::LogBridge::new(logger);
+    log::set_boxed_logger(Box::new(bridge)).expect("global logger must not already be installed");
+    log::set_max_level(log::LevelFilter::Info);
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {

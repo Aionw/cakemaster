@@ -35,8 +35,10 @@ segment 全部 reactivate 后才发布 active session，因此 object write 不�
 
 每次 RPC 的 maintenance candidate budget 至少等于当前 batch item 数，因此批量写入
 不会固定每批加入 333 个 timeout candidate、却长期只清理默认的 64 个；reclaim 和空
-slot budget 仍使用固定上限。没有请求时的定时维护属于 server composition root，不由
-同步领域 manager 或单个 handler 隐式启动后台任务。
+slot budget 仍使用固定上限。没有请求时，composition root 可从 service 构造
+`MasterReconciler`，默认每 100ms 先执行一轮 client cleanup，再执行有界 object
+maintenance。它使用 `MissedTickBehavior::Skip` 且由调用方显式运行和停止；同步
+领域 manager 和单个 handler 不会隐式启动后台任务。
 
 服务类型为 `ObjectCatalogRpcService<B>`，默认 backend 是 `ObjectManager`。RPC
 adapter 内部用私有 `ObjectBatchBackend` trait 统一 batch 接口：single backend 的
