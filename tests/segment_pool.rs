@@ -556,6 +556,24 @@ fn owner_invalidation_is_intent_level_idempotent_and_does_not_wait_for_allocatio
 }
 
 #[test]
+fn batch_owner_invalidation_deduplicates_owners_and_updates_placement_once() {
+    let pool = pool();
+    let first = spec(1, "memory-a");
+    let first_id = first.identity().id();
+    let second = owned_spec(2, "memory-b", OTHER_OWNER);
+    let second_id = second.identity().id();
+    pool.attach(first).unwrap();
+    pool.attach(second).unwrap();
+    let generation = pool.snapshot().generation();
+
+    assert_eq!(pool.invalidate_owners([OWNER, OWNER, OTHER_OWNER]), 2);
+    assert!(pool.segment(first_id).is_none());
+    assert!(pool.segment(second_id).is_none());
+    assert!(pool.snapshot().generation() > generation);
+    assert_eq!(pool.invalidate_owners([OWNER, OTHER_OWNER]), 0);
+}
+
+#[test]
 fn reservation_owns_the_range_and_releases_it_on_drop() {
     let pool = pool();
     let candidate = pool.attach(spec(1, "memory-a")).unwrap();

@@ -3,8 +3,10 @@ use super::config::ClientLifecycleConfig;
 use super::error::{ClientLifecycleConfigError, ClientLifecycleError};
 use parking_lot::Mutex;
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ClientTick(u64);
@@ -46,6 +48,42 @@ impl ClientSession {
     }
 }
 
+/// Cloneable fencing token for operations owned by one client incarnation.
+/// The registry invalidates it before emitting cleanup work.
+#[derive(Clone)]
+pub(crate) struct ClientSessionGuard {
+    inner: Arc<ClientSessionGuardInner>,
+}
+
+struct ClientSessionGuardInner {
+    session: ClientSession,
+    active: AtomicBool,
+}
+
+impl ClientSessionGuard {
+    pub(crate) fn session(&self) -> ClientSession {
+        self.inner.session
+    }
+
+    pub(crate) fn is_active(&self) -> bool {
+        self.inner.active.load(Ordering::Acquire)
+    }
+
+    fn invalidate(&self) {
+        self.inner.active.store(false, Ordering::Release);
+    }
+}
+
+impl fmt::Debug for ClientSessionGuard {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientSessionGuard")
+            .field("session", &self.session())
+            .field("active", &self.is_active())
+            .finish()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum ClientState {
     Active,
@@ -80,19 +118,52 @@ pub enum CleanupReason {
     ServerShutdown,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Exclusive ownership of one fenced session's cleanup.
+///
+/// Dropping an unfinished claim makes it available to the next maintenance
+/// round. This keeps cancellation and transient runtime failures from losing
+/// cleanup work while ensuring only one worker can clean a session at a time.
 pub struct ClientCleanup {
+    registry: Option<Arc<ClientRegistryInner>>,
     session: ClientSession,
     reason: CleanupReason,
 }
 
 impl ClientCleanup {
-    pub const fn session(self) -> ClientSession {
+    pub const fn session(&self) -> ClientSession {
         self.session
     }
 
-    pub const fn reason(self) -> CleanupReason {
+    pub const fn reason(&self) -> CleanupReason {
         self.reason
+    }
+
+    /// Completes cleanup and removes the fenced session from the registry.
+    pub fn finish(mut self) -> Result<(), ClientLifecycleError> {
+        self.registry
+            .as_ref()
+            .expect("unfinished cleanup retains its registry")
+            .finish_cleanup(self.session)?;
+        self.registry = None;
+        Ok(())
+    }
+}
+
+impl fmt::Debug for ClientCleanup {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClientCleanup")
+            .field("session", &self.session)
+            .field("reason", &self.reason)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ClientCleanup {
+    fn drop(&mut self) {
+        if let Some(registry) = &self.registry {
+            registry.release_cleanup(self.session);
+        }
     }
 }
 
@@ -115,15 +186,31 @@ struct ClientRegistryInner {
 struct RegistryState {
     entries: HashMap<ClientId, ClientEntry>,
     deadlines: BinaryHeap<Reverse<DeadlineRecord>>,
+    cleanup_ready: VecDeque<ClientSession>,
     next_generation: u64,
 }
 
 struct ClientEntry {
     session: ClientSession,
-    state: ClientState,
+    guard: ClientSessionGuard,
+    phase: ClientPhase,
     expires_at: ClientTick,
-    cleanup_reason: Option<CleanupReason>,
-    cleanup_issued: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClientPhase {
+    Active,
+    CleanupPending {
+        reason: CleanupReason,
+        claim: CleanupClaimState,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CleanupClaimState {
+    Ready,
+    Queued,
+    Running,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -147,6 +234,7 @@ impl ClientRegistry {
                 state: Mutex::new(RegistryState {
                     entries: HashMap::with_capacity(config.max_clients),
                     deadlines: BinaryHeap::with_capacity(config.max_clients),
+                    cleanup_ready: VecDeque::new(),
                     next_generation: 1,
                 }),
             }),
@@ -171,7 +259,7 @@ impl ClientRegistry {
             .lock()
             .entries
             .get(&client_id)
-            .map(|entry| entry.state)
+            .map(ClientEntry::state)
     }
 
     /// Establishes a session after the caller has completed register/remount.
@@ -190,8 +278,10 @@ impl ClientRegistry {
 
         let mut registry = self.inner.state.lock();
         if let Some(entry) = registry.entries.get_mut(&client_id) {
-            if entry.state != ClientState::Active {
-                return Err(ClientLifecycleError::CleanupInProgress { state: entry.state });
+            if !entry.is_active() {
+                return Err(ClientLifecycleError::CleanupInProgress {
+                    state: entry.state(),
+                });
             }
             if entry.expire_if_due(now) {
                 return Err(ClientLifecycleError::CleanupInProgress {
@@ -213,15 +303,20 @@ impl ClientRegistry {
             client_id,
             generation,
         };
+        let guard = ClientSessionGuard {
+            inner: Arc::new(ClientSessionGuardInner {
+                session,
+                active: AtomicBool::new(true),
+            }),
+        };
         let expires_at = now.saturating_add(self.inner.config.ttl_ticks);
         registry.entries.insert(
             client_id,
             ClientEntry {
                 session,
-                state: ClientState::Active,
+                guard,
+                phase: ClientPhase::Active,
                 expires_at,
-                cleanup_reason: None,
-                cleanup_issued: false,
             },
         );
         registry.deadlines.push(Reverse(DeadlineRecord {
@@ -239,7 +334,7 @@ impl ClientRegistry {
         let Some(entry) = registry.entries.get_mut(&client_id) else {
             return HeartbeatOutcome::NeedRemount;
         };
-        if entry.state != ClientState::Active || entry.expire_if_due(now) {
+        if !entry.is_active() || entry.expire_if_due(now) {
             return HeartbeatOutcome::NeedRemount;
         }
 
@@ -259,12 +354,30 @@ impl ClientRegistry {
             .lock()
             .entries
             .get(&client_id)
-            .filter(|entry| entry.state == ClientState::Active)
+            .filter(|entry| entry.is_active())
             .map(|entry| entry.session)
             .ok_or(ClientLifecycleError::ClientNotActive)
     }
 
-    /// Fences a session and emits cleanup work exactly once.
+    /// Returns the generation-bound fencing token used by a new operation.
+    pub(crate) fn active_session_guard(
+        &self,
+        client_id: ClientId,
+    ) -> Result<ClientSessionGuard, ClientLifecycleError> {
+        if client_id.is_nil() {
+            return Err(ClientLifecycleError::NilClientId);
+        }
+        self.inner
+            .state
+            .lock()
+            .entries
+            .get(&client_id)
+            .filter(|entry| entry.is_active())
+            .map(|entry| entry.guard.clone())
+            .ok_or(ClientLifecycleError::ClientNotActive)
+    }
+
+    /// Fences a session and claims its cleanup when no worker owns it.
     pub fn begin_drain(
         &self,
         session: ClientSession,
@@ -276,31 +389,40 @@ impl ClientRegistry {
         };
         entry.ensure_session(session)?;
 
-        if entry.state == ClientState::Active {
-            entry.state = match reason {
-                CleanupReason::HeartbeatExpired => ClientState::Expired,
-                CleanupReason::GracefulUnmount | CleanupReason::ServerShutdown => {
-                    ClientState::Draining
-                }
-            };
-            entry.cleanup_reason = Some(reason);
+        if entry.is_active() {
+            entry.fence(reason);
         }
 
-        Ok(entry.issue_cleanup())
+        let cleanup = entry.claim_cleanup(CleanupClaimState::Ready);
+        Ok(cleanup.map(|(session, reason)| self.cleanup_claim(session, reason)))
     }
 
     /// Processes at most `budget` due or stale deadline records.
     ///
     /// Heartbeats update only the entry. When its original heap record becomes
-    /// due, maintenance either requeues the single latest deadline or fences
-    /// and returns the session for cleanup. The configured maintenance budget
-    /// is a hard per-call cap; callers may pass a smaller budget for this round.
-    pub fn maintenance(&self, now: ClientTick, budget: usize) -> Vec<ClientCleanup> {
+    /// due, this scan either requeues the single latest deadline or fences and
+    /// returns the session for cleanup. The configured per-round budget is a
+    /// hard per-call cap; callers may pass a smaller budget for this round.
+    pub fn claim_due_cleanups(&self, now: ClientTick, budget: usize) -> Vec<ClientCleanup> {
         let mut registry = self.inner.state.lock();
         let mut cleanups = Vec::new();
-        let budget = budget.min(self.inner.config.maintenance_budget);
+        let budget = budget.min(self.inner.config.cleanup_scan_budget);
 
-        for _ in 0..budget {
+        let mut processed = 0;
+        while processed < budget {
+            let Some(session) = registry.cleanup_ready.pop_front() else {
+                break;
+            };
+            processed += 1;
+            if let Some(entry) = registry.entries.get_mut(&session.client_id)
+                && entry.session == session
+                && let Some((session, reason)) = entry.claim_cleanup(CleanupClaimState::Queued)
+            {
+                cleanups.push(self.cleanup_claim(session, reason));
+            }
+        }
+
+        while processed < budget {
             let Some(Reverse(record)) = registry.deadlines.peek().copied() else {
                 break;
             };
@@ -308,31 +430,39 @@ impl ClientRegistry {
                 break;
             }
             registry.deadlines.pop();
+            processed += 1;
 
             let mut replacement = None;
             if let Some(entry) = registry.entries.get_mut(&record.client_id)
                 && entry.session.generation == record.generation
             {
-                match entry.state {
-                    ClientState::Active if now < entry.expires_at => {
+                match entry.phase {
+                    ClientPhase::Active if now < entry.expires_at => {
                         replacement = Some(DeadlineRecord {
                             expires_at: entry.expires_at,
                             client_id: record.client_id,
                             generation: record.generation,
                         });
                     }
-                    ClientState::Active => {
+                    ClientPhase::Active => {
                         entry.mark_expired();
-                        if let Some(cleanup) = entry.issue_cleanup() {
-                            cleanups.push(cleanup);
+                        if let Some((session, reason)) =
+                            entry.claim_cleanup(CleanupClaimState::Ready)
+                        {
+                            cleanups.push(self.cleanup_claim(session, reason));
                         }
                     }
-                    ClientState::Expired => {
-                        if let Some(cleanup) = entry.issue_cleanup() {
-                            cleanups.push(cleanup);
+                    ClientPhase::CleanupPending {
+                        reason: CleanupReason::HeartbeatExpired,
+                        ..
+                    } => {
+                        if let Some((session, reason)) =
+                            entry.claim_cleanup(CleanupClaimState::Ready)
+                        {
+                            cleanups.push(self.cleanup_claim(session, reason));
                         }
                     }
-                    ClientState::Draining => {}
+                    ClientPhase::CleanupPending { .. } => {}
                 }
             }
             if let Some(replacement) = replacement {
@@ -342,22 +472,12 @@ impl ClientRegistry {
 
         cleanups
     }
-
-    /// Removes a fenced session after all external resource cleanup succeeds.
-    ///
-    /// Finishing an already removed session is idempotent. If a newer session
-    /// with the same client ID exists, the generation mismatch is rejected.
-    pub fn finish_cleanup(&self, session: ClientSession) -> Result<(), ClientLifecycleError> {
-        let mut registry = self.inner.state.lock();
-        let Some(entry) = registry.entries.get(&session.client_id) else {
-            return Ok(());
-        };
-        entry.ensure_session(session)?;
-        if entry.state == ClientState::Active || !entry.cleanup_issued {
-            return Err(ClientLifecycleError::CleanupNotStarted);
+    fn cleanup_claim(&self, session: ClientSession, reason: CleanupReason) -> ClientCleanup {
+        ClientCleanup {
+            registry: Some(Arc::clone(&self.inner)),
+            session,
+            reason,
         }
-        registry.entries.remove(&session.client_id);
-        Ok(())
     }
 }
 
@@ -377,7 +497,48 @@ impl RegistryState {
     }
 }
 
+impl ClientRegistryInner {
+    fn finish_cleanup(&self, session: ClientSession) -> Result<(), ClientLifecycleError> {
+        let mut registry = self.state.lock();
+        let Some(entry) = registry.entries.get(&session.client_id) else {
+            return Ok(());
+        };
+        entry.ensure_session(session)?;
+        if !entry.cleanup_is_running() {
+            return Err(ClientLifecycleError::CleanupNotStarted);
+        }
+        registry.entries.remove(&session.client_id);
+        Ok(())
+    }
+
+    fn release_cleanup(&self, session: ClientSession) {
+        let mut registry = self.state.lock();
+        let should_retry = registry
+            .entries
+            .get_mut(&session.client_id)
+            .is_some_and(|entry| entry.session == session && entry.queue_running_cleanup());
+        if should_retry {
+            registry.cleanup_ready.push_back(session);
+        }
+    }
+}
+
 impl ClientEntry {
+    fn state(&self) -> ClientState {
+        match self.phase {
+            ClientPhase::Active => ClientState::Active,
+            ClientPhase::CleanupPending {
+                reason: CleanupReason::HeartbeatExpired,
+                ..
+            } => ClientState::Expired,
+            ClientPhase::CleanupPending { .. } => ClientState::Draining,
+        }
+    }
+
+    fn is_active(&self) -> bool {
+        self.phase == ClientPhase::Active
+    }
+
     fn ensure_session(&self, session: ClientSession) -> Result<(), ClientLifecycleError> {
         if self.session == session {
             Ok(())
@@ -399,19 +560,55 @@ impl ClientEntry {
     }
 
     fn mark_expired(&mut self) {
-        self.state = ClientState::Expired;
-        self.cleanup_reason = Some(CleanupReason::HeartbeatExpired);
+        debug_assert!(self.is_active());
+        self.phase = ClientPhase::CleanupPending {
+            reason: CleanupReason::HeartbeatExpired,
+            claim: CleanupClaimState::Ready,
+        };
+        self.guard.invalidate();
     }
 
-    fn issue_cleanup(&mut self) -> Option<ClientCleanup> {
-        if self.cleanup_issued {
+    fn fence(&mut self, reason: CleanupReason) {
+        debug_assert!(self.is_active());
+        self.phase = ClientPhase::CleanupPending {
+            reason,
+            claim: CleanupClaimState::Ready,
+        };
+        self.guard.invalidate();
+    }
+
+    fn claim_cleanup(
+        &mut self,
+        expected: CleanupClaimState,
+    ) -> Option<(ClientSession, CleanupReason)> {
+        let ClientPhase::CleanupPending { reason, claim } = &mut self.phase else {
+            return None;
+        };
+        if *claim != expected {
             return None;
         }
-        let reason = self.cleanup_reason?;
-        self.cleanup_issued = true;
-        Some(ClientCleanup {
-            session: self.session,
-            reason,
-        })
+        *claim = CleanupClaimState::Running;
+        Some((self.session, *reason))
+    }
+
+    fn cleanup_is_running(&self) -> bool {
+        matches!(
+            self.phase,
+            ClientPhase::CleanupPending {
+                claim: CleanupClaimState::Running,
+                ..
+            }
+        )
+    }
+
+    fn queue_running_cleanup(&mut self) -> bool {
+        let ClientPhase::CleanupPending { claim, .. } = &mut self.phase else {
+            return false;
+        };
+        if *claim != CleanupClaimState::Running {
+            return false;
+        }
+        *claim = CleanupClaimState::Queued;
+        true
     }
 }

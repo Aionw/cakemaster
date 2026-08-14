@@ -3,7 +3,7 @@ use super::response::{map_lookup_error, map_manager_error};
 use cakemaster::object::reclamation::CatalogTick;
 use cakemaster::object::{
     NamespaceId, ObjectIdentity, ObjectLookup, ObjectManager, ObjectRead, ReplicaSelector,
-    StartedPut, TenantPutRequest, WriteOwner,
+    StartedPut, TenantPutRequest, WriteAdmission, WriteOwner,
 };
 use cakemaster_proto::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
 
@@ -52,7 +52,7 @@ impl ObjectBatchBackend for ObjectManager {
     fn start_put_batch(
         &self,
         _tenant: &Self::Tenant,
-        owner: WriteOwner,
+        admission: WriteAdmission,
         requests: Vec<TenantPutRequest>,
         now: CatalogTick,
     ) -> Vec<Result<StartedPut, ErrorCode>> {
@@ -63,7 +63,7 @@ impl ObjectBatchBackend for ObjectManager {
                 ObjectManager::start_put(
                     self,
                     ObjectIdentity::new(NamespaceId::DEFAULT, key),
-                    owner,
+                    admission.clone(),
                     plan,
                     now,
                 )

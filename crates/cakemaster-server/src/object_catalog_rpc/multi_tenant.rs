@@ -3,7 +3,7 @@ use super::response::{map_lookup_error, map_manager_error, map_tenant_error};
 use cakemaster::object::reclamation::CatalogTick;
 use cakemaster::object::{
     ObjectRead, ReplicaSelector, ResolvedTenant, StartedPut, TenantId, TenantObjectError,
-    TenantObjectManager, TenantPutRequest, WriteOwner,
+    TenantObjectManager, TenantPutRequest, WriteAdmission, WriteOwner,
 };
 use cakemaster_proto::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
 
@@ -48,11 +48,11 @@ impl ObjectBatchBackend for TenantObjectManager {
     fn start_put_batch(
         &self,
         tenant: &Self::Tenant,
-        owner: WriteOwner,
+        admission: WriteAdmission,
         requests: Vec<TenantPutRequest>,
         now: CatalogTick,
     ) -> Vec<Result<StartedPut, ErrorCode>> {
-        TenantObjectManager::start_put_batch(self, tenant, owner, requests, now)
+        TenantObjectManager::start_put_batch(self, tenant, admission, requests, now)
             .into_iter()
             .map(|result| result.map_err(map_tenant_error))
             .collect()

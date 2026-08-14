@@ -20,7 +20,6 @@ impl ObjectCatalog {
                 OBJECT_PUBLISHED => {}
                 _ => unreachable!("object lifecycle is validated internally"),
             }
-
             let lease_expires_at = node.control.acquire_lease(
                 now,
                 self.inner.config.lease_ttl_ticks,
@@ -29,6 +28,7 @@ impl ObjectCatalog {
             node.control.recent.store(true, Ordering::Relaxed);
             if node.control.lifecycle.load(Ordering::Acquire) == OBJECT_PUBLISHED
                 && slot_points_to(&slot, &node)
+                && node.record().replicas.is_live()
             {
                 return Ok(ObjectRead {
                     object: ObjectHandle { node },

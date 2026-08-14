@@ -1,5 +1,7 @@
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
-use cakemaster::object::{ObjectRead, ReplicaSelector, StartedPut, TenantPutRequest, WriteOwner};
+use cakemaster::object::{
+    ObjectRead, ReplicaSelector, StartedPut, TenantPutRequest, WriteAdmission, WriteOwner,
+};
 use cakemaster_proto::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
 
 /// Private adapter boundary: core managers remain concrete, while the RPC
@@ -43,7 +45,7 @@ pub(super) trait ObjectBatchBackend: Send + Sync + 'static {
     fn start_put_batch(
         &self,
         tenant: &Self::Tenant,
-        owner: WriteOwner,
+        admission: WriteAdmission,
         requests: Vec<TenantPutRequest>,
         now: CatalogTick,
     ) -> Vec<Result<StartedPut, ErrorCode>>;

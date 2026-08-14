@@ -29,6 +29,7 @@ pub struct SegmentPool {
     config: SegmentPoolConfig,
     catalog: RwLock<Catalog>,
     direct_capacity_epoch: AtomicU64,
+    invalidation_epoch: AtomicU64,
 }
 
 /// Metadata and runtime-state handle for one logical segment.
@@ -259,6 +260,7 @@ impl SegmentPool {
             config,
             catalog: RwLock::new(Catalog::new(pool_id)),
             direct_capacity_epoch: AtomicU64::new(0),
+            invalidation_epoch: AtomicU64::new(0),
         })
     }
 
@@ -313,6 +315,12 @@ impl SegmentPool {
     /// Cheap change token for callers that cache accepting capacities.
     pub fn direct_capacity_epoch(&self) -> u64 {
         self.direct_capacity_epoch.load(Ordering::Acquire)
+    }
+
+    /// Cheap change token for consumers that retire objects whose segment
+    /// lifetime was explicitly invalidated.
+    pub(crate) fn invalidation_epoch(&self) -> u64 {
+        self.invalidation_epoch.load(Ordering::Acquire)
     }
 
     pub fn offload_snapshot(&self) -> OffloadSnapshot {
@@ -412,7 +420,9 @@ impl SegmentPool {
     }
 
     pub fn remove(&self, owner: ClientId, id: SegmentId) -> Result<(), SegmentStateError> {
-        self.update_direct_catalog(|catalog| catalog.remove(owner, id))
+        self.update_direct_catalog(|catalog| catalog.remove(owner, id))?;
+        self.invalidation_epoch.fetch_add(1, Ordering::Release);
+        Ok(())
     }
 
     /// Logically invalidates every segment owned by a fenced client and removes
@@ -420,9 +430,16 @@ impl SegmentPool {
     /// physical allocation until dropped, but become unusable immediately.
     /// Repeating cleanup for an owner with no mounted segments is a no-op.
     pub fn invalidate_owner(&self, owner: ClientId) -> usize {
-        let invalidated = self.catalog.write().invalidate_owner(owner);
+        self.invalidate_owners(std::iter::once(owner))
+    }
+
+    /// Invalidates many owners under one catalog lock and publishes one new
+    /// placement snapshot. Duplicate and already-cleaned owners are ignored.
+    pub fn invalidate_owners(&self, owners: impl IntoIterator<Item = ClientId>) -> usize {
+        let invalidated = self.catalog.write().invalidate_owners(owners);
         if invalidated != 0 {
             self.direct_capacity_epoch.fetch_add(1, Ordering::Release);
+            self.invalidation_epoch.fetch_add(1, Ordering::Release);
         }
         invalidated
     }

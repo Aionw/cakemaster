@@ -6,12 +6,13 @@ use super::{
 use crate::segment::error::{AttachError, LocalSsdError, SegmentStateError};
 use crate::segment::identity::{ClientId, SegmentId};
 use crate::segment::spec::{ReplicaClass, SegmentSpec};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 pub(super) struct Catalog {
     pool_id: u64,
     segments: HashMap<SegmentId, Arc<SegmentEntry>>,
+    segments_by_owner: HashMap<ClientId, HashSet<SegmentId>>,
     resources: ResourceRegistry,
     indexes: CandidateIndexes,
 }
@@ -29,6 +30,7 @@ impl Catalog {
         Self {
             pool_id,
             segments: HashMap::new(),
+            segments_by_owner: HashMap::new(),
             resources: ResourceRegistry::default(),
             indexes: CandidateIndexes::default(),
         }
@@ -55,6 +57,10 @@ impl Catalog {
         let entry = Arc::new(SegmentEntry::new(Arc::new(spec), resource));
         let segment = self.handle(entry.clone());
         self.segments.insert(segment.id(), entry);
+        self.segments_by_owner
+            .entry(segment.spec().identity().owner())
+            .or_default()
+            .insert(segment.id());
         self.rebuild_indexes();
         Ok(AttachOutcome::Attached(segment))
     }
@@ -159,6 +165,7 @@ impl Catalog {
             .segments
             .remove(&id)
             .expect("owned entries remain registered while the catalog is write-locked");
+        self.remove_owner_segment(owner, id);
         self.resources.unmount(removed.spec());
         self.rebuild_indexes();
         Ok(())
@@ -167,26 +174,44 @@ impl Catalog {
     /// Invalidates and detaches every segment owned by a fenced client.
     /// Outstanding leases retain their resource handles but are logically
     /// unusable immediately.
-    pub(super) fn invalidate_owner(&mut self, owner: ClientId) -> usize {
-        let owned: Vec<_> = self
-            .segments
-            .iter()
-            .filter(|(_, entry)| entry.spec().identity().owner() == owner)
-            .map(|(id, entry)| (*id, entry.clone()))
-            .collect();
+    pub(super) fn invalidate_owners(
+        &mut self,
+        owners: impl IntoIterator<Item = ClientId>,
+    ) -> usize {
+        let mut invalidated = 0;
 
-        for (id, entry) in &owned {
-            entry.invalidate();
-            let removed = self
-                .segments
-                .remove(id)
-                .expect("owned entries remain registered while the catalog is write-locked");
-            self.resources.unmount(removed.spec());
+        for owner in owners {
+            let Some(ids) = self.segments_by_owner.remove(&owner) else {
+                continue;
+            };
+            for id in ids {
+                let removed = self
+                    .segments
+                    .remove(&id)
+                    .expect("the owner index only contains mounted segments");
+                removed.invalidate();
+                self.resources.unmount(removed.spec());
+                invalidated += 1;
+            }
         }
-        if !owned.is_empty() {
+        if invalidated != 0 {
             self.rebuild_indexes();
         }
-        owned.len()
+        invalidated
+    }
+
+    fn remove_owner_segment(&mut self, owner: ClientId, id: SegmentId) {
+        let remove_owner = self
+            .segments_by_owner
+            .get_mut(&owner)
+            .is_some_and(|segments| {
+                let removed = segments.remove(&id);
+                debug_assert!(removed, "mounted segments remain indexed by owner");
+                segments.is_empty()
+            });
+        if remove_owner {
+            self.segments_by_owner.remove(&owner);
+        }
     }
 
     fn handle(&self, entry: Arc<SegmentEntry>) -> SegmentHandle {

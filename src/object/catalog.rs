@@ -9,10 +9,10 @@ use super::identity::{ObjectIdentity, ObjectLookup};
 use super::reclamation::{CatalogTick, CollectBudget, CollectReport, ReclaimFilter, ReclaimTarget};
 use super::replica::{ReplicaLease, ReplicaReclaimBatch, ReplicaSet};
 use super::tenant::{CHARGE_RESERVED, QuotaReservationGuard, TenantQuotaCharge};
-use super::write::{ObjectCommit, WriteId, WriteOwner};
+use super::write::{ObjectCommit, WriteAdmission, WriteId, WriteOwner};
 use arc_swap::ArcSwapOption;
 use crossbeam_queue::SegQueue;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use scc::HashMap;
 use scc::hash_map::Entry;
 use std::fmt;
@@ -65,7 +65,11 @@ struct CollectorState {
     empty_slots: SegQueue<EmptySlotCandidate>,
     retired: SegQueue<RetiredObject>,
     gate: Mutex<()>,
+    pending_stage_gate: RwLock<()>,
     reclaim_debt: AtomicU64,
+    liveness_scan_requested: AtomicBool,
+    liveness_young_remaining: AtomicUsize,
+    liveness_protected_remaining: AtomicUsize,
 }
 
 struct ObjectSlot {
@@ -129,7 +133,7 @@ pub struct PutClaim {
     node: Option<Arc<CatalogNode>>,
     identity: Arc<ObjectIdentity>,
     id: WriteId,
-    owner: WriteOwner,
+    admission: WriteAdmission,
     started_at: CatalogTick,
 }
 
@@ -187,7 +191,11 @@ impl ObjectCatalog {
                     empty_slots: SegQueue::new(),
                     retired: SegQueue::new(),
                     gate: Mutex::new(()),
+                    pending_stage_gate: RwLock::new(()),
                     reclaim_debt: AtomicU64::new(0),
+                    liveness_scan_requested: AtomicBool::new(false),
+                    liveness_young_remaining: AtomicUsize::new(0),
+                    liveness_protected_remaining: AtomicUsize::new(0),
                 },
             }),
         })
@@ -207,6 +215,14 @@ impl ObjectCatalog {
             retired_bytes: lifecycle.retired_bytes.load(Ordering::Relaxed),
             reclaim_debt: collector.reclaim_debt.load(Ordering::Relaxed),
             pending_candidates: collector.pending.len(),
+            liveness_scan_remaining: collector
+                .liveness_young_remaining
+                .load(Ordering::Relaxed)
+                .saturating_add(
+                    collector
+                        .liveness_protected_remaining
+                        .load(Ordering::Relaxed),
+                ),
             young_candidates: collector.young.len(),
             protected_candidates: collector.protected.len(),
             retired_candidates: collector.retired.len(),

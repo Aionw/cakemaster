@@ -11,8 +11,8 @@
 
 1. 实现同步、可确定性测试的 `ClientRegistry`，负责 session、状态、TTL 和超时
    发现，不依赖 Tokio、RPC、`SegmentPool` 或 TaskQueue。
-2. 在 server crate 实现 `ClientRuntime`，串联注册/重挂载、`Ping`、超时清理和
-   per-client runtime slot。
+2. 在 core crate 实现同步 `ClientManager`，串联注册/重挂载、`Ping`、写入 fencing、
+   超时清理和 per-client mount slot；server 只传入显式 tick。
 3. 成功激活 client 时创建 mailbox，client 进入 draining/expired 时关闭 mailbox。
 4. 生命周期稳定后再实现任务 ledger、`FetchTasks` 和各类 typed task lane。
 
@@ -143,7 +143,7 @@ pub struct ClientTick(u64);
 pub struct ClientLifecycleConfig {
     ttl_ticks: u64,
     max_clients: usize,
-    maintenance_budget: usize,
+    cleanup_scan_budget: usize,
 }
 ```
 
@@ -156,7 +156,7 @@ remount、mount lifecycle RPC 可以同时视为一次 heartbeat；Put/Get、tas
 completion 默认不刷新 liveness，避免普通业务流量掩盖已经失效的 heartbeat loop。
 
 过期条件统一为 `now >= expires_at`。`ttl_ticks == 0`、`max_clients == 0` 和
-`maintenance_budget == 0` 在配置构造时拒绝。
+`cleanup_scan_budget == 0` 在配置构造时拒绝。
 
 ### Deadline 索引
 
@@ -171,14 +171,16 @@ completion 默认不刷新 liveness，避免普通业务流量掩盖已经失效
 这样 heap 正常情况下接近每个 client 一条记录，不会随 heartbeat 次数增长。record
 携带 generation；已经删除或 generation 不匹配的 record 直接丢弃。
 
-`maintenance(now, budget)` 最多处理 `budget` 条到期/重排记录并返回需要清理的
-session。后台 runtime 可以周期调用它，之后再优化成按 `next_deadline()` 唤醒；core
+`claim_due_cleanups(now, budget)` 最多处理 `budget` 条到期/重排记录并返回需要清理的
+session。`ClientManager::run_cleanup_step` 使用配置中的 `cleanup_scan_budget` 调用它；
+server timer 以后可以周期驱动 manager，再优化成按 `next_deadline()` 唤醒。core
 行为不依赖具体定时器。
 
-## ClientRegistry API 草案
+## ClientRegistry 与公开 Manager API
 
-`ClientRegistry` 是同步、线程安全的领域组件。方法返回值是状态事实或待执行事件，
-外部副作用由 server runtime 完成。
+`ClientRegistry` 是同步、线程安全的底层状态机。方法返回值是状态事实或独占 cleanup
+claim，不执行外部副作用。普通 RPC、timer 和 benchmark 不直接持有 registry，而是统一
+通过 `ClientManager`，避免只完成状态迁移却漏掉 segment 或 pending-write cleanup。
 
 ```rust
 pub enum ClientState {
@@ -204,8 +206,8 @@ pub enum CleanupReason {
 }
 
 pub struct ClientCleanup {
-    session: ClientSession,
-    reason: CleanupReason,
+    // 独占一个 fenced session 的 cleanup claim。
+    // 未 finish 就 Drop 时会回到 maintenance retry queue。
 }
 
 impl ClientRegistry {
@@ -232,16 +234,16 @@ impl ClientRegistry {
         reason: CleanupReason,
     ) -> Result<Option<ClientCleanup>, ClientLifecycleError>;
 
-    pub fn maintenance(
+    pub fn claim_due_cleanups(
         &self,
         now: ClientTick,
         budget: usize,
     ) -> Vec<ClientCleanup>;
 
-    pub fn finish_cleanup(
-        &self,
-        session: ClientSession,
-    ) -> Result<(), ClientLifecycleError>;
+}
+
+impl ClientCleanup {
+    pub fn finish(self) -> Result<(), ClientLifecycleError>;
 }
 ```
 
@@ -249,48 +251,58 @@ impl ClientRegistry {
 `ClientNotActive` 和 `StaleSession`。以下操作必须幂等：
 
 - active client 重复激活返回 `AlreadyActive`，不分配新 generation；
-- 相同 session 重复 `begin_drain` 不重复生成清理工作；
-- 相同 session 重复 `finish_cleanup` 成功或返回可忽略的 already-finished 结果；
-- generation 不匹配的旧 `finish_cleanup` 只能返回 `StaleSession`，不能删除当前 entry。
+- 相同 session 同时最多存在一个 cleanup claim；
+- claim 未完成即 Drop 时自动回到 retry queue，不会因 future cancellation 丢失；
+- 只有 claim 自身能 `finish`，因此旧 generation 不可能越过 cleanup 边界影响新 session。
 
 Registry 对外只返回复制出的 snapshot/outcome，不暴露持锁 guard。第一版可以用一个
 `parking_lot::Mutex<Inner>` 保持 map、generation allocator 和 deadline heap 的原子
 关系；heartbeat 频率通常远低于 object RPC，先以正确性为主，再根据 benchmark 决定
 是否分片。
 
-## Server Runtime 与并发边界
+`ClientManager` 的公开面只保留 composition 和业务入口：`new/with_config`、
+`heartbeat`、`remount`、`write_admission`、`write_owner`、`drain_sessions` 和
+`run_cleanup_step`。registry、segment pool、mount slot、cleanup claim 和 fencing guard
+都不从 manager 暴露；`PendingWriteRevoker` 只是构造 manager 时传入的不透明 capability，
+调用方不能直接执行 catalog cleanup。
 
-`ClientRuntime` 位于 `cakemaster-server`，持有：
+## Core Manager 与 Server 边界
+
+资源事务位于 core，时钟和异步驱动位于 server：
 
 ```text
-ClientRuntime
-├── Arc<ClientRegistry>                 # 同步领域状态
-├── client_slots[ClientId]              # per-client 生命周期串行门
-├── ClientTaskHub                       # 第二阶段接入
-├── Arc<SegmentPool> / ObjectManager    # 由 coordinator 调用
-└── maintenance task                    # Tokio timer + bounded cleanup
+cakemaster::client::ClientManager
+├── ClientRegistry                       # 同步状态机
+├── mount_slots[ClientId]                # per-client 资源事务串行门
+├── Arc<SegmentPool>                     # segment 生命周期
+└── PendingWriteRevoker                  # 不透明的 pending-write 撤销能力
+
+cakemaster-server
+├── ObjectCatalogRpcService              # wire 转换和错误映射
+├── MasterClock + view version           # server/HA concern
+└── production timer / ClientTaskHub     # 后续接入
 ```
 
-每个 `client_slot` 提供一个异步 mutex，只串行化会改变资源归属的操作：register/remount、
-mount/unmount 和 cleanup。`Ping` 只做 registry 中的短更新，不等待该 mutex；object
-RPC 也不在全局 client lock 下执行。
+每个 mount slot 使用同步 `parking_lot::Mutex`，只串行化会改变资源归属的
+register/remount、mount/unmount 和 cleanup。这里没有 I/O 或 `.await`；`Ping` 只做
+registry 中的短更新，不取得 mount slot，object RPC 也不在全局 client lock 下执行。
 
 ### 注册或 remount
 
 RPC handler 的顺序为：
 
-1. 获取该 `ClientId` 的 runtime slot；
-2. 获取 slot lifecycle mutex；
+1. 获取该 `ClientId` 的 mount slot；
+2. 获取 slot mutex；
 3. 确认 registry 中是 `Absent`，或是可幂等处理的 `Active`；
-4. 校验并挂载完整的 segment 列表；失败时回滚本次新挂载；
-5. 预创建 mailbox，确保 queue 配置有效；
-6. 调用 `registry.activate`；
-7. 只在 `Activated` 时发布 mailbox；`AlreadyActive` 保留原 mailbox；
-8. 返回 RPC 成功。
+4. 校验并以 quiesced 状态挂载完整的 segment 列表；失败时回滚本次新挂载；
+5. 原子 reactivate 本次 segment 集合，使资源先进入 accepting；
+6. 调用 `registry.activate`，此后 write admission 才能取得 session fence；
+7. 记录该 session 的完整 segment 集合并返回 RPC 成功。
 
-步骤 4 到 7 之间不应有网络 I/O。对于新 session，挂载、registry 激活和 mailbox 发布
-需要由 coordinator 做成一个可回滚事务，不能出现 RPC 返回失败但部分 segment 永久
-留在 pool 的情况。
+步骤 4 到 7 之间没有网络 I/O。对于新 session，挂载和 registry 激活
+由 manager 做成一个可回滚事务，不能出现 RPC 返回失败但部分 segment 永久
+留在 pool 的情况。`registry.activate` 必须位于最后一个可失败的资源步骤之后，避免
+object RPC 观察到 segment 尚未 ready 的半激活 session。
 
 ### Ping
 
@@ -301,28 +313,52 @@ RPC handler 的顺序为：
 - response 中同时返回当前 Master view version。
 
 未知 `client_id` 不分配 slot、entry 或 queue。为了避免攻击者只靠 Ping 创建大量
-per-client mutex，runtime slot 也只在 register/remount 路径创建，或使用不持久化的
+per-client mutex，mount slot 也只在 register/remount 路径创建，或使用不持久化的
 临时 gate。
 
 ### TTL 过期
 
 过期必须先 fence、后清理：
 
-1. `maintenance` 在 registry 锁内把 `Active` 原子改为 `Expired`；
-2. 立即按 `ClientSession` 关闭 TaskQueue mailbox，阻止新任务投递和 fetch；
-3. cleanup worker 获取同一个 client slot mutex，等待正在进行的 mount/unmount 完成；
-4. 再次校验 session generation 和 `Expired` 状态；
-5. quiesce 该 client 的 segment，阻止新的 placement；
-6. 终止或回收该 session 的 pending write、processing task 和 LocalSSD workflow；
-7. 移除 client 拥有的 segment 及关联 metadata；
-8. 调用 `finish_cleanup(session)`，最后删除 runtime slot。
+1. `claim_due_cleanups` 在 registry 锁内把 `Active` 原子改为 `Expired`；
+2. 同时失效该 session 的内部 write-admission guard，阻止已经 claim 但尚未 stage 的写入；
+3. manager 获取同一个 mount slot mutex，等待正在进行的 remount 完成；
+4. cleanup claim 保持该 generation 的独占权；若中途返回或 unwind，Drop 自动重试；
+5. manager 在 catalog 现有 pending queue 上按本批 session 做一次筛选，主动撤销仍处于
+   PENDING 的 write；
+6. coordinator 将本轮到期 client 批量提交给 `SegmentPool::invalidate_owners`，一次持锁
+   失效并摘除其 segment，一次重建 placement snapshot；
+7. 失效 segment 上的 pending write 无需等待 write timeout，published object 也不再
+   对 Get/Exist 可见；catalog maintenance 通过有界 liveness pass 退休这些 metadata，
+   外部 handle 仍可通过 RAII 延迟物理释放；
+8. processing task、mailbox 和 LocalSSD workflow 在对应 subsystem 接入后由 manager
+   边界扩展清理；
+9. 删除已清空且无人使用的 mount slot，最后调用 `cleanup.finish()`。
 
 每一步都必须对相同 session 幂等。任何一步失败时保留 `Expired` entry 并重试，不能先
 删除 registry entry 再留下仍可分配的孤儿资源。
 
-第一阶段尚未具备完整 task ledger 和按 owner 批量清理所有 object 的能力时，可以先
-实现 1、2、4、5、8 的接口与测试，并把缺少的 cleanup hook 明确返回为未完成；不能
-静默声称 client 已清理完毕。
+`ClientManager::run_cleanup_step` 已实现 1 到 7 和 9 的同步单轮入口；production timer、
+task ledger 和 LocalSSD workflow 尚未接入。cleanup 完成表示资源已经逻辑失效，不表示
+所有外部 object handle 都已释放或物理回收结束。
+
+### Pending write 的两个归属维度
+
+segment cleanup 与 writer cleanup 是两个不同问题：
+
+- replica 所在 segment 属于已退出 client：segment incarnation 立即失效，PutEnd 失败，
+  pending metadata 由 liveness pass 提前退休；
+- write 由已退出 session 发起，但 replica 全部位于其他健康 client 的 segment：cleanup
+  按完整 `(ClientId, generation)` 主动 Revoke，不等待 pending timeout。
+
+第一版把纯 `(ClientId, generation)` 身份保存在可复制的 `WriteOwner`，只在
+start/stage 阶段由 `WriteAdmission` 携带内部 session guard，catalog node 不持有 guard，
+也不为正常 write 维护第二套 owner 索引。stage 先进入 catalog 本来就需要的 pending
+timeout queue，再复查 guard；registry fence 后，批量 cleanup 在 collector consumer gate
+下只扫描一次该队列。因此竞态中的 write 要么被 cleanup 看见，要么由 staging 方自行
+revoke，正常 publish 路径没有额外的全局锁和索引增删。cleanup revoke 与 PutEnd 通过现有
+object lifecycle CAS 竞争，谁先成功谁决定最终状态，完整 `(ClientId, generation)` 匹配也
+保证旧 session 不影响新 session。
 
 ### 主动卸载与 shutdown
 
@@ -408,10 +444,10 @@ snapshot。view version 属于 server/HA runtime，不放进每个 client entry�
 - `now == expires_at` 时进入 Expired，后续 heartbeat 不能复活；
 - cleanup 完成前相同 ID activate 返回 `CleanupInProgress`；
 - 旧 generation 的 finish 不能删除当前 entry；
-- maintenance budget 生效，剩余到期 client 留给下一轮；
+- cleanup budget 生效，剩余到期 client 留给下一轮；
 - max_clients、nil ID 和非法配置返回明确错误。
 
-### Server 并发测试
+### Manager 并发与资源测试
 
 - concurrent Ping 不丢失更新且 deadline 单调；
 - remount 与 timeout cleanup 通过同一 client slot 串行；
@@ -428,6 +464,38 @@ snapshot。view version 属于 server/HA runtime，不放进每个 client entry�
 - cleanup 完成后 remount：建立新 server generation；
 - Master view version 改变后 client 必须重新 remount。
 
+### Client 退出风暴性能测试
+
+`client_cleanup_benchmark` 在 direct path 上持续执行 50:50 put/get，并在流量中间通过
+真实 `ClientManager::drain_sessions` 批量退出 client。默认使用 8 worker、1K client、每
+client 4 个已发布对象、2048 个健康 hot key，5 轮取中位样本；
+`--pending-per-client` 可同时预置由这些 session 发起的 PENDING write。健康流量也使用
+`ClientManager::write_admission`，确保 benchmark 不绕过 session fence。10K client 用作手工
+压力档，64K client 只验证 cleanup 可扩展性，避免把 RPC 编解码成本混入
+catalog/placement 锁竞争。
+
+```bash
+cargo run --release -p cakemaster-server --bin client_cleanup_benchmark -- \
+  --workers=8 --operations=50000 --clients=10000 \
+  --objects-per-client=4 --pending-per-client=4 \
+  --hot-objects=2048 --rounds=5
+```
+
+逻辑 segment 共用一个 CXL arena，所以 allocator 节点只预分配一次，不随 client 数量
+相乘。64K cleanup-only 可用下面的低内存档验证 registry/slot/claim 扩展性：
+
+```bash
+cargo run --release -p cakemaster-server --bin client_cleanup_benchmark -- \
+  --workers=1 --operations=0 --clients=64000 \
+  --objects-per-client=0 --hot-objects=0 --rounds=3
+```
+
+输出同时包含 baseline 与 exit-storm 的吞吐、put/get p50/p99/p99.9、cleanup/settle
+耗时、失效 metadata 数和健康请求错误数。验收使用同机同轮相对值：无退出 liveness
+check 的吞吐/p99 退化不超过 10%；10K 风暴期间吞吐下降不超过 25%、p99 不超过
+baseline 2 倍、逻辑 cleanup 在 2 秒内完成；健康对象必须零错误。64K cleanup-only
+目标为 10 秒内完成且不出现超线性增长。
+
 ## 建议文件布局
 
 第一阶段预计新增：
@@ -435,12 +503,12 @@ snapshot。view version 属于 server/HA runtime，不放进每个 client entry�
 ```text
 src/client.rs                              # client 领域门面
 src/client/lifecycle.rs                    # registry、状态机、deadline heap
+src/client/manager.rs                      # remount、write fence 与批量资源 cleanup
 src/client/config.rs                       # TTL/容量配置
 src/client/error.rs                        # lifecycle errors/outcomes
 tests/client_lifecycle.rs                  # 确定性 core 测试
-
-crates/cakemaster-server/src/client_runtime.rs
-crates/cakemaster-server/tests/client_runtime.rs
+tests/client_manager.rs                    # manager 跨资源测试
+crates/cakemaster-server/tests/client_lifecycle_rpc.rs
 ```
 
 第二阶段再新增 TaskLedger、`ClientTaskHub` 和 Mooncake task RPC adapter。现有
@@ -455,10 +523,9 @@ Client 生命周期管理可以在下面条件全部满足后视为完成：
 2. unknown Ping 不分配持久状态；
 3. timeout 在任何资源清理前先 fence client；
 4. 相同 ID 在 cleanup 完成前无法建立新 session；
-5. 所有异步 cleanup 都按 generation 校验且可重试；
+5. 所有 cleanup 都按 generation 校验，未完成的 claim 会自动进入重试队列；
 6. Master restart 明确要求 remount，不恢复旧 liveness；
-7. server runtime 已提供 Activated/Draining/Expired hook，TaskQueue 可以只通过这些
-   hook 创建和关闭 mailbox；
+7. server/RPC 只使用 `ClientManager`，不取得 registry、slot 或 cleanup claim；
 8. 没有在 client registry 锁内执行 await 或调用其他领域 manager。
 
 完成这些约束后，再接入 TaskQueue 不会反过来决定 client 是否存活，也不会让 queue

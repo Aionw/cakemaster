@@ -27,8 +27,8 @@ pub use config::ObjectCatalogConfig;
 pub use content::{ObjectContent, ObjectKind};
 pub use identity::{NamespaceId, ObjectIdentity, ObjectKey, ObjectLookup};
 pub use manager::{
-    AllocatedReplica, ObjectManager, ObjectManagerMaintenance, ObjectPutPlan, ReplicaSelector,
-    StartedPut,
+    AllocatedReplica, ObjectManager, ObjectManagerMaintenance, ObjectPutPlan, PendingWriteRevoker,
+    ReplicaSelector, StartedPut,
 };
 pub use reclamation::ReclaimFilter;
 pub use replica::{DirectReplica, LocalSsdReplica, ReplicaId, ReplicaLease, ReplicaSet};
@@ -38,4 +38,4 @@ pub use tenant::{
     TenantObjectManagerCreateError, TenantPolicy, TenantPutRequest, TenantQuotaLimits,
     TenantQuotaSnapshot, TenantResourceClass, TenantSnapshot,
 };
-pub use write::{ObjectCommit, WriteId, WriteOwner};
+pub use write::{ObjectCommit, WriteAdmission, WriteId, WriteOwner};
