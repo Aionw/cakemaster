@@ -28,6 +28,8 @@
 
 namespace mooncake {
 
+inline constexpr std::string_view kMooncakeStoreVersion = "2.0.0";
+
 enum class ErrorCode : std::int32_t {
   OK = 0,
   NO_AVAILABLE_HANDLE = -200,
@@ -114,6 +116,13 @@ struct GetReplicaListResponse {
 };
 YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
 
+struct GetStorageConfigResponse {
+  std::string fsdir;
+  bool enable_disk_eviction;
+  std::uint64_t quota_bytes;
+};
+YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
+
 struct ObjectMeta {
   std::string key;
   std::optional<std::uint64_t> object_checksum;
@@ -142,8 +151,11 @@ YLT_REFL(ReplicateConfig, replica_num, nof_replica_num, soft_pin_action,
 using ExpectedBool = tl::expected<bool, ErrorCode>;
 using ExpectedGetReplicaListResponse =
     tl::expected<GetReplicaListResponse, ErrorCode>;
+using ExpectedGetStorageConfigResponse =
+    tl::expected<GetStorageConfigResponse, ErrorCode>;
 using ExpectedReplicaDescriptors =
     tl::expected<std::vector<ReplicaDescriptor>, ErrorCode>;
+using ExpectedString = tl::expected<std::string, ErrorCode>;
 using ExpectedVoid = tl::expected<void, ErrorCode>;
 
 ReplicaDescriptor memory_replica() {
@@ -155,6 +167,12 @@ ReplicaDescriptor memory_replica() {
 
 class WrappedMasterService {
 public:
+  ExpectedGetStorageConfigResponse GetStorageConfig() {
+    return GetStorageConfigResponse{"", false, 0};
+  }
+
+  ExpectedString ServiceReady() { return std::string{kMooncakeStoreVersion}; }
+
   ExpectedBool ExistKey(const std::string &, const std::string &) {
     return false;
   }
@@ -274,6 +292,17 @@ void print_metadata() {
   print_type<BatchPutEndRequest>("batch_put_end_request");
   print_type<BatchPutRevokeRequest>("batch_put_revoke_request");
   print_type<std::vector<mooncake::ExpectedVoid>>("batch_void_response");
+  print_type<mooncake::GetStorageConfigResponse>("storage_config_value");
+  print_type<mooncake::ExpectedGetStorageConfigResponse>(
+      "storage_config_response");
+  print_type<mooncake::ExpectedString>("service_ready_response");
+  print_value(
+      "storage_config_response_sample",
+      mooncake::ExpectedGetStorageConfigResponse{
+          mooncake::GetStorageConfigResponse{"", false, 0}});
+  print_value("service_ready_response_sample",
+              mooncake::ExpectedString{
+                  std::string{mooncake::kMooncakeStoreVersion}});
 
   const mooncake::UUID sample_client_id{1, 2};
   const std::vector<mooncake::ObjectMeta> sample_object_metas{
@@ -311,6 +340,10 @@ void print_metadata() {
             << coro_rpc::func_id<&Service::BatchPutEnd>() << '\n';
   std::cout << "batch_put_revoke_route="
             << coro_rpc::func_id<&Service::BatchPutRevoke>() << '\n';
+  std::cout << "get_storage_config_route="
+            << coro_rpc::func_id<&Service::GetStorageConfig>() << '\n';
+  std::cout << "service_ready_route="
+            << coro_rpc::func_id<&Service::ServiceReady>() << '\n';
 }
 
 template <typename Call, typename Send, typename Validate>
@@ -1117,7 +1150,9 @@ int main(int argc, char **argv) {
                           &mooncake::WrappedMasterService::BatchGetReplicaList,
                           &mooncake::WrappedMasterService::BatchPutStart,
                           &mooncake::WrappedMasterService::BatchPutEnd,
-                          &mooncake::WrappedMasterService::BatchPutRevoke>(
+                          &mooncake::WrappedMasterService::BatchPutRevoke,
+                          &mooncake::WrappedMasterService::GetStorageConfig,
+                          &mooncake::WrappedMasterService::ServiceReady>(
             &service);
     std::cout << "cpp_mooncake_server_ready=127.0.0.1:" << port << std::endl;
     return !server.start();

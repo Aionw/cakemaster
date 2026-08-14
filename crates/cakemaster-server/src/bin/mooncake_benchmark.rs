@@ -1,10 +1,12 @@
 use std::error::Error;
 use std::time::Instant;
 
+use cakemaster_proto::MOONCAKE_STORE_VERSION;
 use cakemaster_proto::mooncake::{
     BufferDescriptor, ClientStatus, DescriptorVariant, ExpectedBool,
-    ExpectedGetReplicaListResponse, ExpectedPingResponse, ExpectedReplicaDescriptors, ExpectedVoid,
-    GetReplicaListResponse, MemoryDescriptor, ObjectDataType, ObjectMeta, PingResponse,
+    ExpectedGetReplicaListResponse, ExpectedGetStorageConfigResponse, ExpectedPingResponse,
+    ExpectedReplicaDescriptors, ExpectedString, ExpectedVoid, GetReplicaListResponse,
+    GetStorageConfigResponse, MemoryDescriptor, ObjectDataType, ObjectMeta, PingResponse,
     ReplicaDescriptor, ReplicaStatus, ReplicaType, ReplicateConfig, Segment, SoftPinAction, Uuid,
     WrappedMasterService, WrappedMasterServiceServer,
 };
@@ -23,6 +25,8 @@ const BATCH_GET_REPLICA_LIST: &str = "mooncake::WrappedMasterService::BatchGetRe
 const BATCH_PUT_START: &str = "mooncake::WrappedMasterService::BatchPutStart";
 const BATCH_PUT_END: &str = "mooncake::WrappedMasterService::BatchPutEnd";
 const BATCH_PUT_REVOKE: &str = "mooncake::WrappedMasterService::BatchPutRevoke";
+const GET_STORAGE_CONFIG: &str = "mooncake::WrappedMasterService::GetStorageConfig";
+const SERVICE_READY: &str = "mooncake::WrappedMasterService::ServiceReady";
 
 type SingleKeyRequest = (String, String);
 type SingleExistResponse = ExpectedBool;
@@ -96,6 +100,18 @@ impl WrappedMasterService for BenchmarkMasterService {
             view_version_id: 1,
             client_status: ClientStatus::Ok,
         }))
+    }
+
+    async fn get_storage_config(&self) -> Result<ExpectedGetStorageConfigResponse, RpcFailure> {
+        Ok(Ok(GetStorageConfigResponse {
+            fsdir: String::new(),
+            enable_disk_eviction: false,
+            quota_bytes: 0,
+        }))
+    }
+
+    async fn service_ready(&self) -> Result<ExpectedString, RpcFailure> {
+        Ok(Ok(MOONCAKE_STORE_VERSION.to_owned()))
     }
 
     async fn mount_segment(
@@ -275,6 +291,25 @@ fn print_metadata() {
     print_type::<MountSegmentRequest>("mount_segment_request");
     print_type::<UnmountSegmentRequest>("unmount_segment_request");
     print_type::<GracefulUnmountSegmentRequest>("graceful_unmount_segment_request");
+    print_type::<GetStorageConfigResponse>("storage_config_value");
+    print_type::<ExpectedGetStorageConfigResponse>("storage_config_response");
+    print_type::<ExpectedString>("service_ready_response");
+    print_bytes(
+        "storage_config_response_sample",
+        &serialize(&ExpectedGetStorageConfigResponse::Ok(
+            GetStorageConfigResponse {
+                fsdir: String::new(),
+                enable_disk_eviction: false,
+                quota_bytes: 0,
+            },
+        ))
+        .expect("benchmark storage config sample must serialize"),
+    );
+    print_bytes(
+        "service_ready_response_sample",
+        &serialize(&ExpectedString::Ok(MOONCAKE_STORE_VERSION.to_owned()))
+            .expect("benchmark service-ready sample must serialize"),
+    );
     print_bytes(
         "batch_put_end_sample",
         &serialize(&(
@@ -316,6 +351,11 @@ fn print_metadata() {
         "graceful_unmount_segment_route={}",
         function_id(GRACEFUL_UNMOUNT_SEGMENT)
     );
+    println!(
+        "get_storage_config_route={}",
+        function_id(GET_STORAGE_CONFIG)
+    );
+    println!("service_ready_route={}", function_id(SERVICE_READY));
 }
 
 fn print_type<T: StructPack>(label: &str) {

@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
+use cakemaster_proto::MOONCAKE_STORE_VERSION;
 use cakemaster_proto::mooncake::{
-    ExpectedBool, ExpectedGetReplicaListResponse, ExpectedPingResponse, ExpectedReplicaDescriptors,
-    ExpectedVoid, ObjectDataType, ObjectMeta, ReplicaType, ReplicateConfig, Segment, SoftPinAction,
-    Uuid,
+    ExpectedBool, ExpectedGetReplicaListResponse, ExpectedGetStorageConfigResponse,
+    ExpectedPingResponse, ExpectedReplicaDescriptors, ExpectedString, ExpectedVoid,
+    GetStorageConfigResponse, ObjectDataType, ObjectMeta, ReplicaType, ReplicateConfig, Segment,
+    SoftPinAction, Uuid,
 };
 use coro_rpc::function_id;
 use coro_rpc::struct_pack::{deserialize, serialize, type_hash, type_literal};
@@ -37,6 +39,9 @@ fn mooncake_rpc_schema_matches_yalantinglibs_metadata() {
     assert_type::<UnmountSegmentRequest>("fdfd04048989fffd04048989ffff", 3_569_685_216);
     assert_type::<GracefulUnmountSegmentRequest>("fdfd04048989fffd04048989ff04ff", 2_382_966_428);
     assert_eq!(type_hash::<ExpectedVoid>(), 2_938_661_068);
+    assert_type::<GetStorageConfigResponse>("fd800c0b04ff", 4_262_655_338);
+    assert_type::<ExpectedGetStorageConfigResponse>("87fd800c0b04ff01", 2_629_134_570);
+    assert_type::<ExpectedString>("87800c01", 481_545_268);
     assert_type::<SingleKeyRequest>("fd800c800cff", 2_096_701_144);
     assert_type::<SingleExistsResponse>("870b01", 2_431_123_666);
     assert_type::<SingleGetResponse>(
@@ -111,6 +116,43 @@ fn mooncake_rpc_routes_match_wrapped_master_service() {
     assert_eq!(
         function_id("mooncake::WrappedMasterService::BatchPutRevoke"),
         3_089_459_114
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::GetStorageConfig"),
+        2_376_708_262
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::ServiceReady"),
+        2_072_099_670
+    );
+}
+
+#[test]
+fn mooncake_bootstrap_response_bytes_match_cpp_struct_pack() {
+    let storage_config: ExpectedGetStorageConfigResponse = Ok(GetStorageConfigResponse {
+        fsdir: String::new(),
+        enable_disk_eviction: false,
+        quota_bytes: 0,
+    });
+    let cpp_storage_config = hex("eb68b59c0487fd800c0b04ff01000100000000000000000000");
+    assert_eq!(
+        deserialize::<ExpectedGetStorageConfigResponse>(&cpp_storage_config).unwrap(),
+        storage_config
+    );
+    assert_eq!(
+        serialize(&storage_config).unwrap(),
+        hex("ea68b59c0100000000000000000000")
+    );
+
+    let service_ready: ExpectedString = Ok(MOONCAKE_STORE_VERSION.to_owned());
+    let cpp_service_ready = hex("35ccb31c0487800c01000105322e302e30");
+    assert_eq!(
+        deserialize::<ExpectedString>(&cpp_service_ready).unwrap(),
+        service_ready
+    );
+    assert_eq!(
+        serialize(&service_ready).unwrap(),
+        hex("34ccb31c0105322e302e30")
     );
 }
 

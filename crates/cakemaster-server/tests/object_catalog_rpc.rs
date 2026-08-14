@@ -7,6 +7,7 @@ use cakemaster::segment::{
     ClientId, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool, SegmentSpec,
     TransportEndpoint, TransportProtocol,
 };
+use cakemaster_proto::MOONCAKE_STORE_VERSION;
 use cakemaster_proto::mooncake::{
     DescriptorVariant, ErrorCode, ObjectDataType, ObjectMeta, ReplicaStatus, ReplicaType,
     ReplicateConfig, SoftPinAction, Uuid, WrappedMasterService, WrappedMasterServiceClient,
@@ -52,6 +53,34 @@ fn config(replica_num: u64, nof_replica_num: u64) -> ReplicateConfig {
         host_id: String::new(),
         group_ids: None,
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bootstrap_rpcs_support_memory_only_client_initialization() {
+    let manager = Arc::new(ObjectManager::new(Arc::new(SegmentPool::new())));
+    let server = WrappedMasterServiceServer::new(ObjectCatalogRpcService::new(manager))
+        .into_rpc_server()
+        .unwrap();
+    let bound = server.bind("127.0.0.1:0").await.unwrap();
+    let address = bound.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_task = tokio::spawn(bound.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let client = WrappedMasterServiceClient::connect(address).await.unwrap();
+
+    assert_eq!(
+        client.service_ready().await.unwrap(),
+        Ok(MOONCAKE_STORE_VERSION.to_owned())
+    );
+    let storage_config = client.get_storage_config().await.unwrap().unwrap();
+    assert_eq!(storage_config.fsdir, "");
+    assert!(!storage_config.enable_disk_eviction);
+    assert_eq!(storage_config.quota_bytes, 0);
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    server_task.await.unwrap().unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

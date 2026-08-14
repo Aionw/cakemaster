@@ -25,7 +25,7 @@ Cakemaster workspace 包含高并发 object catalog、异构 segment/placement �
 - 入站帧大小、容器大小和单连接并发上限
 - 真实 ObjectCatalog/SegmentPool 驱动的 Mooncake `Ping`、`MountSegment`、
   `ReMountSegment`、`UnmountSegment`、`GracefulUnmountSegment`、single/batch exists/get
-  与 batch put RPC adapter
+  与 batch put RPC adapter，以及 client 初始化所需的 `ServiceReady`/`GetStorageConfig`
 
 暂不包含 TLS/NTLS、RDMA/CUDA transport、struct_pack varint 配置、IDL 外的自定义 variant/多态指针，以及 C++ 未使用 `YLT_REFL` 的 ABI/padding 结构体。大二进制建议放在 coro_rpc attachment 中，无需经过 struct_pack。
 
@@ -275,6 +275,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 wire 校验、plan 转换和错误码映射；同步、线程安全的 ObjectManager 负责 owner、
 pending/published 生命周期、lease 和 reservation 协调。
 
+client bootstrap 路由也已对齐固定的 Mooncake `5c0724d` 基线：`ServiceReady` 返回其
+严格版本校验所需的 `2.0.0`，`GetStorageConfig` 返回 `fsdir=""`、
+`enable_disk_eviction=false`、`quota_bytes=0`，明确禁用持久化。上游 Client 只在
+`GetStorageConfig` 失败时才用 `GetFsdir` 做旧版本兼容 fallback；当前成功的空配置已足够
+让无持久化 Client 完成初始化，`GetFsdir` 本身仍未实现。
+
 当前明确不支持 checksum：PutEnd 携带 checksum 返回 `INVALID_PARAMS`，Get/BatchGet
 固定返回 `None`。Memory-only replica 使用与 C++ 一致的 best-effort 语义，NoF-only
 使用 all-or-nothing；混合 Memory+NoF、group、pin 和 Disk 仍需领域模型支持，不在 RPC
@@ -368,7 +374,7 @@ target/release/mooncake_benchmark metadata
 /tmp/mooncake_benchmark metadata
 ```
 
-[`crates/cakemaster-proto/tests/mooncake_wire.rs`](crates/cakemaster-proto/tests/mooncake_wire.rs) 固定了十二个接口的 C++ type metadata 与 route hash，以及代表性的 `BatchPutEnd` 和最新 `BatchPutStart` 字节序列。
+[`crates/cakemaster-proto/tests/mooncake_wire.rs`](crates/cakemaster-proto/tests/mooncake_wire.rs) 固定了十四个接口的 C++ type metadata 与 route hash，以及 bootstrap 响应、代表性的 `BatchPutEnd` 和最新 `BatchPutStart` 字节序列。
 
 ## 本机性能对比
 
