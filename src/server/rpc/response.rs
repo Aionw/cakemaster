@@ -1,10 +1,12 @@
-use cakemaster::object::error::{LookupError, ObjectManagerError};
-use cakemaster::object::{AllocatedReplica, ReplicaLease, TenantObjectError};
-use cakemaster::segment::{ReservationDescriptor, ReservationDescriptorRef};
-use cakemaster_proto::mooncake::{
+//! Domain-to-Mooncake response and error mapping.
+
+use crate::mooncake::{
     BufferDescriptor, DescriptorVariant, ErrorCode, MemoryDescriptor, NoFDescriptor,
     ReplicaDescriptor, ReplicaStatus,
 };
+use crate::object::error::{LookupError, ObjectManagerError};
+use crate::object::{AllocatedReplica, ReplicaLease, TenantObjectError};
+use crate::segment::{ReservationDescriptor, ReservationDescriptorRef};
 
 pub(super) fn started_replica_descriptor(
     replica: &AllocatedReplica,
@@ -37,7 +39,6 @@ pub(super) fn replica_descriptor(
         ReservationDescriptorRef::Nof(_) => {
             DescriptorVariant::NofSsd(NoFDescriptor { buffer_descriptor })
         }
-        _ => return Err(ErrorCode::InternalError),
     };
     Ok(ReplicaDescriptor {
         id: u64::from(replica.id().get()),
@@ -62,7 +63,6 @@ fn owned_descriptor_variant(
         ReservationDescriptor::Nof(_) => {
             DescriptorVariant::NofSsd(NoFDescriptor { buffer_descriptor })
         }
-        _ => return Err(ErrorCode::InternalError),
     })
 }
 

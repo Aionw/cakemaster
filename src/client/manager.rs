@@ -323,6 +323,11 @@ impl ClientManager {
         }
     }
 
+    /// Returns whether two handles drive the same client and graceful-work state.
+    pub fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     pub fn heartbeat(&self, client_id: ClientId, now: ClientTick) -> HeartbeatOutcome {
         self.inner.registry.heartbeat(client_id, now)
     }

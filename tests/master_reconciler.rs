@@ -1,4 +1,5 @@
 use cakemaster::client::{ClientId, ClientLifecycleConfig, ClientTick};
+use cakemaster::mooncake::{Uuid, WrappedMasterService};
 use cakemaster::object::error::LookupError;
 use cakemaster::object::reclamation::CollectBudget;
 use cakemaster::object::{
@@ -10,8 +11,7 @@ use cakemaster::segment::{
     MemoryRegion, SegmentId, SegmentIdentity, SegmentPool, SegmentSpec, TransportEndpoint,
     TransportProtocol,
 };
-use cakemaster_proto::mooncake::{Uuid, WrappedMasterService};
-use cakemaster_server::{
+use cakemaster::server::{
     DEFAULT_OBJECT_COLLECTION_BUDGET, DEFAULT_RECONCILE_INTERVAL, MasterClock,
     MasterReconcileConfig, MasterReconcileConfigError, ObjectCatalogRpcService,
 };

@@ -277,7 +277,7 @@ cakemaster::client::ClientManager
 ├── Arc<SegmentPool>                     # segment 生命周期
 └── PendingWriteRevoker                  # 不透明的 pending-write 撤销能力
 
-cakemaster-server
+cakemaster::server
 ├── ObjectCatalogRpcService              # wire 转换和错误映射
 ├── MasterClock + view version           # server/HA concern
 ├── MasterReconciler                     # 显式启动的有界定时收敛
@@ -487,7 +487,7 @@ client 4 个已发布对象、2048 个健康 hot key，5 轮取中位样本；
 catalog/placement 锁竞争。
 
 ```bash
-cargo run --release -p cakemaster-server --bin client_cleanup_benchmark -- \
+cargo run --release --bin client_cleanup_benchmark -- \
   --workers=8 --operations=50000 --clients=10000 \
   --objects-per-client=4 --pending-per-client=4 \
   --hot-objects=2048 --rounds=5
@@ -497,7 +497,7 @@ cargo run --release -p cakemaster-server --bin client_cleanup_benchmark -- \
 相乘。64K cleanup-only 可用下面的低内存档验证 registry/slot/claim 扩展性：
 
 ```bash
-cargo run --release -p cakemaster-server --bin client_cleanup_benchmark -- \
+cargo run --release --bin client_cleanup_benchmark -- \
   --workers=1 --operations=0 --clients=64000 \
   --objects-per-client=0 --hot-objects=0 --rounds=3
 ```
@@ -520,11 +520,11 @@ src/client/config.rs                       # TTL/容量配置
 src/client/error.rs                        # lifecycle errors/outcomes
 tests/client_lifecycle.rs                  # 确定性 core 测试
 tests/client_manager.rs                    # manager 跨资源测试
-crates/cakemaster-server/tests/client_lifecycle_rpc.rs
+tests/client_lifecycle_rpc.rs
 ```
 
 第二阶段再新增 TaskLedger、`ClientTaskHub` 和 Mooncake task RPC adapter。现有
-`crates/cakemaster-server/src/client_task_queue.rs` 保持为最底层 channel primitive，
+`src/server/client_task_queue.rs` 保持为最底层 channel primitive，
 不向其中加入 registry、segment cleanup 或任务持久化逻辑。
 
 ## 第一阶段验收标准

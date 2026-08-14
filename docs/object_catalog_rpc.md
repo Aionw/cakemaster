@@ -53,7 +53,7 @@ slot budget 仍使用固定上限。没有请求时，composition root 可从 se
 领域 manager 和单个 handler 不会隐式启动后台任务。
 
 `ServiceReady` 返回固定上游基线的握手版本 `2.0.0`；该字符串集中定义在
-`cakemaster-proto::MOONCAKE_STORE_VERSION`，与上游 `MasterClient::Connect()` 的严格相等
+`cakemaster::MOONCAKE_STORE_VERSION`，与上游 `MasterClient::Connect()` 的严格相等
 校验一致。`GetStorageConfig` 固定返回 `fsdir=""`、`enable_disk_eviction=false`、
 `quota_bytes=0`，表示不创建 storage backend。上游当前仅在该 RPC 失败时回退到旧
 `GetFsdir`；因此空配置成功响应足以初始化无持久化 Client，兼容 fallback `GetFsdir`
@@ -66,6 +66,46 @@ request tenant 是 `()`，multi backend 是 `ResolvedTenant`。trait 通过泛�
 展开，两种实现只保留实际领域调用的差异。两种具体 manager 仍是核心层的显式安全
 边界。类型化 accessor 只允许 single 服务取得 raw `ObjectManager`，multi 服务只能
 取得 `TenantObjectManager`。
+
+## Production composition 与生命周期
+
+`MooncakeServerConfig::build` 是 production composition root，默认构造 single-tenant、
+process-local 的内存 backend。它按以下顺序只构造一份状态：
+
+```text
+SegmentPool
+    └── Arc<ObjectManager>
+          └── ObjectCatalogRpcService + MasterClock + ClientManager + Notify
+                ├── WrappedMasterServiceServer
+                └── MasterReconciler（从同一 service 派生）
+```
+
+`MooncakeServerComposition` 在 bind 前暴露只读 accessor，测试可直接核对 pool/manager 的
+`Arc` identity、clock epoch 以及 client manager state identity。bind 成功后
+`BoundMooncakeServer::run_until` 以结构化并发同时轮询 RPC server 和 reconciler；外部
+shutdown、server 提前退出或 reconciler 提前退出中的任一事件都会广播停止，随后完整
+等待另一个 participant。coro_rpc server 自身会 cancel 并 join 所有 connection task。
+reconciler 的 shutdown 分支优先于 interval/deadline，因此 shutdown 不会补跑一次
+maintenance 或 Graceful deadline。
+
+production binary 为 `cakemaster`：
+
+```bash
+cargo run --release -- \
+  --listen 127.0.0.1:50051
+```
+
+`--listen` 必须是明确的 socket address；默认是保守的 loopback
+`127.0.0.1:50051`。Unix 同时监听 Ctrl-C 和 SIGTERM，其他 Tokio 支持的平台监听
+Ctrl-C。当前默认沿用 core 已验证配置：64K expected objects、64K clients、10s client
+TTL、10s object lease、30s pending timeout、1GiB retired-byte ceiling 和 100ms
+reconcile interval。配置及 metadata 都只在内存中，重启不恢复；没有预挂载 segment，
+由 client 的 Mount/ReMount RPC 注册 Memory/CXL 容量。
+
+这个入口只部署本文列出的当前 `WrappedMasterService` 子集，不附带 HA、持久化、TLS、
+HTTP metadata、NoF/LocalSSD workflow 或 multi-tenant policy connector。已合并的
+`ServiceReady` 和空 `GetStorageConfig` 由同一个生成的 `WrappedMasterServiceServer`
+注册，不需要额外的 bootstrap server。
 
 Vec 数量、wire config、replica selector 和 checksum 等纯请求校验全部发生在
 `execute_batch` 之前，非法请求不会触发 maintenance 或 tenant lookup。`put_end` 的
@@ -169,9 +209,9 @@ class 子计划及原子回滚。group、checksum 和 pin 是当前明确不支�
 - `src/object/tenant/registry.rs`：ID/namespace 解析、注册与生命周期；
 - `src/object/tenant/quota.rs`：quota admission、accounting 与 RAII token；
 - `src/segment/placement.rs`：placement 与 reservation；
-- `crates/cakemaster-server/src/object_catalog_rpc/mod.rs`：service 与 RPC handler；
-- `crates/cakemaster-server/src/object_catalog_rpc/backend.rs`：静态 backend 契约与公共 batch 流程；
-- `crates/cakemaster-server/src/object_catalog_rpc/single_tenant.rs`、`multi_tenant.rs`：两种领域 backend 适配；
-- `crates/cakemaster-server/src/object_catalog_rpc/request.rs`、`response.rs`：wire 请求归一化与响应映射；
+- `src/server/rpc/mod.rs`：service 与 RPC handler；
+- `src/server/rpc/backend.rs`：静态 backend 契约与公共 batch 流程；
+- `src/server/rpc/single_tenant.rs`、`multi_tenant.rs`：两种领域 backend 适配；
+- `src/server/rpc/request.rs`、`response.rs`：wire 请求归一化与响应映射；
 - `src/client/manager.rs`：client remount、session fencing 与资源清理协调；
-- `crates/cakemaster-server/tests/object_catalog_rpc.rs`、`client_lifecycle_rpc.rs`：真实 TCP 跨层测试。
+- `tests/rpc.rs`、`client_lifecycle_rpc.rs`：真实 TCP 跨层测试。

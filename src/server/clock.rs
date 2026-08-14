@@ -1,7 +1,7 @@
 //! Process-local monotonic time shared by server runtime components.
 
-use cakemaster::client::ClientTick;
-use cakemaster::object::reclamation::CatalogTick;
+use crate::client::ClientTick;
+use crate::object::reclamation::CatalogTick;
 use std::time::Duration;
 use tokio::time::Instant;
 
@@ -28,6 +28,11 @@ impl MasterClock {
 
     pub fn client_now(&self) -> ClientTick {
         ClientTick::new(self.elapsed_millis())
+    }
+
+    /// Returns whether two handles use the same monotonic epoch.
+    pub fn shares_origin_with(&self, other: &Self) -> bool {
+        self.epoch == other.epoch
     }
 
     pub(crate) fn delay_until_client_tick(&self, deadline: ClientTick) -> Duration {

@@ -1,11 +1,13 @@
+//! Single-tenant RPC backend adapter.
+
 use super::backend::{ObjectBatchBackend, batch_maintenance_budget};
 use super::response::{map_lookup_error, map_manager_error};
-use cakemaster::object::reclamation::CatalogTick;
-use cakemaster::object::{
+use crate::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
+use crate::object::reclamation::CatalogTick;
+use crate::object::{
     NamespaceId, ObjectIdentity, ObjectLookup, ObjectManager, ObjectRead, ReplicaSelector,
     StartedPut, TenantPutRequest, WriteAdmission, WriteOwner,
 };
-use cakemaster_proto::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
 
 impl ObjectBatchBackend for ObjectManager {
     type Tenant = ();

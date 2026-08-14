@@ -1,13 +1,13 @@
 //! Real ObjectManager RPC server used by the Mooncake mixed-workload benchmark.
 
+use cakemaster::mooncake::WrappedMasterServiceServer;
 use cakemaster::object::reclamation::CollectBudget;
 use cakemaster::object::{ObjectCatalogConfig, ObjectManager};
 use cakemaster::segment::{
     ClientId, DirectCandidate, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool,
     SegmentPoolConfig, SegmentSpec, TransportEndpoint, TransportProtocol,
 };
-use cakemaster_proto::mooncake::WrappedMasterServiceServer;
-use cakemaster_server::{MasterClock, ObjectCatalogRpcService};
+use cakemaster::server::{MasterClock, ObjectCatalogRpcService};
 use std::error::Error;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

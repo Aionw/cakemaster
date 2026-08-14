@@ -1,13 +1,15 @@
-use cakemaster::object::{ObjectContent, ObjectKind, ObjectPutPlan, ReplicaSelector};
-use cakemaster::segment::placement::{
+//! Mooncake wire request validation and domain normalization.
+
+use crate::mooncake::{
+    ErrorCode, ObjectDataType, ReplicaType, ReplicateConfig, Segment, SoftPinAction, Uuid,
+};
+use crate::object::{ObjectContent, ObjectKind, ObjectPutPlan, ReplicaSelector};
+use crate::segment::placement::{
     AllocationSpec, FulfillmentPolicy, PlacementConstraints, PlacementRequest, ReplicaPolicy,
 };
-use cakemaster::segment::{
+use crate::segment::{
     ClientId, CxlArenaId, CxlArenaSpec, MemoryRegion, ReplicaClass, SegmentId, SegmentIdentity,
     SegmentSpec, TransportEndpoint, TransportProtocol,
-};
-use cakemaster_proto::mooncake::{
-    ErrorCode, ObjectDataType, ReplicaType, ReplicateConfig, Segment, SoftPinAction, Uuid,
 };
 use std::collections::HashSet;
 

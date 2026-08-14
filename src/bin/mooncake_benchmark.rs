@@ -1,8 +1,8 @@
 use std::error::Error;
 use std::time::Instant;
 
-use cakemaster_proto::MOONCAKE_STORE_VERSION;
-use cakemaster_proto::mooncake::{
+use cakemaster::MOONCAKE_STORE_VERSION;
+use cakemaster::mooncake::{
     BufferDescriptor, ClientStatus, DescriptorVariant, ExpectedBool,
     ExpectedGetReplicaListResponse, ExpectedGetStorageConfigResponse, ExpectedPingResponse,
     ExpectedReplicaDescriptors, ExpectedString, ExpectedVoid, GetReplicaListResponse,

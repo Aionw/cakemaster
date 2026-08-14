@@ -1,7 +1,7 @@
-//! RPC contracts generated from Cakemaster's Thrift IDL files.
+//! Internal include point for RPC contracts generated from the root IDL files.
 //!
-//! The generated namespaces are exposed once from this crate so applications,
-//! tests, and tools all compile against the same Rust types.
+//! `lib.rs` re-exports the generated namespaces at the crate root so all
+//! applications, tests, and tools compile against the same Rust types.
 
 /// Mooncake Store RPC handshake version at the fixed upstream wire baseline.
 ///

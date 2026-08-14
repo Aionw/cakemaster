@@ -1,7 +1,7 @@
 #![allow(dead_code)]
 
-use cakemaster_proto::MOONCAKE_STORE_VERSION;
-use cakemaster_proto::mooncake::{
+use cakemaster::MOONCAKE_STORE_VERSION;
+use cakemaster::mooncake::{
     ExpectedBool, ExpectedGetReplicaListResponse, ExpectedGetStorageConfigResponse,
     ExpectedPingResponse, ExpectedReplicaDescriptors, ExpectedString, ExpectedVoid,
     GetStorageConfigResponse, ObjectDataType, ObjectMeta, ReplicaType, ReplicateConfig, Segment,

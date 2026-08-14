@@ -1,11 +1,13 @@
+//! Multi-tenant RPC backend adapter.
+
 use super::backend::{ObjectBatchBackend, batch_error, batch_maintenance_budget};
 use super::response::{map_lookup_error, map_manager_error, map_tenant_error};
-use cakemaster::object::reclamation::CatalogTick;
-use cakemaster::object::{
+use crate::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
+use crate::object::reclamation::CatalogTick;
+use crate::object::{
     ObjectRead, ReplicaSelector, ResolvedTenant, StartedPut, TenantId, TenantObjectError,
     TenantObjectManager, TenantPutRequest, WriteAdmission, WriteOwner,
 };
-use cakemaster_proto::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
 
 impl ObjectBatchBackend for TenantObjectManager {
     type Tenant = ResolvedTenant;
