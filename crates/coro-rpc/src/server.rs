@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use bytes::Bytes;
 use futures_util::stream::FuturesUnordered;
@@ -33,6 +34,8 @@ pub struct ServerConfig {
     pub frame_limits: FrameLimits,
     pub max_in_flight_per_connection: usize,
     pub tcp_nodelay: bool,
+    /// Emits one structured `coro_rpc::access` info log for each completed request.
+    pub access_log: bool,
 }
 
 impl Default for ServerConfig {
@@ -41,7 +44,15 @@ impl Default for ServerConfig {
             frame_limits: FrameLimits::default(),
             max_in_flight_per_connection: 256,
             tcp_nodelay: true,
+            access_log: false,
         }
+    }
+}
+
+impl ServerConfig {
+    pub const fn with_access_log(mut self, enabled: bool) -> Self {
+        self.access_log = enabled;
+        self
     }
 }
 
@@ -481,6 +492,7 @@ impl BoundRpcServer {
 struct RpcService {
     peer_addr: SocketAddr,
     routes: Arc<HashMap<u32, Route>>,
+    access_log: bool,
 }
 
 impl Service<RequestFrame> for RpcService {
@@ -494,22 +506,61 @@ impl Service<RequestFrame> for RpcService {
 
     fn call(&mut self, request: RequestFrame) -> Self::Future {
         let sequence = request.header.sequence;
-        let Some(route) = self.routes.get(&request.header.function_id) else {
-            return ready_failure(
-                sequence,
-                RpcFailure::new(
-                    RpcErrorCode::FunctionNotRegistered as u16,
-                    "function not registered",
+        let function_id = request.header.function_id;
+        let request_body_bytes = request.body.len();
+        let request_attachment_bytes = request.attachment.len();
+        let started_at = self.access_log.then(Instant::now);
+        let (rpc_method, response) = match self.routes.get(&function_id) {
+            Some(route) => {
+                let context = RequestContext {
+                    sequence,
+                    function_id,
+                    attachment: request.attachment,
+                    peer_addr: self.peer_addr,
+                };
+                (route.name, route.handler.call(request.body, context))
+            }
+            None => (
+                "<unregistered>",
+                ready_failure(
+                    sequence,
+                    RpcFailure::new(
+                        RpcErrorCode::FunctionNotRegistered as u16,
+                        "function not registered",
+                    ),
                 ),
+            ),
+        };
+        let Some(started_at) = started_at else {
+            return response;
+        };
+
+        let peer_addr = self.peer_addr;
+        Box::pin(async move {
+            let response = response.await?;
+            let duration_us = u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
+            let status = if response.header.error_code == 0 {
+                "ok"
+            } else {
+                "error"
+            };
+            log::info!(
+                target: "coro_rpc::access",
+                peer_addr:% = peer_addr,
+                rpc_method = rpc_method,
+                function_id = function_id,
+                sequence = sequence,
+                status = status,
+                error_code = response.header.error_code,
+                request_body_bytes = request_body_bytes,
+                request_attachment_bytes = request_attachment_bytes,
+                response_body_bytes = response.body.len(),
+                response_attachment_bytes = response.attachment.len(),
+                duration_us = duration_us;
+                "RPC request"
             );
-        };
-        let context = RequestContext {
-            sequence,
-            function_id: request.header.function_id,
-            attachment: request.attachment,
-            peer_addr: self.peer_addr,
-        };
-        route.handler.call(request.body, context)
+            Ok(response)
+        })
     }
 }
 
@@ -532,7 +583,11 @@ impl ServerConnection {
     ) -> Self {
         Self {
             transport: Framed::new(stream, ServerCodec::new(config.frame_limits)),
-            service: RpcService { peer_addr, routes },
+            service: RpcService {
+                peer_addr,
+                routes,
+                access_log: config.access_log,
+            },
             in_flight: FuturesUnordered::new(),
             pending_responses: VecDeque::new(),
             buffered_responses: 0,

@@ -66,10 +66,12 @@ async fn run() -> Result<(), Box<dyn Error>> {
 fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command, CliError> {
     let mut listen_addr = DEFAULT_MOONCAKE_LISTEN_ADDR;
     let mut listen_seen = false;
+    let mut access_log = false;
     let mut arguments = arguments.into_iter();
     while let Some(argument) = arguments.next() {
         match argument.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
+            "--access-log" => access_log = true,
             "--listen" => {
                 let value = arguments.next().ok_or(CliError::MissingListenAddress)?;
                 set_listen_addr(&mut listen_addr, &mut listen_seen, value)?;
@@ -85,7 +87,9 @@ fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command, Cl
         }
     }
     Ok(Command::Run(
-        MooncakeServerConfig::default().with_listen_addr(listen_addr),
+        MooncakeServerConfig::default()
+            .with_listen_addr(listen_addr)
+            .with_access_log(access_log),
     ))
 }
 
@@ -145,7 +149,7 @@ fn init_logging() {
 }
 
 fn print_usage() {
-    eprintln!("usage: cakemaster [--listen ADDRESS]");
+    eprintln!("usage: cakemaster [--listen ADDRESS] [--access-log]");
     eprintln!("default listen address: {DEFAULT_MOONCAKE_LISTEN_ADDR}");
 }
 
@@ -159,6 +163,7 @@ mod tests {
             panic!("empty arguments must run the server");
         };
         assert_eq!(default.listen_addr(), DEFAULT_MOONCAKE_LISTEN_ADDR);
+        assert!(!default.access_log());
 
         let Command::Run(config) =
             parse_args(["--listen", "127.0.0.1:0"].map(str::to_owned)).unwrap()
@@ -166,6 +171,12 @@ mod tests {
             panic!("listen arguments must run the server");
         };
         assert_eq!(config.listen_addr(), "127.0.0.1:0".parse().unwrap());
+        assert!(!config.access_log());
+
+        let Command::Run(config) = parse_args(["--access-log".to_owned()]).unwrap() else {
+            panic!("access log flag must run the server");
+        };
+        assert!(config.access_log());
     }
 
     #[test]

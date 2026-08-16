@@ -77,7 +77,10 @@ cargo run --release -- \
 ```
 
 不传参数时默认监听 `127.0.0.1:50051`；也可传 `--listen 127.0.0.1:0` 让系统选择
-测试端口。binary 在同一个 composition root 中只构建一次 `SegmentPool`、内存态
+测试端口。RPC access 日志默认关闭；传 `--access-log` 后，每个完成的请求会以 info 级别
+记录来源地址、路由名/function ID、sequence、结果、请求/响应大小和耗时。通用库调用方也可
+使用 `ServerConfig::default().with_access_log(true)` 开启。binary 在同一个 composition
+root 中只构建一次 `SegmentPool`、内存态
 `ObjectManager`、`MasterClock` 和 `ObjectCatalogRpcService`，并从 service 派生共享
 `ClientManager`、clock 和 deadline `Notify` 的 `MasterReconciler`。RPC server 与 reconciler
 并发运行；Unix 上 Ctrl-C/SIGTERM、其他平台上 Ctrl-C 会通知两者停止，进程等待监听器、
