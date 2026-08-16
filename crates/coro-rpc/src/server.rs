@@ -28,6 +28,7 @@ use crate::struct_pack::{
 };
 
 const DRIVER_POLL_BUDGET: usize = 1024;
+const ACCESS_LOG_TARGET: &str = "coro_rpc::access";
 const SERVER_CONNECTION_LOG_TARGET: &str = "coro_rpc::server::connection";
 const SERVER_REQUEST_LOG_TARGET: &str = "coro_rpc::server::request";
 
@@ -41,6 +42,8 @@ pub struct ServerConfig {
     pub frame_limits: FrameLimits,
     pub max_in_flight_per_connection: usize,
     pub tcp_nodelay: bool,
+    /// Emits one structured `coro_rpc::access` info log for each completed request.
+    pub access_log: bool,
 }
 
 impl Default for ServerConfig {
@@ -49,7 +52,15 @@ impl Default for ServerConfig {
             frame_limits: FrameLimits::default(),
             max_in_flight_per_connection: 256,
             tcp_nodelay: true,
+            access_log: false,
         }
+    }
+}
+
+impl ServerConfig {
+    pub const fn with_access_log(mut self, enabled: bool) -> Self {
+        self.access_log = enabled;
+        self
     }
 }
 
@@ -542,6 +553,7 @@ struct RpcService {
     peer_addr: SocketAddr,
     routes: Arc<HashMap<u32, Route>>,
     request_logging: RequestLogging,
+    access_log: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -573,56 +585,70 @@ impl Service<RequestFrame> for RpcService {
     fn call(&mut self, request: RequestFrame) -> Self::Future {
         let sequence = request.header.sequence;
         let function_id = request.header.function_id;
-        let Some(route) = self.routes.get(&function_id) else {
-            log::warn!(
-                target: SERVER_REQUEST_LOG_TARGET,
-                peer_addr:% = self.peer_addr,
-                sequence = sequence,
-                function_id = function_id;
-                "RPC function is not registered"
-            );
-            return ready_failure(
-                sequence,
-                RpcFailure::new(
-                    RpcErrorCode::FunctionNotRegistered as u16,
-                    "function not registered",
-                ),
-            );
-        };
-        let method = route.name;
-        if self.request_logging.trace {
-            log::trace!(
-                target: SERVER_REQUEST_LOG_TARGET,
-                peer_addr:% = self.peer_addr,
-                sequence = sequence,
-                function_id = function_id,
-                method = method,
-                body_bytes = request.body.len(),
-                attachment_bytes = request.attachment.len();
-                "RPC request received"
-            );
-        }
-        let context = RequestContext {
-            sequence,
-            function_id,
-            attachment: request.attachment,
-            peer_addr: self.peer_addr,
-        };
-        let response = route.handler.call(request.body, context);
-        let peer_addr = self.peer_addr;
+        let request_body_bytes = request.body.len();
+        let request_attachment_bytes = request.attachment.len();
         let request_logging = self.request_logging;
-        // Successful request timing is a DEBUG diagnostic. Keeping the clock
-        // reads out of the default INFO/WARN hot path matters for tiny,
-        // heavily-pipelined RPCs; failed requests still retain every routing
-        // and error field at WARN.
-        let started_at = request_logging.debug.then(Instant::now);
+        let access_log = self.access_log;
+        let started_at = (request_logging.debug || access_log).then(Instant::now);
+        let (method, response, registered) = match self.routes.get(&function_id) {
+            Some(route) => {
+                if request_logging.trace {
+                    log::trace!(
+                        target: SERVER_REQUEST_LOG_TARGET,
+                        peer_addr:% = self.peer_addr,
+                        sequence = sequence,
+                        function_id = function_id,
+                        method = route.name,
+                        body_bytes = request_body_bytes,
+                        attachment_bytes = request_attachment_bytes;
+                        "RPC request received"
+                    );
+                }
+                let context = RequestContext {
+                    sequence,
+                    function_id,
+                    attachment: request.attachment,
+                    peer_addr: self.peer_addr,
+                };
+                (route.name, route.handler.call(request.body, context), true)
+            }
+            None => {
+                if request_logging.warn {
+                    log::warn!(
+                        target: SERVER_REQUEST_LOG_TARGET,
+                        peer_addr:% = self.peer_addr,
+                        sequence = sequence,
+                        function_id = function_id;
+                        "RPC function is not registered"
+                    );
+                }
+                (
+                    "<unregistered>",
+                    ready_failure(
+                        sequence,
+                        RpcFailure::new(
+                            RpcErrorCode::FunctionNotRegistered as u16,
+                            "function not registered",
+                        ),
+                    ),
+                    false,
+                )
+            }
+        };
+
+        if !access_log && !request_logging.debug && (!request_logging.warn || !registered) {
+            return response;
+        }
+
+        let peer_addr = self.peer_addr;
         Box::pin(async move {
             let response = match response.await {
                 Ok(response) => response,
                 Err(never) => match never {},
             };
             let error_code = response.header.error_code;
-            if error_code == 0 && request_logging.debug {
+
+            if registered && error_code == 0 && request_logging.debug {
                 let elapsed_micros = started_at
                     .expect("debug request logging captures a start time")
                     .elapsed()
@@ -636,7 +662,7 @@ impl Service<RequestFrame> for RpcService {
                     elapsed_micros = elapsed_micros;
                     "RPC request completed"
                 );
-            } else if error_code != 0 && request_logging.warn {
+            } else if registered && error_code != 0 && request_logging.warn {
                 let (rpc_error_code, rpc_error_message) = response_failure_details(&response);
                 if let Some(started_at) = started_at {
                     log::warn!(
@@ -663,6 +689,33 @@ impl Service<RequestFrame> for RpcService {
                     );
                 }
             }
+
+            if access_log {
+                let duration_us = u64::try_from(
+                    started_at
+                        .expect("access logging captures a start time")
+                        .elapsed()
+                        .as_micros(),
+                )
+                .unwrap_or(u64::MAX);
+                let status = if error_code == 0 { "ok" } else { "error" };
+                log::info!(
+                    target: ACCESS_LOG_TARGET,
+                    peer_addr:% = peer_addr,
+                    rpc_method = method,
+                    function_id = function_id,
+                    sequence = sequence,
+                    status = status,
+                    error_code = error_code,
+                    request_body_bytes = request_body_bytes,
+                    request_attachment_bytes = request_attachment_bytes,
+                    response_body_bytes = response.body.len(),
+                    response_attachment_bytes = response.attachment.len(),
+                    duration_us = duration_us;
+                    "RPC request"
+                );
+            }
+
             Ok(response)
         })
     }
@@ -691,6 +744,8 @@ impl ServerConnection {
                 peer_addr,
                 routes,
                 request_logging: RequestLogging::capture(),
+                access_log: config.access_log
+                    && log::log_enabled!(target: ACCESS_LOG_TARGET, log::Level::Info),
             },
             in_flight: FuturesUnordered::new(),
             pending_responses: VecDeque::new(),

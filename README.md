@@ -77,7 +77,10 @@ cargo run --release -- \
 ```
 
 不传参数时默认监听 `127.0.0.1:50051`；也可传 `--listen 127.0.0.1:0` 让系统选择
-测试端口。binary 在同一个 composition root 中只构建一次 `SegmentPool`、内存态
+测试端口。RPC access 日志默认关闭；传 `--access-log` 后，每个完成的请求会以 info 级别
+记录来源地址、路由名/function ID、sequence、结果、请求/响应大小和耗时。通用库调用方也可
+使用 `ServerConfig::default().with_access_log(true)` 开启。binary 在同一个 composition
+root 中只构建一次 `SegmentPool`、内存态
 `ObjectManager`、`MasterClock` 和 `ObjectCatalogRpcService`，并从 service 派生共享
 `ClientManager`、clock 和 deadline `Notify` 的 `MasterReconciler`。RPC server 与 reconciler
 并发运行；Unix 上 Ctrl-C/SIGTERM、其他平台上 Ctrl-C 会通知两者停止，进程等待监听器、
@@ -101,6 +104,7 @@ cakemaster \
 `CAKEMASTER_LOG_OUTPUT` 提供相同配置能力，优先级为命令行、环境变量、内置默认值。
 过滤器在进程启动时解析，当前不支持运行时热更新。常用的稳定日志 target 包括：
 
+- `coro_rpc::access`：通过 `--access-log` 显式开启的逐请求 access 日志；
 - `coro_rpc::server::connection`：连接建立、关闭和帧/协议故障；
 - `coro_rpc::server::request`：请求方法、peer、sequence、耗时和 RPC transport 错误；
 - `coro_rpc::client::{connection,request}`：客户端连接驱动错误和请求超时；
@@ -119,7 +123,7 @@ cakemaster --log-filter \
 协议/RPC 失败进入 `WARN`。未打开请求 `DEBUG` 时，默认热路径不会为每个成功请求读取时钟。
 业务 `InternalError` 进入 `ERROR`，容量或暂时不可用进入 `WARN`，参数、not-found 等调用方
 可处理的拒绝进入 `DEBUG`。batch 只记录聚合错误数，不记录 object key，避免高基数和敏感
-数据进入日志。
+数据进入日志。Access 日志同样受等级和模块过滤规则控制。
 
 当前 production 默认值是保守的单进程、单租户内存态配置：最多 65,536 个 client 和预期
 65,536 个 object，client TTL/lease TTL 均为 10 秒，pending write timeout 为 30 秒，

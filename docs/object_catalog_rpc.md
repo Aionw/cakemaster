@@ -96,7 +96,9 @@ cargo run --release -- \
 ```
 
 `--listen` 必须是明确的 socket address；默认是保守的 loopback
-`127.0.0.1:50051`。Unix 同时监听 Ctrl-C 和 SIGTERM，其他 Tokio 支持的平台监听
+`127.0.0.1:50051`。逐请求 access 日志默认关闭，可通过 `--access-log` 开启；开启后会
+以 info 级别记录来源、路由、sequence、结果、请求/响应大小和耗时。Unix 同时监听
+Ctrl-C 和 SIGTERM，其他 Tokio 支持的平台监听
 Ctrl-C。当前默认沿用 core 已验证配置：64K expected objects、64K clients、10s client
 TTL、10s object lease、30s pending timeout、1GiB retired-byte ceiling 和 100ms
 reconcile interval。配置及 metadata 都只在内存中，重启不恢复；没有预挂载 segment，

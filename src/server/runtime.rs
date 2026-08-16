@@ -10,7 +10,7 @@ use crate::object::error::ObjectCatalogConfigError;
 use crate::object::{ObjectCatalogConfig, ObjectManager};
 use crate::segment::error::PoolConfigError;
 use crate::segment::{SegmentPool, SegmentPoolConfig};
-use coro_rpc::{BoundRpcServer, RegisterError};
+use coro_rpc::{BoundRpcServer, RegisterError, ServerConfig};
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -35,6 +35,7 @@ pub struct MooncakeServerConfig {
     client_lifecycle: ClientLifecycleConfig,
     reconcile: MasterReconcileConfig,
     view_version: i64,
+    access_log: bool,
 }
 
 impl MooncakeServerConfig {
@@ -68,6 +69,11 @@ impl MooncakeServerConfig {
         self
     }
 
+    pub const fn with_access_log(mut self, enabled: bool) -> Self {
+        self.access_log = enabled;
+        self
+    }
+
     pub const fn listen_addr(self) -> SocketAddr {
         self.listen_addr
     }
@@ -92,6 +98,10 @@ impl MooncakeServerConfig {
         self.view_version
     }
 
+    pub const fn access_log(self) -> bool {
+        self.access_log
+    }
+
     /// Builds one explicit manager/service/reconciler object graph.
     pub fn build(self) -> Result<MooncakeServerComposition, MooncakeServerBuildError> {
         MooncakeServerComposition::new(self)
@@ -107,6 +117,7 @@ impl Default for MooncakeServerConfig {
             client_lifecycle: ClientLifecycleConfig::default(),
             reconcile: MasterReconcileConfig::default(),
             view_version: DEFAULT_MASTER_VIEW_VERSION,
+            access_log: false,
         }
     }
 }
@@ -196,7 +207,10 @@ impl MooncakeServerComposition {
     /// Registers the supported `WrappedMasterService` routes and binds TCP.
     pub async fn bind(self) -> Result<BoundMooncakeServer, MooncakeServerBindError> {
         let clients = self.service.client_manager().clone();
-        let rpc_server = WrappedMasterServiceServer::new(self.service).into_rpc_server()?;
+        let rpc_server = WrappedMasterServiceServer::new(self.service)
+            .into_rpc_server_with_config(
+                ServerConfig::default().with_access_log(self.config.access_log()),
+            )?;
         let server = rpc_server.bind(self.config.listen_addr()).await?;
         Ok(BoundMooncakeServer {
             server,
