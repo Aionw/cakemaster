@@ -132,7 +132,7 @@ to one mode.
 The direct-path benchmark accepts `put_items`, `lookup_items`, and `rounds`:
 
 ```bash
-taskset -c 2 cargo run --release -p cakemaster-server \
+taskset -c 2 cargo run --release \
   --bin tenant_quota_benchmark -- 250000 1000000 11
 ```
 
@@ -140,7 +140,7 @@ The optional `breakdown` mode reports total, start, and finish nanoseconds per
 item for batch put:
 
 ```bash
-taskset -c 2 cargo run --release -p cakemaster-server \
+taskset -c 2 cargo run --release \
   --bin tenant_quota_benchmark -- 250000 1 7 breakdown
 ```
 

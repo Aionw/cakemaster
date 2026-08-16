@@ -73,8 +73,7 @@ g++ -std=c++20 -O3 -DNDEBUG \
   -I /path/to/Mooncake/extern/yalantinglibs/include/ylt/thirdparty \
   interop/mooncake_benchmark.cpp -pthread -o /tmp/mooncake_benchmark
 
-cargo build --release -p cakemaster-server \
-  --bin object_catalog_rpc_benchmark_server
+cargo build --release --bin object_catalog_rpc_benchmark_server
 
 # Rust server
 target/release/object_catalog_rpc_benchmark_server \
@@ -215,16 +214,16 @@ cache line。单 segment 高水位场景还需要继续优化 allocator 的串�
 
 ## 可复现入口
 
-- Rust 回收与并发 lookup：`crates/cakemaster-server/src/bin/object_catalog_evict_benchmark.rs`
-- Rust 自动水位压力：`crates/cakemaster-server/src/bin/object_catalog_watermark_benchmark.rs`
-- Rust 50:50：`crates/cakemaster-server/src/bin/object_catalog_benchmark.rs`
+- Rust 回收与并发 lookup：`src/bin/object_catalog_evict_benchmark.rs`
+- Rust 自动水位压力：`src/bin/object_catalog_watermark_benchmark.rs`
+- Rust 50:50：`src/bin/object_catalog_benchmark.rs`
 - Mooncake direct benchmark：`interop/mooncake_object_catalog_benchmark.cpp`
 - Mooncake 官方基线：`mooncake-store/benchmarks/batch_evict_bench.cpp`
 
 ObjectCatalog 回收示例：
 
 ```bash
-cargo run --release -p cakemaster-server --bin object_catalog_evict_benchmark -- \
+cargo run --release --bin object_catalog_evict_benchmark -- \
   --num_objects=100000 --evict_ratio_target=0.50 \
   --evict_ratio_lowerbound=0.25 --collect_budget=64 \
   --slot_cleanup_budget=0 --lookup_threads=8 --hot_objects=2048 --rounds=5
@@ -233,5 +232,5 @@ cargo run --release -p cakemaster-server --bin object_catalog_evict_benchmark --
 50:50 示例：
 
 ```bash
-cargo run --release -p cakemaster-server --bin object_catalog_benchmark -- 8 50000 8 3 2048
+cargo run --release --bin object_catalog_benchmark -- 8 50000 8 3 2048
 ```

@@ -1,8 +1,10 @@
-use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
-use cakemaster::object::{
+//! Shared batch backend boundary for RPC handlers.
+
+use crate::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
+use crate::object::reclamation::{CatalogTick, CollectBudget};
+use crate::object::{
     ObjectRead, ReplicaSelector, StartedPut, TenantPutRequest, WriteAdmission, WriteOwner,
 };
-use cakemaster_proto::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
 
 /// Private adapter boundary: core managers remain concrete, while the RPC
 /// service is monomorphized over one batch-capable backend.

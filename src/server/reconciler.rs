@@ -1,11 +1,11 @@
 //! Periodic convergence of client and object lifecycle state.
 
-use crate::MasterClock;
-use cakemaster::client::{
+use super::MasterClock;
+use crate::client::{
     ClientCleanupReport, ClientManager, ClientManagerError, GracefulUnmountReport,
 };
-use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
-use cakemaster::object::{ObjectManager, ObjectManagerMaintenance, TenantObjectManager};
+use crate::object::reclamation::{CatalogTick, CollectBudget};
+use crate::object::{ObjectManager, ObjectManagerMaintenance, TenantObjectManager};
 use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
@@ -157,6 +157,16 @@ impl MasterReconciler {
         self.config
     }
 
+    /// Returns the shared client lifecycle manager driven by this reconciler.
+    pub const fn client_manager(&self) -> &ClientManager {
+        &self.clients
+    }
+
+    /// Returns the shared monotonic clock used by this reconciler.
+    pub const fn clock(&self) -> &MasterClock {
+        &self.clock
+    }
+
     /// Runs one bounded convergence step.
     ///
     /// Object collection always runs, even when client cleanup reports an
@@ -215,7 +225,7 @@ impl MasterReconciler {
         let report = self.reconcile_once();
         if let Err(error) = &report.client_cleanup {
             log::error!(
-                target: "cakemaster_server::reconciler",
+                target: "cakemaster::server::reconciler",
                 cleanup_error:% = error;
                 "master reconciliation client cleanup failed"
             );

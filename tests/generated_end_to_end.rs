@@ -1,4 +1,4 @@
-use cakemaster_proto::api::{
+use cakemaster::api::{
     DemoService, DemoServiceClient, DemoServiceServer, DescriptorVariant, DiskDescriptor,
     ErrorCode, LocalDiskDescriptor, MemoryDescriptor, NoFDescriptor, ReplicaDescriptor, User,
     UserId,

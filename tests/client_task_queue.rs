@@ -1,4 +1,4 @@
-use cakemaster_server::{ClientTaskQueue, ClientTaskQueueError};
+use cakemaster::server::{ClientTaskQueue, ClientTaskQueueError};
 
 #[tokio::test]
 async fn tx_rx_preserve_fifo_order() {

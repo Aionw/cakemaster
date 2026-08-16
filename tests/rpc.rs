@@ -1,4 +1,12 @@
+//! End-to-end tests for the Mooncake RPC adapter.
+
+use cakemaster::MOONCAKE_STORE_VERSION;
 use cakemaster::client::ClientTick;
+use cakemaster::mooncake::{
+    DescriptorVariant, ErrorCode, ObjectDataType, ObjectMeta, ReplicaStatus, ReplicaType,
+    ReplicateConfig, SoftPinAction, Uuid, WrappedMasterService, WrappedMasterServiceClient,
+    WrappedMasterServiceServer,
+};
 use cakemaster::object::{
     ObjectCatalogConfig, ObjectManager, TenantConfig, TenantId, TenantObjectManager, TenantPolicy,
     TenantQuotaLimits,
@@ -7,13 +15,7 @@ use cakemaster::segment::{
     ClientId, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool, SegmentSpec,
     TransportEndpoint, TransportProtocol,
 };
-use cakemaster_proto::MOONCAKE_STORE_VERSION;
-use cakemaster_proto::mooncake::{
-    DescriptorVariant, ErrorCode, ObjectDataType, ObjectMeta, ReplicaStatus, ReplicaType,
-    ReplicateConfig, SoftPinAction, Uuid, WrappedMasterService, WrappedMasterServiceClient,
-    WrappedMasterServiceServer,
-};
-use cakemaster_server::ObjectCatalogRpcService;
+use cakemaster::server::ObjectCatalogRpcService;
 use std::sync::Arc;
 use tokio::sync::oneshot;
 

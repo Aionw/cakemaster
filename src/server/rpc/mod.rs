@@ -1,24 +1,26 @@
+//! Mooncake RPC adapters backed by Cakemaster domain managers.
+
 mod backend;
 mod multi_tenant;
 mod request;
 mod response;
 mod single_tenant;
 
-use crate::{MasterClock, MasterReconcileConfig, MasterReconciler};
-use backend::{ObjectBatchBackend, batch_error};
-use cakemaster::client::{
+use super::{MasterClock, MasterReconcileConfig, MasterReconciler};
+use crate::MOONCAKE_STORE_VERSION;
+use crate::client::{
     ClientLifecycleConfig, ClientLifecycleConfigError, ClientLifecycleError, ClientManager,
     ClientManagerError, HeartbeatOutcome,
 };
-use cakemaster::object::{ObjectManager, ObjectRead, TenantObjectManager, TenantPutRequest};
-use cakemaster::segment::error::AttachError;
-use cakemaster_proto::MOONCAKE_STORE_VERSION;
-use cakemaster_proto::mooncake::{
+use crate::mooncake::{
     ClientStatus, ErrorCode, ExpectedBool, ExpectedGetReplicaListResponse,
     ExpectedGetStorageConfigResponse, ExpectedPingResponse, ExpectedReplicaDescriptors,
     ExpectedString, ExpectedVoid, GetReplicaListResponse, GetStorageConfigResponse, ObjectMeta,
     PingResponse, ReplicaStatus, ReplicaType, ReplicateConfig, Segment, Uuid, WrappedMasterService,
 };
+use crate::object::{ObjectManager, ObjectRead, TenantObjectManager, TenantPutRequest};
+use crate::segment::error::AttachError;
+use backend::{ObjectBatchBackend, batch_error};
 use coro_rpc::RpcFailure;
 use request::{
     PutPlanTemplate, client_id_from_uuid, replica_selector, segment_id_from_uuid,
@@ -416,11 +418,11 @@ fn client_manager_error(error: ClientManagerError) -> ErrorCode {
         | ClientManagerError::Rollback { .. } => ErrorCode::InternalError,
         ClientManagerError::SegmentUnavailable(_) => ErrorCode::UnavailableInCurrentStatus,
         ClientManagerError::SegmentState(
-            cakemaster::segment::error::SegmentStateError::OwnerMismatch { .. },
+            crate::segment::error::SegmentStateError::OwnerMismatch { .. },
         ) => ErrorCode::InvalidParams,
-        ClientManagerError::SegmentState(
-            cakemaster::segment::error::SegmentStateError::NotFound(segment),
-        ) => {
+        ClientManagerError::SegmentState(crate::segment::error::SegmentStateError::NotFound(
+            segment,
+        )) => {
             if segment.is_nil() {
                 ErrorCode::InvalidParams
             } else {
@@ -428,8 +430,8 @@ fn client_manager_error(error: ClientManagerError) -> ErrorCode {
             }
         }
         ClientManagerError::SegmentState(
-            cakemaster::segment::error::SegmentStateError::StillAccepting(_)
-            | cakemaster::segment::error::SegmentStateError::Busy { .. },
+            crate::segment::error::SegmentStateError::StillAccepting(_)
+            | crate::segment::error::SegmentStateError::Busy { .. },
         ) => ErrorCode::UnavailableInCurrentStatus,
         ClientManagerError::Attach(AttachError::ConflictingSegmentId(_)) => {
             ErrorCode::SegmentAlreadyExists
@@ -464,7 +466,7 @@ fn only_item<T>(mut items: Vec<Result<T, ErrorCode>>) -> Result<T, ErrorCode> {
 
 fn get_replica_list_response(
     read: Result<ObjectRead, ErrorCode>,
-    now: cakemaster::object::reclamation::CatalogTick,
+    now: crate::object::reclamation::CatalogTick,
 ) -> ExpectedGetReplicaListResponse {
     let read = read?;
     let replica_view = read.object().replicas();

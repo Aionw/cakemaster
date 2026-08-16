@@ -1,12 +1,12 @@
 use cakemaster::client::{ClientId, ClientLifecycleConfig, ClientTick};
-use cakemaster::object::ObjectManager;
-use cakemaster::segment::stats::SegmentState;
-use cakemaster::segment::{SegmentId, SegmentPool};
-use cakemaster_proto::mooncake::{
+use cakemaster::mooncake::{
     ClientStatus, ErrorCode, ObjectDataType, ObjectMeta, ReplicaType, ReplicateConfig, Segment,
     SoftPinAction, Uuid, WrappedMasterServiceClient, WrappedMasterServiceServer,
 };
-use cakemaster_server::{MasterClock, MasterReconcileConfig, ObjectCatalogRpcService};
+use cakemaster::object::ObjectManager;
+use cakemaster::segment::stats::SegmentState;
+use cakemaster::segment::{SegmentId, SegmentPool};
+use cakemaster::server::{MasterClock, MasterReconcileConfig, ObjectCatalogRpcService};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::oneshot;
