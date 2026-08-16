@@ -1,11 +1,13 @@
 use super::super::catalog::{ObjectCatalog, ObjectRead};
 use super::super::config::ObjectCatalogConfig;
 use super::super::diagnostics::ObjectCatalogStats;
-use super::super::error::{LookupError, ObjectCatalogConfigError, ObjectManagerError};
+use super::super::error::{
+    LookupError, ObjectCatalogConfigError, ObjectManagerError, ObjectRemoveError,
+};
 use super::super::identity::{ObjectIdentity, ObjectLookup};
 use super::super::manager::{
-    ObjectManager, ObjectManagerMaintenance, ObjectPutPlan, PendingWriteRevoker, ReplicaSelector,
-    StartedPut,
+    ObjectManager, ObjectManagerMaintenance, ObjectPutPlan, PendingWriteRevoker, PreparedUpsert,
+    ReplicaSelector, StartedPut,
 };
 use super::super::reclamation::{CatalogTick, CollectBudget};
 use super::super::write::{WriteAdmission, WriteOwner};
@@ -16,6 +18,7 @@ use super::{
     TenantResourceClass, TenantSnapshot,
 };
 use crate::segment::SegmentPool;
+use regex::Regex;
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -60,6 +63,14 @@ pub enum TenantGetError {
     Tenant(#[from] TenantObjectError),
     #[error(transparent)]
     Lookup(#[from] LookupError),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum TenantRemoveError {
+    #[error(transparent)]
+    Tenant(#[from] TenantObjectError),
+    #[error(transparent)]
+    Remove(#[from] ObjectRemoveError),
 }
 
 /// Tenant-aware façade around [`ObjectManager`]. It is the quota-safe public
@@ -150,6 +161,47 @@ impl TenantObjectManager {
         let (class, charge_bytes) = admission_charge(&plan)?;
         let reservation = entry.reserve(class, charge_bytes, tenant.version)?;
         self.start_put_accounted(identity, admission, plan, now, reservation)
+    }
+
+    pub fn start_upsert(
+        &self,
+        tenant: &ResolvedTenant,
+        key: impl Into<Arc<str>>,
+        admission: WriteAdmission,
+        plan: ObjectPutPlan,
+        now: CatalogTick,
+    ) -> Result<StartedPut, TenantObjectError> {
+        self.registry.validate_binding(tenant)?;
+        let identity = ObjectIdentity::new(tenant.namespace, key);
+        let class = admission_charge(&plan)?.0;
+        match self.object.prepare_upsert(identity, admission, plan, now)? {
+            PreparedUpsert::Reused(started) => Ok(started),
+            PreparedUpsert::Write(prepared) => {
+                let Some(entry) = &tenant.entry else {
+                    return Ok(self.object.finalize_start_put(prepared, None)?);
+                };
+                let reservation =
+                    entry.reserve(class, prepared.actual_charge_bytes()?, tenant.version)?;
+                Ok(self
+                    .object
+                    .finalize_start_put(prepared, Some(reservation))?)
+            }
+        }
+    }
+
+    pub fn start_upsert_batch(
+        &self,
+        tenant: &ResolvedTenant,
+        admission: WriteAdmission,
+        requests: Vec<TenantPutRequest>,
+        now: CatalogTick,
+    ) -> Vec<Result<StartedPut, TenantObjectError>> {
+        requests
+            .into_iter()
+            .map(|request| {
+                self.start_upsert(tenant, request.key, admission.clone(), request.plan, now)
+            })
+            .collect()
     }
 
     #[inline]
@@ -305,6 +357,59 @@ impl TenantObjectManager {
         Ok(self
             .object
             .exists(ObjectLookup::new(tenant.namespace, key), now))
+    }
+
+    pub fn remove(
+        &self,
+        tenant: &ResolvedTenant,
+        key: &str,
+        now: CatalogTick,
+        force: bool,
+    ) -> Result<(), TenantRemoveError> {
+        self.registry.validate(tenant)?;
+        self.object
+            .remove(ObjectLookup::new(tenant.namespace, key), now, force)?;
+        Ok(())
+    }
+
+    pub fn remove_batch<'a, I>(
+        &self,
+        tenant: &ResolvedTenant,
+        keys: I,
+        now: CatalogTick,
+        force: bool,
+    ) -> Result<Vec<Result<(), ObjectRemoveError>>, TenantObjectError>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        self.map_validated_keys(tenant, keys, |lookup| {
+            self.object.remove(lookup, now, force)
+        })
+    }
+
+    pub fn remove_matching(
+        &self,
+        tenant: &ResolvedTenant,
+        pattern: Option<&Regex>,
+        now: CatalogTick,
+        force: bool,
+    ) -> Result<usize, TenantObjectError> {
+        self.registry.validate(tenant)?;
+        Ok(self
+            .object
+            .remove_matching(tenant.namespace, pattern, now, force))
+    }
+
+    pub fn remove_all_tenants(&self, now: CatalogTick, force: bool) -> usize {
+        self.registry
+            .list()
+            .into_iter()
+            .filter_map(|snapshot| self.registry.resolve(&snapshot.id).ok())
+            .map(|tenant| {
+                self.object
+                    .remove_matching(tenant.namespace, None, now, force)
+            })
+            .sum()
     }
 
     pub fn exists_batch<'a, I>(

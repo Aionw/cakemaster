@@ -1,4 +1,4 @@
-use cakemaster::object::error::{LookupError, ObjectManagerError};
+use cakemaster::object::error::{LookupError, ObjectManagerError, ObjectRemoveError};
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     NamespaceId, ObjectCatalogConfig, ObjectContent, ObjectIdentity, ObjectKind, ObjectManager,
@@ -171,6 +171,320 @@ fn manager_owns_the_complete_pending_to_published_lifecycle() {
         Err(ObjectManagerError::InvalidWrite)
     );
     assert_eq!(pool.stats(MEMORY_ID).unwrap().usage.active_allocations, 1);
+}
+
+#[test]
+fn same_size_upsert_reuses_allocations_and_changes_write_owner() {
+    let pool = pool(true, false);
+    let manager = ObjectManager::new(pool.clone());
+    let object = identity("in-place-upsert");
+    let original = manager
+        .start_put(
+            object.clone(),
+            admission(OWNER),
+            plan(
+                4096,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    let original_descriptor = original.replicas()[0].descriptor().clone();
+    manager
+        .finish_put(&object, owner(OWNER), ReplicaSelector::All)
+        .unwrap();
+
+    let replacement = manager
+        .start_upsert(
+            object.clone(),
+            admission(OTHER_OWNER),
+            plan(
+                4096,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::new(1),
+        )
+        .unwrap();
+    assert_eq!(replacement.replicas()[0].descriptor(), &original_descriptor);
+    assert_eq!(pool.stats(MEMORY_ID).unwrap().usage.active_allocations, 1);
+    assert!(matches!(
+        manager.get(object.as_lookup(), CatalogTick::new(1)),
+        Err(LookupError::NotReady)
+    ));
+    assert_eq!(
+        manager.finish_put(&object, owner(OWNER), ReplicaSelector::All),
+        Err(ObjectManagerError::IllegalOwner)
+    );
+    manager
+        .finish_put(&object, owner(OTHER_OWNER), ReplicaSelector::All)
+        .unwrap();
+    assert_eq!(
+        manager
+            .get(object.as_lookup(), CatalogTick::new(2))
+            .unwrap()
+            .object()
+            .owner(),
+        owner(OTHER_OWNER)
+    );
+}
+
+#[test]
+fn upsert_revoke_and_failed_reallocation_restore_the_published_version() {
+    let pool = Arc::new(SegmentPool::new());
+    pool.attach(SegmentSpec::memory(
+        SegmentIdentity::new(MEMORY_ID, OWNER, "memory-a"),
+        MemoryRegion::new(0x1_0000_0000, 12 * 1024),
+        TransportEndpoint::new(TransportProtocol::Tcp, "127.0.0.1:12000"),
+    ))
+    .unwrap();
+    let manager = ObjectManager::new(pool.clone());
+    let object = identity("rollback-upsert");
+    manager
+        .start_put(
+            object.clone(),
+            admission(OWNER),
+            plan(
+                4096,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    manager
+        .finish_put(&object, owner(OWNER), ReplicaSelector::All)
+        .unwrap();
+
+    manager
+        .start_upsert(
+            object.clone(),
+            admission(OTHER_OWNER),
+            plan(
+                8192,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::new(1),
+        )
+        .unwrap();
+    assert!(matches!(
+        manager.get(object.as_lookup(), CatalogTick::new(1)),
+        Err(LookupError::NotReady)
+    ));
+    manager
+        .revoke_put(
+            &object,
+            owner(OTHER_OWNER),
+            ReplicaSelector::All,
+            CatalogTick::new(2),
+        )
+        .unwrap();
+    let restored = manager
+        .get(object.as_lookup(), CatalogTick::new(2))
+        .unwrap();
+    assert_eq!(restored.object().content().logical_bytes(), 4096);
+    assert_eq!(restored.object().owner(), owner(OWNER));
+    drop(restored);
+    let _ = manager.maintenance(CatalogTick::new(2), CollectBudget::new(0, 8, 0));
+    assert_eq!(pool.stats(MEMORY_ID).unwrap().usage.active_allocations, 1);
+
+    assert_eq!(
+        manager.start_upsert(
+            object.clone(),
+            admission(OTHER_OWNER),
+            plan(
+                16 * 1024,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::new(3),
+        ),
+        Err(ObjectManagerError::NoAvailableReplicas)
+    );
+    assert_eq!(
+        manager
+            .get(object.as_lookup(), CatalogTick::new(3))
+            .unwrap()
+            .object()
+            .content()
+            .logical_bytes(),
+        4096
+    );
+}
+
+#[test]
+fn size_changing_upsert_commits_new_generation_and_reclaims_old_allocation() {
+    let pool = pool(true, false);
+    let manager = ObjectManager::new(pool.clone());
+    let object = identity("resized-upsert");
+    manager
+        .start_put(
+            object.clone(),
+            admission(OWNER),
+            plan(
+                4096,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    manager
+        .finish_put(&object, owner(OWNER), ReplicaSelector::All)
+        .unwrap();
+    manager
+        .start_upsert(
+            object.clone(),
+            admission(OTHER_OWNER),
+            plan(
+                8192,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::new(1),
+        )
+        .unwrap();
+    manager
+        .finish_put(&object, owner(OTHER_OWNER), ReplicaSelector::All)
+        .unwrap();
+    assert_eq!(manager.catalog().stats().published_objects, 1);
+    assert_eq!(pool.stats(MEMORY_ID).unwrap().usage.active_allocations, 2);
+    let report = manager.maintenance(CatalogTick::new(2), CollectBudget::new(0, 8, 0));
+    assert_eq!(report.catalog.reclaimed_objects, 1);
+    assert_eq!(pool.stats(MEMORY_ID).unwrap().usage.active_allocations, 1);
+    assert_eq!(
+        manager
+            .get(object.as_lookup(), CatalogTick::new(2))
+            .unwrap()
+            .object()
+            .content()
+            .logical_bytes(),
+        8192
+    );
+}
+
+#[test]
+fn remove_honors_lease_unless_forced() {
+    let pool = pool(true, false);
+    let manager =
+        ObjectManager::with_config(pool, ObjectCatalogConfig::new(32).with_lease(10, 5)).unwrap();
+    let object = identity("remove-me");
+    manager
+        .start_put(
+            object.clone(),
+            admission(OWNER),
+            plan(
+                4096,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    manager
+        .finish_put(&object, owner(OWNER), ReplicaSelector::All)
+        .unwrap();
+    drop(
+        manager
+            .get(object.as_lookup(), CatalogTick::new(1))
+            .unwrap(),
+    );
+
+    assert_eq!(
+        manager.remove(object.as_lookup(), CatalogTick::new(2), false),
+        Err(ObjectRemoveError::Leased {
+            expires_at: CatalogTick::new(11)
+        })
+    );
+    manager
+        .remove(object.as_lookup(), CatalogTick::new(2), true)
+        .unwrap();
+    assert!(matches!(
+        manager.get(object.as_lookup(), CatalogTick::new(2)),
+        Err(LookupError::NotFound)
+    ));
+}
+
+#[test]
+fn in_place_upsert_timeout_is_fenced_by_write_generation() {
+    let pool = pool(true, false);
+    let manager =
+        ObjectManager::with_config(pool, ObjectCatalogConfig::new(32).with_pending_timeout(2))
+            .unwrap();
+    let object = identity("upsert-timeout");
+    manager
+        .start_put(
+            object.clone(),
+            admission(OWNER),
+            plan(
+                4096,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    manager
+        .finish_put(&object, owner(OWNER), ReplicaSelector::All)
+        .unwrap();
+
+    manager
+        .start_upsert(
+            object.clone(),
+            admission(OTHER_OWNER),
+            plan(
+                4096,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::new(1),
+        )
+        .unwrap();
+    manager
+        .finish_put(&object, owner(OTHER_OWNER), ReplicaSelector::All)
+        .unwrap();
+    manager
+        .start_upsert(
+            object.clone(),
+            admission(OWNER),
+            plan(
+                4096,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
+            CatalogTick::new(2),
+        )
+        .unwrap();
+
+    let report = manager.maintenance(CatalogTick::new(3), CollectBudget::new(8, 8, 0));
+    assert_eq!(report.expired_writes, 0);
+    assert!(matches!(
+        manager.get(object.as_lookup(), CatalogTick::new(3)),
+        Err(LookupError::NotReady)
+    ));
+    let report = manager.maintenance(CatalogTick::new(4), CollectBudget::new(8, 8, 0));
+    assert_eq!(report.expired_writes, 1);
+    assert_eq!(
+        manager
+            .get(object.as_lookup(), CatalogTick::new(4))
+            .unwrap()
+            .object()
+            .owner(),
+        owner(OTHER_OWNER)
+    );
 }
 
 #[test]

@@ -5,7 +5,7 @@ use super::error::{
     LookupError, ObjectCatalogConfigError, PublishError, PutError, RemoveError, RevokeError,
     StageError,
 };
-use super::identity::{ObjectIdentity, ObjectLookup};
+use super::identity::{NamespaceId, ObjectIdentity, ObjectLookup};
 use super::reclamation::{CatalogTick, CollectBudget, CollectReport, ReclaimFilter, ReclaimTarget};
 use super::replica::{ReplicaLease, ReplicaPartition, ReplicaReclaimBatch, ReplicaSet};
 use super::tenant::{QuotaReservationGuard, TenantQuotaCharge};
@@ -36,6 +36,8 @@ enum ObjectState {
     Pending,
     /// The current slot generation is readable and lease-protected.
     Published,
+    /// A published generation is hidden while an upsert can still roll back.
+    Updating,
     /// The node is detached or being detached before deferred reclamation.
     Retiring,
 }
@@ -46,6 +48,7 @@ impl ObjectState {
             value if value == Self::Claimed as u8 => Self::Claimed,
             value if value == Self::Pending as u8 => Self::Pending,
             value if value == Self::Published as u8 => Self::Published,
+            value if value == Self::Updating as u8 => Self::Updating,
             value if value == Self::Retiring as u8 => Self::Retiring,
             _ => unreachable!("object lifecycle only stores valid states"),
         }
@@ -156,13 +159,23 @@ struct MutationControl {
     /// Serializes lifecycle mutations and replica pruning for this node.
     /// Ordinary lookups still use the atomic lifecycle and access controls.
     gate: Mutex<()>,
-    metadata: WriteMetadata,
+    /// Keeps the externally inspectable write identity and its rollback plan
+    /// in one consistent snapshot.
+    metadata: RwLock<WriteMetadata>,
     commit: OnceLock<ObjectCommit>,
 }
 
 struct WriteMetadata {
     id: WriteId,
     owner: WriteOwner,
+    rollback: WriteRollback,
+}
+
+/// Only one rollback strategy can belong to a write generation.
+enum WriteRollback {
+    None,
+    InPlace { previous_owner: WriteOwner },
+    Replacement { previous: Arc<CatalogNode> },
 }
 
 /// Read-side signals consumed by lease enforcement and second-chance eviction.
@@ -179,6 +192,7 @@ struct GcCandidate {
 
 struct PendingCandidate {
     candidate: GcCandidate,
+    write_id: WriteId,
     deadline: CatalogTick,
 }
 
@@ -234,6 +248,11 @@ pub struct ObjectRead {
 pub(super) enum ObjectWriteState {
     Pending(PutTicket),
     Published(ObjectHandle),
+}
+
+pub(super) enum UpsertClaim {
+    Reuse(PutTicket),
+    Write(PutClaim),
 }
 
 impl ObjectCatalog {
@@ -304,6 +323,17 @@ impl ObjectCatalog {
             empty_slot_candidates: collector.empty_slots.len(),
         }
     }
+
+    pub(in crate::object) fn identities(&self, namespace: NamespaceId) -> Vec<ObjectIdentity> {
+        let mut identities = Vec::new();
+        self.inner.index.entries.iter_sync(|identity, slot| {
+            if identity.namespace() == namespace && slot.current.load().is_some() {
+                identities.push(identity.clone());
+            }
+            true
+        });
+        identities
+    }
 }
 
 impl Default for ObjectCatalog {
@@ -332,6 +362,17 @@ impl CatalogIndex {
 
     fn on_slot_removed(&self) {
         self.slots.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl CatalogInner {
+    /// Restores an allocation-reusing update while the caller holds the
+    /// node's write gate.
+    fn rollback_in_place_update(&self, slot: &Arc<ObjectSlot>, node: &Arc<CatalogNode>) {
+        debug_assert_eq!(node.mutation.state(), ObjectState::Updating);
+        node.mutation.rollback_in_place_update();
+        node.mutation.store(ObjectState::Published);
+        self.collector.young.push(GcCandidate::new(slot, node));
     }
 }
 
@@ -399,12 +440,26 @@ impl ObjectSlot {
 
 impl CatalogNode {
     fn claimed(id: WriteId, owner: WriteOwner) -> Self {
+        Self::claimed_replacement(id, owner, None)
+    }
+
+    fn claimed_replacement(
+        id: WriteId,
+        owner: WriteOwner,
+        previous: Option<Arc<CatalogNode>>,
+    ) -> Self {
         Self {
             record: OnceLock::new(),
             mutation: MutationControl {
                 lifecycle: ObjectLifecycle::new(ObjectState::Claimed),
                 gate: Mutex::new(()),
-                metadata: WriteMetadata { id, owner },
+                metadata: RwLock::new(WriteMetadata {
+                    id,
+                    owner,
+                    rollback: previous.map_or(WriteRollback::None, |previous| {
+                        WriteRollback::Replacement { previous }
+                    }),
+                }),
                 commit: OnceLock::new(),
             },
             access: AccessControl {
@@ -619,11 +674,61 @@ impl MutationControl {
     }
 
     fn write_id(&self) -> WriteId {
-        self.metadata.id
+        self.metadata.read().id
     }
 
     fn owner(&self) -> WriteOwner {
-        self.metadata.owner
+        self.metadata.read().owner
+    }
+
+    /// Installs all externally inspectable write identity under one lock.
+    /// The caller holds `gate` and has already hidden the published node.
+    fn begin_in_place_update(&self, id: WriteId, owner: WriteOwner) {
+        let mut metadata = self.metadata.write();
+        debug_assert!(matches!(&metadata.rollback, WriteRollback::None));
+        let previous_owner = metadata.owner;
+        metadata.id = id;
+        metadata.owner = owner;
+        metadata.rollback = WriteRollback::InPlace { previous_owner };
+    }
+
+    fn commit_in_place_update(&self) {
+        let rollback = std::mem::replace(&mut self.metadata.write().rollback, WriteRollback::None);
+        assert!(matches!(rollback, WriteRollback::InPlace { .. }));
+    }
+
+    fn rollback_in_place_update(&self) {
+        let mut metadata = self.metadata.write();
+        let rollback = std::mem::replace(&mut metadata.rollback, WriteRollback::None);
+        let WriteRollback::InPlace { previous_owner } = rollback else {
+            unreachable!("updating an in-place object retains its previous owner");
+        };
+        metadata.owner = previous_owner;
+    }
+
+    fn has_replacement(&self) -> bool {
+        matches!(
+            &self.metadata.read().rollback,
+            WriteRollback::Replacement { .. }
+        )
+    }
+
+    fn replacement(&self) -> Option<Arc<CatalogNode>> {
+        match &self.metadata.read().rollback {
+            WriteRollback::Replacement { previous } => Some(previous.clone()),
+            WriteRollback::None | WriteRollback::InPlace { .. } => None,
+        }
+    }
+
+    fn take_replacement(&self) -> Option<Arc<CatalogNode>> {
+        let rollback = std::mem::replace(&mut self.metadata.write().rollback, WriteRollback::None);
+        match rollback {
+            WriteRollback::Replacement { previous } => Some(previous),
+            WriteRollback::None => None,
+            WriteRollback::InPlace { .. } => {
+                unreachable!("an in-place update cannot publish a replacement")
+            }
+        }
     }
 
     fn commit(&self) -> Option<ObjectCommit> {
@@ -704,6 +809,26 @@ fn clear_slot(slot: &ObjectSlot, expected: &Arc<CatalogNode>) -> bool {
     previous
         .as_ref()
         .is_some_and(|current| Arc::ptr_eq(current, expected))
+}
+
+fn restore_previous(slot: &ObjectSlot, replacement: &Arc<CatalogNode>) -> Option<Arc<CatalogNode>> {
+    let previous_node = replacement.mutation.replacement()?;
+    let observed = slot
+        .current
+        .compare_and_swap(replacement, Some(previous_node.clone()));
+    if !observed
+        .as_ref()
+        .is_some_and(|observed| Arc::ptr_eq(observed, replacement))
+    {
+        return None;
+    }
+    let restored = replacement
+        .mutation
+        .take_replacement()
+        .expect("a restored replacement retains its previous generation");
+    debug_assert!(Arc::ptr_eq(&restored, &previous_node));
+    previous_node.mutation.store(ObjectState::Published);
+    Some(previous_node)
 }
 
 fn atomic_saturating_sub(value: &AtomicU64, amount: u64) {

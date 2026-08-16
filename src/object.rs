@@ -38,6 +38,6 @@ pub use tenant::{
     ResolvedTenant, TenantAdminError, TenantCatalog, TenantConfig, TenantConfigError,
     TenantGetError, TenantId, TenantIdError, TenantObjectError, TenantObjectManager,
     TenantObjectManagerCreateError, TenantPolicy, TenantPutRequest, TenantQuotaLimits,
-    TenantQuotaSnapshot, TenantResourceClass, TenantSnapshot,
+    TenantQuotaSnapshot, TenantRemoveError, TenantResourceClass, TenantSnapshot,
 };
 pub use write::{ObjectCommit, WriteAdmission, WriteId, WriteOwner};

@@ -4,11 +4,11 @@ use std::time::Instant;
 use cakemaster::MOONCAKE_STORE_VERSION;
 use cakemaster::mooncake::{
     BufferDescriptor, ClientStatus, DescriptorVariant, ExpectedBool,
-    ExpectedGetReplicaListResponse, ExpectedGetStorageConfigResponse, ExpectedPingResponse,
-    ExpectedReplicaDescriptors, ExpectedString, ExpectedVoid, GetReplicaListResponse,
-    GetStorageConfigResponse, MemoryDescriptor, ObjectDataType, ObjectMeta, PingResponse,
-    ReplicaDescriptor, ReplicaStatus, ReplicaType, ReplicateConfig, Segment, SoftPinAction, Uuid,
-    WrappedMasterService, WrappedMasterServiceServer,
+    ExpectedGetReplicaListResponse, ExpectedGetStorageConfigResponse, ExpectedI64,
+    ExpectedPingResponse, ExpectedReplicaDescriptors, ExpectedString, ExpectedVoid,
+    GetReplicaListResponse, GetStorageConfigResponse, MemoryDescriptor, ObjectDataType, ObjectMeta,
+    PingResponse, ReplicaDescriptor, ReplicaStatus, ReplicaType, ReplicateConfig, Segment,
+    SoftPinAction, Uuid, WrappedMasterService, WrappedMasterServiceServer,
 };
 use coro_rpc::struct_pack::{serialize, type_hash, type_literal};
 use coro_rpc::{ClientConfig, RpcClient, RpcError, RpcFailure, RpcMethod, StructPack, function_id};
@@ -27,6 +27,16 @@ const BATCH_PUT_END: &str = "mooncake::WrappedMasterService::BatchPutEnd";
 const BATCH_PUT_REVOKE: &str = "mooncake::WrappedMasterService::BatchPutRevoke";
 const GET_STORAGE_CONFIG: &str = "mooncake::WrappedMasterService::GetStorageConfig";
 const SERVICE_READY: &str = "mooncake::WrappedMasterService::ServiceReady";
+const UPSERT_START: &str = "mooncake::WrappedMasterService::UpsertStart";
+const UPSERT_END: &str = "mooncake::WrappedMasterService::UpsertEnd";
+const UPSERT_REVOKE: &str = "mooncake::WrappedMasterService::UpsertRevoke";
+const BATCH_UPSERT_START: &str = "mooncake::WrappedMasterService::BatchUpsertStart";
+const BATCH_UPSERT_END: &str = "mooncake::WrappedMasterService::BatchUpsertEnd";
+const BATCH_UPSERT_REVOKE: &str = "mooncake::WrappedMasterService::BatchUpsertRevoke";
+const REMOVE: &str = "mooncake::WrappedMasterService::Remove";
+const REMOVE_BY_REGEX: &str = "mooncake::WrappedMasterService::RemoveByRegex";
+const REMOVE_ALL: &str = "mooncake::WrappedMasterService::RemoveAll";
+const BATCH_REMOVE: &str = "mooncake::WrappedMasterService::BatchRemove";
 
 type SingleKeyRequest = (String, String);
 type SingleExistResponse = ExpectedBool;
@@ -42,6 +52,15 @@ type BatchVoidResponse = Vec<ExpectedVoid>;
 type MountSegmentRequest = (Segment, Uuid);
 type UnmountSegmentRequest = (Uuid, Uuid);
 type GracefulUnmountSegmentRequest = (Uuid, Uuid, u64);
+type UpsertStartRequest = (Uuid, String, u64, ReplicateConfig, String);
+type UpsertEndRequest = (Uuid, ObjectMeta, ReplicaType, String);
+type UpsertRevokeRequest = (Uuid, String, ReplicaType, String);
+type BatchUpsertEndRequest = (Uuid, Vec<ObjectMeta>, String);
+type BatchUpsertRevokeRequest = (Uuid, Vec<String>, String);
+type RemoveRequest = (String, bool, String);
+type RemoveByRegexResponse = ExpectedI64;
+type RemoveAllRequest = (bool, String);
+type BatchRemoveRequest = (Vec<String>, bool, String);
 
 #[derive(Clone, Copy)]
 enum Operation {
@@ -225,6 +244,100 @@ impl WrappedMasterService for BenchmarkMasterService {
     ) -> Result<BatchVoidResponse, RpcFailure> {
         Ok(keys.into_iter().map(|_| Ok(())).collect())
     }
+
+    async fn upsert_start(
+        &self,
+        _client_id: Uuid,
+        _key: String,
+        _slice_length: u64,
+        _config: ReplicateConfig,
+        _tenant_id: String,
+    ) -> Result<ExpectedReplicaDescriptors, RpcFailure> {
+        Ok(Ok(vec![memory_replica()]))
+    }
+
+    async fn upsert_end(
+        &self,
+        _client_id: Uuid,
+        _object_meta: ObjectMeta,
+        _replica_type: ReplicaType,
+        _tenant_id: String,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        Ok(Ok(()))
+    }
+
+    async fn upsert_revoke(
+        &self,
+        _client_id: Uuid,
+        _key: String,
+        _replica_type: ReplicaType,
+        _tenant_id: String,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        Ok(Ok(()))
+    }
+
+    async fn batch_upsert_start(
+        &self,
+        _client_id: Uuid,
+        keys: Vec<String>,
+        _slice_lengths: Vec<u64>,
+        _config: ReplicateConfig,
+        _tenant_id: String,
+    ) -> Result<BatchPutStartResponse, RpcFailure> {
+        Ok(keys
+            .into_iter()
+            .map(|_| Ok(vec![memory_replica()]))
+            .collect())
+    }
+
+    async fn batch_upsert_end(
+        &self,
+        _client_id: Uuid,
+        object_metas: Vec<ObjectMeta>,
+        _tenant_id: String,
+    ) -> Result<BatchVoidResponse, RpcFailure> {
+        Ok(object_metas.into_iter().map(|_| Ok(())).collect())
+    }
+
+    async fn batch_upsert_revoke(
+        &self,
+        _client_id: Uuid,
+        keys: Vec<String>,
+        _tenant_id: String,
+    ) -> Result<BatchVoidResponse, RpcFailure> {
+        Ok(keys.into_iter().map(|_| Ok(())).collect())
+    }
+
+    async fn remove(
+        &self,
+        _key: String,
+        _force: bool,
+        _tenant_id: String,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        Ok(Ok(()))
+    }
+
+    async fn remove_by_regex(
+        &self,
+        _regex: String,
+        _force: bool,
+        _tenant_id: String,
+    ) -> Result<ExpectedI64, RpcFailure> {
+        Ok(Ok(0))
+    }
+
+    async fn remove_all(&self, _force: bool, _tenant_id: String) -> Result<i64, RpcFailure> {
+        Ok(0)
+    }
+
+    async fn batch_remove(
+        &self,
+        keys: Vec<String>,
+        _force: bool,
+        _tenant_id: String,
+    ) -> Result<BatchVoidResponse, RpcFailure> {
+        Ok(keys.into_iter().map(|_| Ok(())).collect())
+    }
 }
 
 fn memory_replica() -> ReplicaDescriptor {
@@ -294,6 +407,15 @@ fn print_metadata() {
     print_type::<GetStorageConfigResponse>("storage_config_value");
     print_type::<ExpectedGetStorageConfigResponse>("storage_config_response");
     print_type::<ExpectedString>("service_ready_response");
+    print_type::<UpsertStartRequest>("upsert_start_request");
+    print_type::<UpsertEndRequest>("upsert_end_request");
+    print_type::<UpsertRevokeRequest>("upsert_revoke_request");
+    print_type::<BatchUpsertEndRequest>("batch_upsert_end_request");
+    print_type::<BatchUpsertRevokeRequest>("batch_upsert_revoke_request");
+    print_type::<RemoveRequest>("remove_request");
+    print_type::<RemoveByRegexResponse>("remove_by_regex_response");
+    print_type::<RemoveAllRequest>("remove_all_request");
+    print_type::<BatchRemoveRequest>("batch_remove_request");
     print_bytes(
         "storage_config_response_sample",
         &serialize(&ExpectedGetStorageConfigResponse::Ok(
@@ -356,6 +478,22 @@ fn print_metadata() {
         function_id(GET_STORAGE_CONFIG)
     );
     println!("service_ready_route={}", function_id(SERVICE_READY));
+    println!("upsert_start_route={}", function_id(UPSERT_START));
+    println!("upsert_end_route={}", function_id(UPSERT_END));
+    println!("upsert_revoke_route={}", function_id(UPSERT_REVOKE));
+    println!(
+        "batch_upsert_start_route={}",
+        function_id(BATCH_UPSERT_START)
+    );
+    println!("batch_upsert_end_route={}", function_id(BATCH_UPSERT_END));
+    println!(
+        "batch_upsert_revoke_route={}",
+        function_id(BATCH_UPSERT_REVOKE)
+    );
+    println!("remove_route={}", function_id(REMOVE));
+    println!("remove_by_regex_route={}", function_id(REMOVE_BY_REGEX));
+    println!("remove_all_route={}", function_id(REMOVE_ALL));
+    println!("batch_remove_route={}", function_id(BATCH_REMOVE));
 }
 
 fn print_type<T: StructPack>(label: &str) {

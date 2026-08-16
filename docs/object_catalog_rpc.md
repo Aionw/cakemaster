@@ -5,8 +5,9 @@ handler 中复制 catalog、placement 或事务规则。当前实现提供 clien
 `Ping`、`MountSegment`、`ReMountSegment`、`UnmountSegment`、
 `GracefulUnmountSegment`，单 key `ExistKey`、`GetReplicaList`，以及
 `BatchExistKey`、`BatchGetReplicaList`、`BatchPutStart`、`BatchPutEnd` 和
-`BatchPutRevoke`。此外，`ServiceReady` 和 `GetStorageConfig` 提供上游 Client 初始化所需
-的版本握手与无持久化配置。
+`BatchPutRevoke`。对象更新已覆盖 `UpsertStart/End/Revoke` 及其 batch 版本；删除已覆盖
+`Remove`、`BatchRemove`、`RemoveByRegex` 和 `RemoveAll`。此外，`ServiceReady` 和
+`GetStorageConfig` 提供上游 Client 初始化所需的版本握手与无持久化配置。
 
 ## 分层与同步/异步边界
 
@@ -121,6 +122,12 @@ backend callback 因此只包含对应的领域 batch 调用。
 candidate 全部由 catalog 维护，不再在 manager 中复制事务表与 deadline heap。它不决定
 watermark 或淘汰比例。
 
+Catalog node 的对外 lifecycle 收敛为 `Claimed`、`Pending`、`Published`、`Updating` 和
+`Retiring` 五态。publish 和 replica pruning 只是 node `write_gate` 内的临界区，不再暴露
+额外中间态；同尺寸更新和变尺寸更新保留的旧 generation 都使用 `Updating`，具体回滚路径
+由 previous generation/owner metadata 区分。这样状态只表达可见性与资源归属差异，CAS 和
+内存序统一封装在 typed lifecycle 中。
+
 `start_put` 的顺序为：
 
 1. 校验 object size、allocation size、replica count 和 replica class。
@@ -143,6 +150,18 @@ publish 的对象重复调用 finish 是幂等成功；owner 不同返回 `ILLEG
 `revoke_put` 做同样的 owner/class 校验，然后撤销 pending ticket。reservation
 随 catalog record 进入回收流程并最终归还 allocator；已 publish 的对象不能用
 revoke 删除。
+
+`start_upsert` 对缺失 key 复用 put 流程；对同尺寸已发布对象进入不可读的更新状态并复用
+原 replica 地址；对变尺寸对象则安装新的 pending generation，同时保留旧 generation
+用于失败回滚。`finish_put` 同时提交普通 put 和 upsert：变尺寸提交后旧 generation 进入
+延迟回收，外部 read handle 释放后才归还 reservation 和 quota；`revoke_put`、pending
+timeout 或 client session fencing 都会恢复旧 generation。同一对象已有 pending write 时
+当前仍返回冲突，不实现上游 UpsertStart 对旧 PROCESSING writer 的立即抢占。
+
+`remove` 只删除已发布对象；普通删除受 lease 保护，`force=true` 绕过 lease。pending 或
+upsert 中对象返回 `REPLICA_IS_NOT_READY`，缺失对象返回 `OBJECT_NOT_FOUND`。batch 删除逐项
+返回结果；regex/all 删除只统计实际成功删除的对象，并跳过仍受保护或未完成的对象。
+当前没有 hard pin 和 replication task，因此 force 尚没有这两类额外状态可绕过或检查。
 
 `get` 只返回完整 publish 的对象并刷新 lease，pending object 返回
 `REPLICA_IS_NOT_READY`。`exists` 与 get 使用同一可见性和 lease 语义，但只返回
@@ -189,6 +208,9 @@ pending write、淘汰、物理回收和空 slot；它不会在一次调用中�
 | `ReMountSegment` | 支持 Memory/CXL segment 的原子激活与幂等重挂载；NoF 和冲突配置返回错误 |
 | `UnmountSegment` | 立即摘除单个 segment；不存在幂等成功，client session 保持 active |
 | `GracefulUnmountSegment` | 立即停止新分配并在 grace deadline 摘除；不存在返回 `SEGMENT_NOT_FOUND`；依赖显式运行的 `MasterReconciler` |
+| `UpsertStart/End/Revoke` + batch | 缺失 key 等价 put；同尺寸复用 allocation；变尺寸保留旧 generation 并支持 end/revoke/timeout/session-fence 回滚 |
+| `Remove` / `BatchRemove` | 普通模式遵守 lease，force 绕过 lease；pending/upsert 中对象拒绝删除 |
+| `RemoveByRegex` / `RemoveAll` | 删除所有当前可删除的匹配对象并返回成功数量；multi-tenant 下空 tenant 的 `RemoveAll` 覆盖所有租户 |
 | tenant id（single 构造） | 忽略并统一映射到 `NamespaceId::DEFAULT` |
 | tenant id（multi 构造） | 映射到隔离 namespace；未知租户和超额分别返回现有 tenant 错误码 |
 

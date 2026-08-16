@@ -15,6 +15,15 @@ enum ScopedCandidate {
 
 impl ObjectCatalog {
     pub fn remove(&self, lookup: ObjectLookup<'_>, now: CatalogTick) -> Result<(), RemoveError> {
+        self.remove_with_force(lookup, now, false)
+    }
+
+    pub fn remove_with_force(
+        &self,
+        lookup: ObjectLookup<'_>,
+        now: CatalogTick,
+        force: bool,
+    ) -> Result<(), RemoveError> {
         let slot = self
             .inner
             .lookup_slot(lookup)
@@ -28,7 +37,7 @@ impl ObjectCatalog {
             }
             match node.mutation.state() {
                 ObjectState::Published => {}
-                ObjectState::Claimed | ObjectState::Pending => {
+                ObjectState::Claimed | ObjectState::Pending | ObjectState::Updating => {
                     return Err(RemoveError::NotReady);
                 }
                 ObjectState::Retiring => return Err(RemoveError::NotFound),
@@ -43,7 +52,7 @@ impl ObjectCatalog {
             }
 
             let lease_until = node.access.lease_until();
-            if lease_until > now {
+            if !force && lease_until > now {
                 node.mutation.store(ObjectState::Published);
                 return Err(RemoveError::Leased {
                     expires_at: lease_until,
@@ -282,7 +291,10 @@ impl CatalogInner {
     ) -> Option<(Arc<ObjectSlot>, Arc<CatalogNode>)> {
         let slot = pending.candidate.slot.upgrade()?;
         let node = pending.candidate.node.upgrade()?;
-        if node.mutation.state() != ObjectState::Pending
+        if !matches!(
+            node.mutation.state(),
+            ObjectState::Pending | ObjectState::Updating
+        ) || node.write_id() != pending.write_id
             || !slot_points_to(&slot, &node)
             || node.record.get().is_none()
         {
@@ -295,11 +307,19 @@ impl CatalogInner {
         &self,
         slot: Arc<ObjectSlot>,
         node: Arc<CatalogNode>,
+        write_id: WriteId,
         now: CatalogTick,
     ) -> bool {
-        let write = node.mutation.lock();
-        if !slot_points_to(&slot, &node) {
+        let _write = node.mutation.lock();
+        // Recheck under the transaction gate. An in-place upsert may have
+        // committed and a newer one may have reused this node after the
+        // candidate was resolved but before this lock was acquired.
+        if node.write_id() != write_id || !slot_points_to(&slot, &node) {
             return false;
+        }
+        if node.mutation.state() == ObjectState::Updating {
+            self.rollback_in_place_update(&slot, &node);
+            return true;
         }
         if node
             .mutation
@@ -308,11 +328,32 @@ impl CatalogInner {
         {
             return false;
         }
-        if !clear_slot(&slot, &node) {
-            return false;
+        self.retire_revoked_pending(slot, node.clone(), now)
+    }
+
+    /// Finishes a revoke after the pending node entered `Retiring`. A normal
+    /// put clears the slot; a replacement upsert restores its old generation
+    /// before the new allocation is queued for reclamation.
+    pub(super) fn retire_revoked_pending(
+        &self,
+        slot: Arc<ObjectSlot>,
+        node: Arc<CatalogNode>,
+        now: CatalogTick,
+    ) -> bool {
+        if node.mutation.has_replacement() {
+            let Some(previous) = restore_previous(&slot, &node) else {
+                return false;
+            };
+            self.collector
+                .young
+                .push(GcCandidate::new(&slot, &previous));
+            self.retire_rolled_back_pending(node.clone(), now);
+        } else {
+            if !clear_slot(&slot, &node) {
+                return false;
+            }
+            self.retire_pending(slot, node.clone(), now);
         }
-        drop(write);
-        self.retire_pending(slot, node, now);
         true
     }
 
@@ -346,7 +387,7 @@ impl CatalogInner {
                 self.collector.pending.push(pending);
                 continue;
             }
-            if self.try_revoke_pending(slot, node, now) {
+            if self.try_revoke_pending(slot, node, pending.write_id, now) {
                 revoked += 1;
             }
         }
@@ -369,6 +410,38 @@ impl CatalogInner {
         self.enqueue_empty(&slot, now);
     }
 
+    /// Retires the previous generation of a committed upsert. The slot is
+    /// already occupied by the replacement, so no empty-slot candidate is
+    /// created.
+    pub(super) fn retire_replaced(&self, node: Arc<CatalogNode>) {
+        let record = node
+            .record
+            .get()
+            .expect("only published objects can be replaced");
+        let bytes = record.reserved_bytes();
+        node.mutation.store(ObjectState::Retiring);
+        node.mark_accounting_retiring();
+        self.lifecycle.on_retire_published(bytes);
+        self.collector.retired.push(RetiredObject {
+            node,
+            reserved_bytes: bytes,
+            retry_at: CatalogTick::ZERO,
+        });
+    }
+
+    /// Retires a failed replacement while restoring its predecessor in the
+    /// same slot.
+    pub(super) fn retire_rolled_back_pending(&self, node: Arc<CatalogNode>, now: CatalogTick) {
+        let bytes = node.record().reserved_bytes();
+        node.abort_accounting();
+        self.lifecycle.on_retire_pending(bytes);
+        self.collector.retired.push(RetiredObject {
+            node,
+            reserved_bytes: bytes,
+            retry_at: now,
+        });
+    }
+
     pub(super) fn expire_pending(
         &self,
         now: CatalogTick,
@@ -384,7 +457,7 @@ impl CatalogInner {
                 continue;
             };
             if !node.record().replicas.read().all_live() {
-                if self.try_revoke_pending(slot, node, now) {
+                if self.try_revoke_pending(slot, node, pending.write_id, now) {
                     report.invalidated_pending += 1;
                 }
                 continue;
@@ -393,7 +466,7 @@ impl CatalogInner {
                 self.collector.pending.push(pending);
                 continue;
             }
-            if self.try_revoke_pending(slot, node, now) {
+            if self.try_revoke_pending(slot, node, pending.write_id, now) {
                 report.expired_pending += 1;
             }
         }
