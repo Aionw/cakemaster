@@ -545,7 +545,15 @@ impl ClientManager {
                     self.inner.graceful_unmounts.lock().finish(&job);
                     report.stale_or_cancelled += 1;
                 }
-                Err(_) => {
+                Err(error) => {
+                    log::warn!(
+                        target: "cakemaster::client::manager",
+                        client_id:% = job.key.session.client_id(),
+                        generation = job.key.session.generation(),
+                        segment_id:% = job.key.segment,
+                        error:% = error;
+                        "graceful segment unmount failed and will be retried"
+                    );
                     if self
                         .inner
                         .graceful_unmounts
