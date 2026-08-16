@@ -23,11 +23,12 @@ thiserror = "2"
 
 [dependencies]
 arc-swap = "1.9"
+clap = { version = "4", features = ["derive"] }
 coro-rpc = { path = "crates/coro-rpc" }
 crossbeam-queue = "0.3"
 futures-util = "0.3"
 log = { version = "0.4", features = ["kv"] }
-logforth = { version = "0.30", features = ["append-async", "bridge-log"] }
+logforth = { version = "0.30", features = ["append-async", "append-file", "bridge-log", "filter-rustlog", "layout-text"] }
 offset-allocator = "0.2"
 parking_lot = "0.12"
 scc = "3.8"
