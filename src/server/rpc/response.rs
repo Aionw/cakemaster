@@ -1,5 +1,6 @@
 //! Domain-to-Mooncake response and error mapping.
 
+use super::observability::observe_internal_mapping;
 use crate::mooncake::{
     BufferDescriptor, DescriptorVariant, ErrorCode, MemoryDescriptor, NoFDescriptor,
     ReplicaDescriptor, ReplicaStatus,
@@ -88,7 +89,7 @@ pub(super) fn map_lookup_error(error: LookupError) -> ErrorCode {
 }
 
 pub(super) fn map_manager_error(error: ObjectManagerError) -> ErrorCode {
-    match error {
+    let error_code = match error {
         ObjectManagerError::InvalidPlan => ErrorCode::InvalidParams,
         ObjectManagerError::AlreadyExists => ErrorCode::ObjectAlreadyExists,
         ObjectManagerError::NoAvailableReplicas => ErrorCode::NoAvailableHandle,
@@ -98,7 +99,9 @@ pub(super) fn map_manager_error(error: ObjectManagerError) -> ErrorCode {
             ErrorCode::InvalidWrite
         }
         ObjectManagerError::Internal => ErrorCode::InternalError,
-    }
+    };
+    observe_internal_mapping("object_manager", &error, error_code);
+    error_code
 }
 
 pub(super) fn map_tenant_error(error: TenantObjectError) -> ErrorCode {

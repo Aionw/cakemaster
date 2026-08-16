@@ -230,5 +230,38 @@ impl MasterReconciler {
                 "master reconciliation client cleanup failed"
             );
         }
+        let client_cleanup = report.client_cleanup.as_ref().ok();
+        let catalog = report.object_collection.catalog;
+        let did_work = client_cleanup.is_some_and(|report| {
+            report.completed_sessions != 0
+                || report.revoked_pending_writes != 0
+                || report.invalidated_segments != 0
+        }) || report.graceful_unmount.completed != 0
+            || report.graceful_unmount.stale_or_cancelled != 0
+            || report.graceful_unmount.retried != 0
+            || report.object_collection.expired_writes != 0
+            || catalog.invalidated_pending != 0
+            || catalog.invalidated_published != 0
+            || catalog.pruned_objects != 0
+            || catalog.reclaimed_objects != 0
+            || catalog.removed_empty_slots != 0;
+        if did_work {
+            log::debug!(
+                target: "cakemaster::server::reconciler",
+                completed_sessions = client_cleanup.map_or(0, |report| report.completed_sessions),
+                revoked_pending_writes = client_cleanup.map_or(0, |report| report.revoked_pending_writes),
+                invalidated_segments = client_cleanup.map_or(0, |report| report.invalidated_segments),
+                graceful_unmount_completed = report.graceful_unmount.completed,
+                graceful_unmount_retried = report.graceful_unmount.retried,
+                expired_writes = report.object_collection.expired_writes,
+                invalidated_pending = catalog.invalidated_pending,
+                invalidated_published = catalog.invalidated_published,
+                pruned_objects = catalog.pruned_objects,
+                reclaimed_objects = catalog.reclaimed_objects,
+                reclaimed_bytes = catalog.reclaimed_bytes,
+                removed_empty_slots = catalog.removed_empty_slots;
+                "master reconciliation completed work"
+            );
+        }
     }
 }
