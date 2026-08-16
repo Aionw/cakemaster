@@ -1,110 +1,63 @@
+mod logging;
+
 use cakemaster::server::{DEFAULT_MOONCAKE_LISTEN_ADDR, MooncakeServerConfig};
+use clap::error::ErrorKind;
+use clap::{CommandFactory, Parser};
+use logging::{LoggingConfig, LoggingOverrides};
 use std::error::Error;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddr;
-use thiserror::Error;
 
-#[derive(Debug, Error)]
-enum CliError {
-    #[error("command-line argument is not valid UTF-8")]
-    NonUtf8,
-    #[error("--listen requires an address")]
-    MissingListenAddress,
-    #[error("--listen was specified more than once")]
-    DuplicateListenAddress,
-    #[error("invalid --listen address {value:?}: {source}")]
-    InvalidListenAddress {
-        value: String,
-        #[source]
-        source: std::net::AddrParseError,
-    },
-    #[error("unknown argument {0:?}")]
-    UnknownArgument(String),
-}
+#[derive(Debug, Parser)]
+#[command(version, about)]
+struct Cli {
+    /// Listen address for the Mooncake RPC server.
+    #[arg(
+        long,
+        default_value_t = DEFAULT_MOONCAKE_LISTEN_ADDR,
+        value_name = "ADDRESS",
+        help_heading = "Server options"
+    )]
+    listen: std::net::SocketAddr,
 
-enum Command {
-    Run(MooncakeServerConfig),
-    Help,
+    /// Emit one structured info log for each completed RPC request.
+    #[arg(long, help_heading = "Server options")]
+    access_log: bool,
+
+    #[command(flatten, next_help_heading = "Logging options")]
+    logging: LoggingOverrides,
 }
 
 #[tokio::main]
 async fn main() {
-    init_logging();
-    if let Err(error) = run().await {
+    let cli = Cli::parse();
+    let logging = match LoggingConfig::resolve(cli.logging) {
+        Ok(logging) => logging,
+        Err(error) => Cli::command().error(ErrorKind::InvalidValue, error).exit(),
+    };
+    if let Err(error) = logging::init(&logging) {
+        eprintln!("{error}");
+        std::process::exit(1);
+    }
+    let server = MooncakeServerConfig::default()
+        .with_listen_addr(cli.listen)
+        .with_access_log(cli.access_log);
+    if let Err(error) = run(server).await {
         log::error!(error:% = error; "cakemaster exited with an error");
         eprintln!("error: {error}");
-        print_usage();
         log::logger().flush();
         std::process::exit(1);
     }
     log::logger().flush();
 }
 
-async fn run() -> Result<(), Box<dyn Error>> {
-    let arguments = std::env::args_os()
-        .skip(1)
-        .map(|argument| argument.into_string().map_err(|_| CliError::NonUtf8))
-        .collect::<Result<Vec<_>, _>>()?;
-    let config = match parse_args(arguments)? {
-        Command::Run(config) => config,
-        Command::Help => {
-            print_usage();
-            return Ok(());
-        }
-    };
-
+async fn run(config: MooncakeServerConfig) -> Result<(), Box<dyn Error>> {
     let bound = config.build()?.bind().await?;
     let local_addr = bound.local_addr()?;
     log::info!(listen_addr:% = local_addr; "cakemaster is ready");
     println!("cakemaster_ready={local_addr}");
     bound.run_until(shutdown_signal()?).await?;
     log::info!("cakemaster stopped");
-    Ok(())
-}
-
-fn parse_args(arguments: impl IntoIterator<Item = String>) -> Result<Command, CliError> {
-    let mut listen_addr = DEFAULT_MOONCAKE_LISTEN_ADDR;
-    let mut listen_seen = false;
-    let mut access_log = false;
-    let mut arguments = arguments.into_iter();
-    while let Some(argument) = arguments.next() {
-        match argument.as_str() {
-            "-h" | "--help" => return Ok(Command::Help),
-            "--access-log" => access_log = true,
-            "--listen" => {
-                let value = arguments.next().ok_or(CliError::MissingListenAddress)?;
-                set_listen_addr(&mut listen_addr, &mut listen_seen, value)?;
-            }
-            _ if argument.starts_with("--listen=") => {
-                let value = argument["--listen=".len()..].to_owned();
-                if value.is_empty() {
-                    return Err(CliError::MissingListenAddress);
-                }
-                set_listen_addr(&mut listen_addr, &mut listen_seen, value)?;
-            }
-            _ => return Err(CliError::UnknownArgument(argument)),
-        }
-    }
-    Ok(Command::Run(
-        MooncakeServerConfig::default()
-            .with_listen_addr(listen_addr)
-            .with_access_log(access_log),
-    ))
-}
-
-fn set_listen_addr(
-    listen_addr: &mut SocketAddr,
-    listen_seen: &mut bool,
-    value: String,
-) -> Result<(), CliError> {
-    if *listen_seen {
-        return Err(CliError::DuplicateListenAddress);
-    }
-    *listen_addr = value
-        .parse()
-        .map_err(|source| CliError::InvalidListenAddress { value, source })?;
-    *listen_seen = true;
     Ok(())
 }
 
@@ -134,68 +87,70 @@ fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
     })
 }
 
-fn init_logging() {
-    let stderr = logforth::append::asynchronous::AsyncBuilder::new("cakemaster-log")
-        .buffered_lines_limit(Some(8_192))
-        .overflow_block()
-        .append(logforth::append::Stderr::default())
-        .build();
-    let logger = logforth::core::builder()
-        .dispatch(|dispatch| dispatch.append(stderr))
-        .build();
-    let bridge = logforth::bridge::log::LogBridge::new(logger);
-    log::set_boxed_logger(Box::new(bridge)).expect("global logger must not already be installed");
-    log::set_max_level(log::LevelFilter::Info);
-}
-
-fn print_usage() {
-    eprintln!("usage: cakemaster [--listen ADDRESS] [--access-log]");
-    eprintln!("default listen address: {DEFAULT_MOONCAKE_LISTEN_ADDR}");
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn defaults_to_loopback_and_accepts_an_explicit_listener() {
-        let Command::Run(default) = parse_args(Vec::new()).unwrap() else {
-            panic!("empty arguments must run the server");
-        };
-        assert_eq!(default.listen_addr(), DEFAULT_MOONCAKE_LISTEN_ADDR);
-        assert!(!default.access_log());
+        let default = Cli::try_parse_from(["cakemaster"]).unwrap();
+        assert_eq!(default.listen, DEFAULT_MOONCAKE_LISTEN_ADDR);
+        assert!(!default.access_log);
+        assert_eq!(default.logging, LoggingOverrides::default());
 
-        let Command::Run(config) =
-            parse_args(["--listen", "127.0.0.1:0"].map(str::to_owned)).unwrap()
-        else {
-            panic!("listen arguments must run the server");
-        };
-        assert_eq!(config.listen_addr(), "127.0.0.1:0".parse().unwrap());
-        assert!(!config.access_log());
+        let explicit = Cli::try_parse_from(["cakemaster", "--listen", "127.0.0.1:0"]).unwrap();
+        assert_eq!(explicit.listen, "127.0.0.1:0".parse().unwrap());
 
-        let Command::Run(config) = parse_args(["--access-log".to_owned()]).unwrap() else {
-            panic!("access log flag must run the server");
-        };
-        assert!(config.access_log());
+        let access_log = Cli::try_parse_from(["cakemaster", "--access-log"]).unwrap();
+        assert!(access_log.access_log);
+    }
+
+    #[test]
+    fn accepts_logging_options_and_module_filters() {
+        let cli = Cli::try_parse_from([
+            "cakemaster",
+            "--log-filter=info,cakemaster::server=debug",
+            "--log-dir",
+            "/var/log/cakemaster",
+            "--log-output=file",
+        ])
+        .unwrap();
+        assert_eq!(
+            cli.logging.log_filter.as_deref(),
+            Some("info,cakemaster::server=debug")
+        );
+        assert_eq!(
+            cli.logging.log_dir.as_deref(),
+            Some(std::path::Path::new("/var/log/cakemaster"))
+        );
+        assert_eq!(cli.logging.log_output, Some(logging::LogOutput::File));
     }
 
     #[test]
     fn rejects_missing_invalid_duplicate_and_unknown_arguments() {
-        assert!(matches!(
-            parse_args(["--listen".to_owned()]),
-            Err(CliError::MissingListenAddress)
-        ));
-        assert!(matches!(
-            parse_args(["--listen=localhost:50051".to_owned()]),
-            Err(CliError::InvalidListenAddress { .. })
-        ));
-        assert!(matches!(
-            parse_args(["--listen", "127.0.0.1:1", "--listen", "127.0.0.1:2"].map(str::to_owned)),
-            Err(CliError::DuplicateListenAddress)
-        ));
-        assert!(matches!(
-            parse_args(["server".to_owned()]),
-            Err(CliError::UnknownArgument(_))
-        ));
+        assert!(Cli::try_parse_from(["cakemaster", "--listen"]).is_err());
+        assert!(Cli::try_parse_from(["cakemaster", "--listen=localhost:50051"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "cakemaster",
+                "--listen",
+                "127.0.0.1:1",
+                "--listen",
+                "127.0.0.1:2"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["cakemaster", "--log-level=verbose"]).is_err());
+        assert!(Cli::try_parse_from(["cakemaster", "--log-filter=cakemaster=verbose"]).is_err());
+        assert!(Cli::try_parse_from(["cakemaster", "--log-output=stdout"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "cakemaster",
+                "--log-level=info",
+                "--log-filter=cakemaster=debug"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["cakemaster", "server"]).is_err());
     }
 }

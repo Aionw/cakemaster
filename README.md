@@ -86,6 +86,24 @@ root 中只构建一次 `SegmentPool`、内存态
 并发运行；Unix 上 Ctrl-C/SIGTERM、其他平台上 Ctrl-C 会通知两者停止，进程等待监听器、
 所有连接 task 和 reconciler 完整退出后才返回。
 
+运行日志默认同时写入 stderr 和 `logs/cakemaster.log`，使用带系统时区的 ISO 8601
+时间戳。日志文件每天滚动一次，单文件达到 100 MiB 时也会提前滚动，最多保留 14 个
+文件。滚动文件名形如 `cakemaster.2026-08-16.1.log`。日志等级、模块过滤、目录和输出
+目标均可通过命令行配置：
+
+```bash
+cakemaster \
+  --log-filter 'info,cakemaster::server=debug,coro_rpc=warn' \
+  --log-dir /var/log/cakemaster \
+  --log-output both
+```
+
+只需全局等级时可使用 `--log-level debug`；它与 `--log-filter` 互斥。`--log-output`
+接受 `stderr`、`file` 或 `both`，选择 `stderr` 时不会创建日志目录。环境变量
+`RUST_LOG`、`CAKEMASTER_LOG_LEVEL`、`CAKEMASTER_LOG_DIR` 和
+`CAKEMASTER_LOG_OUTPUT` 提供相同配置能力，优先级为命令行、环境变量、内置默认值。
+Access 日志的 target 是 `coro_rpc::access`，同样受这些等级和模块过滤规则控制。
+
 当前 production 默认值是保守的单进程、单租户内存态配置：最多 65,536 个 client 和预期
 65,536 个 object，client TTL/lease TTL 均为 10 秒，pending write timeout 为 30 秒，
 reconcile 周期为 100ms；未配置初始 segment，client 必须通过 Mount/ReMount 注册容量。
