@@ -12,26 +12,20 @@ impl ObjectCatalog {
             .ok_or(LookupError::NotFound)?;
         for _ in 0..3 {
             let node = slot.current.load_full().ok_or(LookupError::NotFound)?;
-            match node.control.lifecycle.load(Ordering::Acquire) {
-                OBJECT_CLAIMED | OBJECT_PENDING | OBJECT_PUBLISHING => {
+            match node.mutation.state() {
+                ObjectState::Claimed | ObjectState::Pending => {
                     return Err(LookupError::NotReady);
                 }
-                OBJECT_RETIRING => return Err(LookupError::NotFound),
-                OBJECT_PRUNING => {
-                    node.record().wait_for_pruning();
-                    continue;
-                }
-                OBJECT_PUBLISHED => {}
-                _ => unreachable!("object lifecycle is validated internally"),
+                ObjectState::Retiring => return Err(LookupError::NotFound),
+                ObjectState::Published => {}
             }
-            let lease_expires_at = node.control.acquire_lease(
+            let lease_expires_at = node.access.record_access(
                 now,
                 self.inner.config.lease_ttl_ticks,
                 self.inner.config.lease_refresh_ticks,
             );
-            node.control.recent.store(true, Ordering::Relaxed);
             let has_live_replica = node.record().replicas.read().has_live();
-            if node.control.lifecycle.load(Ordering::Acquire) == OBJECT_PUBLISHED
+            if node.mutation.state() == ObjectState::Published
                 && slot_points_to(&slot, &node)
                 && has_live_replica
             {
@@ -66,11 +60,9 @@ impl ObjectHandle {
     }
 
     pub fn commit(&self) -> ObjectCommit {
-        *self
-            .node
-            .control
-            .commit
-            .get()
+        self.node
+            .mutation
+            .commit()
             .expect("published objects always have commit metadata")
     }
 
@@ -85,7 +77,7 @@ impl ObjectHandle {
     }
 
     pub fn owner(&self) -> WriteOwner {
-        self.node.control.owner
+        self.node.owner()
     }
 }
 

@@ -21,38 +21,41 @@ impl ObjectCatalog {
             .ok_or(RemoveError::NotFound)?;
         let node = loop {
             let node = slot.current.load_full().ok_or(RemoveError::NotFound)?;
-            match node.control.lifecycle.compare_exchange(
-                OBJECT_PUBLISHED,
-                OBJECT_RETIRING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => break node,
-                Err(OBJECT_CLAIMED | OBJECT_PENDING | OBJECT_PUBLISHING) => {
+            let write = node.mutation.lock();
+            if !slot_points_to(&slot, &node) {
+                drop(write);
+                continue;
+            }
+            match node.mutation.state() {
+                ObjectState::Published => {}
+                ObjectState::Claimed | ObjectState::Pending => {
                     return Err(RemoveError::NotReady);
                 }
-                Err(OBJECT_PRUNING) => {
-                    node.record().wait_for_pruning();
-                }
-                Err(_) => return Err(RemoveError::NotFound),
+                ObjectState::Retiring => return Err(RemoveError::NotFound),
             }
-        };
+            if node
+                .mutation
+                .transition(ObjectState::Published, ObjectState::Retiring)
+                .is_err()
+            {
+                drop(write);
+                continue;
+            }
 
-        let lease_until = CatalogTick::new(node.control.lease_until.load(Ordering::Acquire));
-        if lease_until > now {
-            let _ = node.control.lifecycle.compare_exchange(
-                OBJECT_RETIRING,
-                OBJECT_PUBLISHED,
-                Ordering::Release,
-                Ordering::Relaxed,
-            );
-            return Err(RemoveError::Leased {
-                expires_at: lease_until,
-            });
-        }
-        if !clear_slot(&slot, &node) {
-            return Err(RemoveError::NotFound);
-        }
+            let lease_until = node.access.lease_until();
+            if lease_until > now {
+                node.mutation.store(ObjectState::Published);
+                return Err(RemoveError::Leased {
+                    expires_at: lease_until,
+                });
+            }
+            if !clear_slot(&slot, &node) {
+                node.mutation.store(ObjectState::Published);
+                return Err(RemoveError::NotFound);
+            }
+            drop(write);
+            break node;
+        };
         self.inner.retire_published(slot, node, now);
         Ok(())
     }
@@ -188,78 +191,45 @@ impl CatalogInner {
                 let Some(node) = candidate.node.upgrade() else {
                     continue;
                 };
-                if node.control.lifecycle.load(Ordering::Acquire) != OBJECT_PUBLISHED
+                if node.mutation.state() != ObjectState::Published
                     || !slot_points_to(&slot, &node)
                     || node.record.get().is_none()
                 {
                     continue;
                 }
+                let write = node.mutation.lock();
+                if node.mutation.state() != ObjectState::Published || !slot_points_to(&slot, &node)
+                {
+                    continue;
+                }
                 let record = node.record();
-                let mut replicas = record.replicas.write();
-                if node.control.lifecycle.load(Ordering::Acquire) != OBJECT_PUBLISHED
-                    || !slot_points_to(&slot, &node)
-                {
-                    continue;
-                }
-                if replicas.all_live() {
-                    drop(replicas);
-                    queue.push(candidate);
-                    continue;
-                }
-                if node
-                    .control
-                    .lifecycle
-                    .compare_exchange(
-                        OBJECT_PUBLISHED,
-                        OBJECT_PRUNING,
-                        Ordering::AcqRel,
-                        Ordering::Acquire,
-                    )
-                    .is_err()
-                {
-                    continue;
-                }
-                let current = std::mem::take(&mut *replicas);
-                match current.partition_by_liveness() {
-                    ReplicaPartition::AllLive(current) => {
-                        *replicas = current;
-                        node.control
-                            .lifecycle
-                            .store(OBJECT_PUBLISHED, Ordering::Release);
-                        drop(replicas);
+                match record.replicas.prune_invalidated() {
+                    ReplicaPrune::AllLive => {
+                        drop(write);
                         queue.push(candidate);
                     }
-                    ReplicaPartition::AllStale(current) => {
-                        *replicas = current;
-                        node.control
-                            .lifecycle
-                            .store(OBJECT_RETIRING, Ordering::Release);
-                        drop(replicas);
+                    ReplicaPrune::AllStale => {
+                        node.mutation.store(ObjectState::Retiring);
                         if !clear_slot(&slot, &node) {
-                            node.control
-                                .lifecycle
-                                .store(OBJECT_PUBLISHED, Ordering::Release);
+                            node.mutation.store(ObjectState::Published);
+                            drop(write);
                             queue.push(candidate);
                             continue;
                         }
                         let bytes = record.reserved_bytes();
+                        drop(write);
                         self.retire_published(slot, node, now);
                         report.invalidated_published += 1;
                         report.retired_objects += 1;
                         report.retired_bytes = report.retired_bytes.saturating_add(bytes);
                     }
-                    ReplicaPartition::Mixed { live, stale } => {
+                    ReplicaPrune::Mixed { stale } => {
                         let stale_count = stale.len();
                         let stale_bytes = stale.reserved_bytes();
-                        *replicas = live;
-                        atomic_saturating_sub(&record.reserved_bytes, stale_bytes);
                         node.release_pruned_accounting(&stale);
                         self.lifecycle.on_prune_published(stale_bytes);
                         self.collector.on_reclaim(stale_bytes);
-                        node.control
-                            .lifecycle
-                            .store(OBJECT_PUBLISHED, Ordering::Release);
-                        drop(replicas);
+                        drop(write);
                         resources.extend(stale);
                         report.pruned_objects += 1;
                         report.pruned_replicas += stale_count;
@@ -312,7 +282,7 @@ impl CatalogInner {
     ) -> Option<(Arc<ObjectSlot>, Arc<CatalogNode>)> {
         let slot = pending.candidate.slot.upgrade()?;
         let node = pending.candidate.node.upgrade()?;
-        if node.control.lifecycle.load(Ordering::Acquire) != OBJECT_PENDING
+        if node.mutation.state() != ObjectState::Pending
             || !slot_points_to(&slot, &node)
             || node.record.get().is_none()
         {
@@ -321,26 +291,27 @@ impl CatalogInner {
         Some((slot, node))
     }
 
-    fn try_retire_pending(
+    fn try_revoke_pending(
         &self,
         slot: Arc<ObjectSlot>,
         node: Arc<CatalogNode>,
         now: CatalogTick,
     ) -> bool {
+        let write = node.mutation.lock();
+        if !slot_points_to(&slot, &node) {
+            return false;
+        }
         if node
-            .control
-            .lifecycle
-            .compare_exchange(
-                OBJECT_PENDING,
-                OBJECT_RETIRING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .mutation
+            .transition(ObjectState::Pending, ObjectState::Retiring)
             .is_err()
-            || !clear_slot(&slot, &node)
         {
             return false;
         }
+        if !clear_slot(&slot, &node) {
+            return false;
+        }
+        drop(write);
         self.retire_pending(slot, node, now);
         true
     }
@@ -371,11 +342,11 @@ impl CatalogInner {
             let Some((slot, node)) = self.resolve_pending_candidate(&pending) else {
                 continue;
             };
-            if !owners.contains(&node.control.owner) {
+            if !owners.contains(&node.owner()) {
                 self.collector.pending.push(pending);
                 continue;
             }
-            if self.try_retire_pending(slot, node, now) {
+            if self.try_revoke_pending(slot, node, now) {
                 revoked += 1;
             }
         }
@@ -413,7 +384,7 @@ impl CatalogInner {
                 continue;
             };
             if !node.record().replicas.read().all_live() {
-                if self.try_retire_pending(slot, node, now) {
+                if self.try_revoke_pending(slot, node, now) {
                     report.invalidated_pending += 1;
                 }
                 continue;
@@ -422,7 +393,7 @@ impl CatalogInner {
                 self.collector.pending.push(pending);
                 continue;
             }
-            if self.try_retire_pending(slot, node, now) {
+            if self.try_revoke_pending(slot, node, now) {
                 report.expired_pending += 1;
             }
         }
@@ -533,9 +504,7 @@ impl CatalogInner {
         let Some(node) = candidate.node.upgrade() else {
             return ScopedCandidate::Stale;
         };
-        if node.control.lifecycle.load(Ordering::Acquire) != OBJECT_PUBLISHED
-            || !slot_points_to(&slot, &node)
-        {
+        if node.mutation.state() != ObjectState::Published || !slot_points_to(&slot, &node) {
             return ScopedCandidate::Stale;
         }
         let Some(record) = node.record.get() else {
@@ -551,7 +520,7 @@ impl CatalogInner {
                             namespace,
                             replica_class,
                         } => {
-                            record.accounting.is_some()
+                            record.is_accounted()
                                 && record.identity.namespace() == *namespace
                                 && record.current_direct_replica_class() == Some(*replica_class)
                         }
@@ -579,34 +548,28 @@ impl CatalogInner {
         let Some(node) = candidate.node.upgrade() else {
             return 0;
         };
-        if node.control.lifecycle.load(Ordering::Acquire) != OBJECT_PUBLISHED
-            || !slot_points_to(&slot, &node)
-        {
+        if node.mutation.state() != ObjectState::Published || !slot_points_to(&slot, &node) {
             return 0;
         }
 
-        if node.control.recent.swap(false, Ordering::Relaxed) {
+        let write = node.mutation.lock();
+        if node.mutation.state() != ObjectState::Published || !slot_points_to(&slot, &node) {
+            return 0;
+        }
+        if node.access.take_recent() {
             self.collector.protected.push(candidate);
             return 0;
         }
         if node
-            .control
-            .lifecycle
-            .compare_exchange(
-                OBJECT_PUBLISHED,
-                OBJECT_RETIRING,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
+            .mutation
+            .transition(ObjectState::Published, ObjectState::Retiring)
             .is_err()
         {
             return 0;
         }
 
-        if node.control.lease_until.load(Ordering::Acquire) > now.get() {
-            node.control
-                .lifecycle
-                .store(OBJECT_PUBLISHED, Ordering::Release);
+        if node.access.is_leased(now) {
+            node.mutation.store(ObjectState::Published);
             self.collector.protected.push(candidate);
             return 0;
         }
@@ -621,14 +584,14 @@ impl CatalogInner {
                 .get()
                 .and_then(ObjectRecord::tenant_accounting)
                 .map_or(bytes, |(_, _, quota_bytes)| quota_bytes);
+            drop(write);
             self.retire_published(slot, node, now);
             report.retired_objects += 1;
             report.retired_bytes = report.retired_bytes.saturating_add(bytes);
             quota_bytes
         } else {
-            node.control
-                .lifecycle
-                .store(OBJECT_PUBLISHED, Ordering::Release);
+            node.mutation.store(ObjectState::Published);
+            drop(write);
             if from_protected {
                 self.collector.protected.push(candidate);
             } else {

@@ -259,7 +259,6 @@ impl ObjectManager {
                 Err(ObjectManagerError::NotFound)
             }
             Err(PublishError::ReplicasInvalidated) => Err(ObjectManagerError::NoAvailableReplicas),
-            Err(PublishError::PublicationInProgress) => Err(ObjectManagerError::InvalidWrite),
             Err(PublishError::ForeignCatalog | PublishError::CommitConflict) => {
                 Err(ObjectManagerError::Internal)
             }

@@ -8,7 +8,7 @@ use super::error::{
 use super::identity::{ObjectIdentity, ObjectLookup};
 use super::reclamation::{CatalogTick, CollectBudget, CollectReport, ReclaimFilter, ReclaimTarget};
 use super::replica::{ReplicaLease, ReplicaPartition, ReplicaReclaimBatch, ReplicaSet};
-use super::tenant::{CHARGE_RESERVED, QuotaReservationGuard, TenantQuotaCharge};
+use super::tenant::{QuotaReservationGuard, TenantQuotaCharge};
 use super::write::{ObjectCommit, WriteAdmission, WriteId, WriteOwner};
 use arc_swap::ArcSwapOption;
 use crossbeam_queue::SegQueue;
@@ -27,12 +27,53 @@ mod write;
 const SLOT_OPEN: u8 = 0;
 const SLOT_CLOSING: u8 = 1;
 
-const OBJECT_CLAIMED: u8 = 0;
-const OBJECT_PENDING: u8 = 1;
-const OBJECT_PUBLISHING: u8 = 2;
-const OBJECT_PUBLISHED: u8 = 3;
-const OBJECT_RETIRING: u8 = 4;
-const OBJECT_PRUNING: u8 = 5;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum ObjectState {
+    /// The key is reserved, but its immutable record is not installed yet.
+    Claimed,
+    /// The record and reservations exist but are not readable yet.
+    Pending,
+    /// The current slot generation is readable and lease-protected.
+    Published,
+    /// The node is detached or being detached before deferred reclamation.
+    Retiring,
+}
+
+impl ObjectState {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            value if value == Self::Claimed as u8 => Self::Claimed,
+            value if value == Self::Pending as u8 => Self::Pending,
+            value if value == Self::Published as u8 => Self::Published,
+            value if value == Self::Retiring as u8 => Self::Retiring,
+            _ => unreachable!("object lifecycle only stores valid states"),
+        }
+    }
+}
+
+struct ObjectLifecycle(AtomicU8);
+
+impl ObjectLifecycle {
+    const fn new(state: ObjectState) -> Self {
+        Self(AtomicU8::new(state as u8))
+    }
+
+    fn state(&self) -> ObjectState {
+        ObjectState::from_raw(self.0.load(Ordering::Acquire))
+    }
+
+    fn transition(&self, from: ObjectState, to: ObjectState) -> Result<(), ObjectState> {
+        self.0
+            .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(ObjectState::from_raw)
+    }
+
+    fn store(&self, state: ObjectState) {
+        self.0.store(state as u8, Ordering::Release);
+    }
+}
 
 #[derive(Clone)]
 pub struct ObjectCatalog {
@@ -86,23 +127,46 @@ struct ObjectSlot {
 /// matching byte counter without replacing this Arc.
 struct CatalogNode {
     record: OnceLock<ObjectRecord>,
-    control: ObjectControl,
+    mutation: MutationControl,
+    access: AccessControl,
 }
 
 struct ObjectRecord {
     identity: Arc<ObjectIdentity>,
     content: ObjectContent,
-    replicas: RwLock<ReplicaSet>,
-    reserved_bytes: AtomicU64,
+    replicas: ReplicaStorage,
     accounting: Option<TenantQuotaCharge>,
 }
 
-struct ObjectControl {
-    lifecycle: AtomicU8,
-    accounting_phase: AtomicU8,
-    write_id: WriteId,
-    owner: WriteOwner,
+/// The replica set and its physical byte total change as one pruning unit.
+struct ReplicaStorage {
+    set: RwLock<ReplicaSet>,
+    reserved_bytes: AtomicU64,
+}
+
+enum ReplicaPrune {
+    AllLive,
+    AllStale,
+    Mixed { stale: ReplicaSet },
+}
+
+/// State that changes as an object moves through a write transaction.
+struct MutationControl {
+    lifecycle: ObjectLifecycle,
+    /// Serializes lifecycle mutations and replica pruning for this node.
+    /// Ordinary lookups still use the atomic lifecycle and access controls.
+    gate: Mutex<()>,
+    metadata: WriteMetadata,
     commit: OnceLock<ObjectCommit>,
+}
+
+struct WriteMetadata {
+    id: WriteId,
+    owner: WriteOwner,
+}
+
+/// Read-side signals consumed by lease enforcement and second-chance eviction.
+struct AccessControl {
     lease_until: AtomicU64,
     recent: AtomicBool,
 }
@@ -337,15 +401,13 @@ impl CatalogNode {
     fn claimed(id: WriteId, owner: WriteOwner) -> Self {
         Self {
             record: OnceLock::new(),
-            control: ObjectControl {
-                lifecycle: AtomicU8::new(OBJECT_CLAIMED),
-                // Unaccounted records ignore this field. Accounted records
-                // start reserved, so staging does not need another hot-path
-                // atomic write.
-                accounting_phase: AtomicU8::new(CHARGE_RESERVED),
-                write_id: id,
-                owner,
+            mutation: MutationControl {
+                lifecycle: ObjectLifecycle::new(ObjectState::Claimed),
+                gate: Mutex::new(()),
+                metadata: WriteMetadata { id, owner },
                 commit: OnceLock::new(),
+            },
+            access: AccessControl {
                 lease_until: AtomicU64::new(0),
                 recent: AtomicBool::new(false),
             },
@@ -358,21 +420,29 @@ impl CatalogNode {
             .expect("staged objects always have immutable records")
     }
 
+    fn owner(&self) -> WriteOwner {
+        self.mutation.owner()
+    }
+
+    fn write_id(&self) -> WriteId {
+        self.mutation.write_id()
+    }
+
     fn commit_accounting(&self) {
         if let Some((charge, class, bytes)) = self.record().tenant_accounting() {
-            charge.commit(&self.control.accounting_phase, class, bytes);
+            charge.commit(class, bytes);
         }
     }
 
     fn abort_accounting(&self) {
         if let Some((charge, class, bytes)) = self.record().tenant_accounting() {
-            charge.abort(&self.control.accounting_phase, class, bytes);
+            charge.abort(class, bytes);
         }
     }
 
     fn mark_accounting_retiring(&self) {
         if let Some((charge, class, bytes)) = self.record().tenant_accounting() {
-            charge.mark_retiring(&self.control.accounting_phase, class, bytes);
+            charge.mark_retiring(class, bytes);
         }
     }
 
@@ -381,7 +451,7 @@ impl CatalogNode {
             return;
         };
         if let Some((charge, class, bytes)) = record.tenant_accounting() {
-            charge.release(&self.control.accounting_phase, class, bytes);
+            charge.release(class, bytes);
         }
     }
 
@@ -400,7 +470,7 @@ impl CatalogNode {
             .logical_bytes()
             .checked_mul(replica_count)
             .expect("tenant replica charge was representable when the object was staged");
-        charge.release_committed_partial(&self.control.accounting_phase, replica_class, bytes);
+        charge.release_committed_partial(replica_class, bytes);
     }
 }
 
@@ -428,12 +498,58 @@ impl ObjectRecord {
         Self::direct_replica_class(&self.replicas.read())
     }
 
+    fn is_accounted(&self) -> bool {
+        self.accounting.is_some()
+    }
+
+    fn reserved_bytes(&self) -> u64 {
+        self.replicas.reserved_bytes()
+    }
+}
+
+impl ReplicaStorage {
+    fn new(replicas: ReplicaSet) -> Self {
+        let reserved_bytes = replicas.reserved_bytes();
+        Self {
+            set: RwLock::new(replicas),
+            reserved_bytes: AtomicU64::new(reserved_bytes),
+        }
+    }
+
+    fn read(&self) -> RwLockReadGuard<'_, ReplicaSet> {
+        self.set.read()
+    }
+
     fn reserved_bytes(&self) -> u64 {
         self.reserved_bytes.load(Ordering::Relaxed)
     }
 
-    fn wait_for_pruning(&self) {
-        drop(self.replicas.read());
+    /// Removes stale replicas and updates the physical byte total before the
+    /// pruned set becomes visible to readers.
+    fn prune_invalidated(&self) -> ReplicaPrune {
+        let mut replicas = self.set.write();
+        if replicas.all_live() {
+            return ReplicaPrune::AllLive;
+        }
+        match std::mem::take(&mut *replicas).partition_by_liveness() {
+            ReplicaPartition::AllLive(current) => {
+                *replicas = current;
+                ReplicaPrune::AllLive
+            }
+            ReplicaPartition::AllStale(current) => {
+                *replicas = current;
+                ReplicaPrune::AllStale
+            }
+            ReplicaPartition::Mixed { live, stale } => {
+                atomic_saturating_sub(&self.reserved_bytes, stale.reserved_bytes());
+                *replicas = live;
+                ReplicaPrune::Mixed { stale }
+            }
+        }
+    }
+
+    fn into_inner(self) -> ReplicaSet {
+        self.set.into_inner()
     }
 }
 
@@ -485,7 +601,41 @@ impl fmt::Debug for LiveReplicaView<'_> {
     }
 }
 
-impl ObjectControl {
+impl MutationControl {
+    fn state(&self) -> ObjectState {
+        self.lifecycle.state()
+    }
+
+    fn transition(&self, from: ObjectState, to: ObjectState) -> Result<(), ObjectState> {
+        self.lifecycle.transition(from, to)
+    }
+
+    fn store(&self, state: ObjectState) {
+        self.lifecycle.store(state);
+    }
+
+    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
+        self.gate.lock()
+    }
+
+    fn write_id(&self) -> WriteId {
+        self.metadata.id
+    }
+
+    fn owner(&self) -> WriteOwner {
+        self.metadata.owner
+    }
+
+    fn commit(&self) -> Option<ObjectCommit> {
+        self.commit.get().copied()
+    }
+
+    fn set_commit(&self, commit: ObjectCommit) -> Result<(), ObjectCommit> {
+        self.commit.set(commit)
+    }
+}
+
+impl AccessControl {
     fn acquire_lease(
         &self,
         now: CatalogTick,
@@ -507,6 +657,29 @@ impl ObjectControl {
             }
         }
         CatalogTick::new(current)
+    }
+
+    fn record_access(
+        &self,
+        now: CatalogTick,
+        lease_ttl_ticks: u64,
+        lease_refresh_ticks: u64,
+    ) -> CatalogTick {
+        let lease_until = self.acquire_lease(now, lease_ttl_ticks, lease_refresh_ticks);
+        self.recent.store(true, Ordering::Relaxed);
+        lease_until
+    }
+
+    fn take_recent(&self) -> bool {
+        self.recent.swap(false, Ordering::Relaxed)
+    }
+
+    fn lease_until(&self) -> CatalogTick {
+        CatalogTick::new(self.lease_until.load(Ordering::Acquire))
+    }
+
+    fn is_leased(&self, now: CatalogTick) -> bool {
+        self.lease_until() > now
     }
 }
 

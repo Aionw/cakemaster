@@ -16,7 +16,7 @@ pub use manager::{
     TenantPutRequest,
 };
 pub(crate) use quota::QuotaReservationGuard;
-pub(crate) use quota::{CHARGE_RESERVED, TenantQuotaCharge};
+pub(crate) use quota::TenantQuotaCharge;
 pub use registry::ResolvedTenant;
 
 /// External tenant identity. Its internal representation is deliberately

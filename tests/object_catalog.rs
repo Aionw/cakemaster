@@ -479,15 +479,9 @@ fn high_concurrency_put_get_and_incremental_collection_leave_no_resources() {
                             .unwrap()
                             .stage(ObjectContent::new(64), replica(&pool, 64))
                             .unwrap();
-                        let handle = loop {
-                            match catalog.publish(&ticket, ObjectCommit::default()) {
-                                Ok(handle) => break handle,
-                                Err(PublishError::PublicationInProgress) => {
-                                    std::hint::spin_loop();
-                                }
-                                Err(error) => panic!("publication failed: {error}"),
-                            }
-                        };
+                        let handle = catalog
+                            .publish(&ticket, ObjectCommit::default())
+                            .expect("the ticket has one serialized publisher");
                         black_box(handle.identity());
                     } else {
                         let prior = sequence - 1;

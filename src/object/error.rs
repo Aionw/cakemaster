@@ -69,8 +69,6 @@ pub enum PublishError {
     ForeignCatalog,
     #[error("object write no longer exists")]
     ObjectGone,
-    #[error("object publication is already in progress")]
-    PublicationInProgress,
     #[error("object is not pending publication")]
     NotPending,
     #[error("object commit metadata conflicts with the pending publication")]
