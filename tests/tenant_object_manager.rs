@@ -239,6 +239,53 @@ fn revoke_returns_reserved_quota_and_unknown_tenants_are_rejected() {
 }
 
 #[test]
+fn tenant_upsert_reuses_charge_and_accounts_replacement_until_reclaim() {
+    let manager = manager(12 * 1024, 4096);
+    let a = manager.resolve_tenant(&tenant_id("a")).unwrap();
+    manager
+        .start_put(&a, "key", admission(), plan(4096, 1), CatalogTick::ZERO)
+        .unwrap();
+    manager
+        .finish_put(&a, "key", owner(), ReplicaSelector::All)
+        .unwrap();
+
+    manager
+        .start_upsert(&a, "key", admission(), plan(4096, 1), CatalogTick::new(1))
+        .unwrap();
+    let snapshot = manager.tenant_snapshot(&tenant_id("a")).unwrap();
+    assert_eq!(snapshot.memory.demand_bytes, 4096);
+    assert_eq!(snapshot.memory.reserved_bytes, 0);
+    manager
+        .revoke_put(
+            &a,
+            "key",
+            owner(),
+            ReplicaSelector::All,
+            CatalogTick::new(1),
+        )
+        .unwrap();
+
+    manager
+        .start_upsert(&a, "key", admission(), plan(8192, 1), CatalogTick::new(2))
+        .unwrap();
+    let snapshot = manager.tenant_snapshot(&tenant_id("a")).unwrap();
+    assert_eq!(snapshot.memory.used_bytes, 4096);
+    assert_eq!(snapshot.memory.reserved_bytes, 8192);
+    assert_eq!(snapshot.memory.demand_bytes, 12 * 1024);
+    manager
+        .finish_put(&a, "key", owner(), ReplicaSelector::All)
+        .unwrap();
+    let snapshot = manager.tenant_snapshot(&tenant_id("a")).unwrap();
+    assert_eq!(snapshot.memory.used_bytes, 12 * 1024);
+    assert_eq!(snapshot.memory.retiring_bytes, 4096);
+    manager.maintenance(CatalogTick::new(3), CollectBudget::new(0, 8, 0));
+    let snapshot = manager.tenant_snapshot(&tenant_id("a")).unwrap();
+    assert_eq!(snapshot.memory.used_bytes, 8192);
+    assert_eq!(snapshot.memory.retiring_bytes, 0);
+    assert_eq!(snapshot.memory.demand_bytes, 8192);
+}
+
+#[test]
 fn pending_timeout_returns_reserved_quota() {
     let manager = TenantObjectManager::with_config(
         pool(),

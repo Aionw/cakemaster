@@ -390,6 +390,195 @@ async fn generated_mooncake_rpc_drives_the_real_object_manager() {
     server_task.await.unwrap().unwrap();
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn upsert_and_remove_routes_drive_transactional_catalog_semantics() {
+    let pool = pool();
+    let manager = Arc::new(
+        ObjectManager::with_config(pool, ObjectCatalogConfig::new(64).with_lease(10_000, 5_000))
+            .unwrap(),
+    );
+    let service = ObjectCatalogRpcService::new(manager);
+    service
+        .client_manager()
+        .remount(OWNER, Vec::new(), ClientTick::ZERO)
+        .unwrap();
+    let server = WrappedMasterServiceServer::new(service)
+        .into_rpc_server()
+        .unwrap();
+    let bound = server.bind("127.0.0.1:0").await.unwrap();
+    let address = bound.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_task = tokio::spawn(bound.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let client = WrappedMasterServiceClient::connect(address).await.unwrap();
+    let writer = Uuid { high: 17, low: 23 };
+
+    let inserted = client
+        .upsert_start(
+            writer.clone(),
+            "upsert-key".to_owned(),
+            4096,
+            config(1, 0),
+            "ignored".to_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let DescriptorVariant::Memory(first) = &inserted[0].descriptor_variant else {
+        panic!("expected memory descriptor");
+    };
+    let original_address = first.buffer_descriptor.buffer_address;
+    client
+        .upsert_end(
+            writer.clone(),
+            ObjectMeta {
+                key: "upsert-key".to_owned(),
+                object_checksum: None,
+            },
+            ReplicaType::All,
+            "ignored".to_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let reused = client
+        .upsert_start(
+            writer.clone(),
+            "upsert-key".to_owned(),
+            4096,
+            config(1, 0),
+            "ignored".to_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    let DescriptorVariant::Memory(reused) = &reused[0].descriptor_variant else {
+        panic!("expected memory descriptor");
+    };
+    assert_eq!(reused.buffer_descriptor.buffer_address, original_address);
+    assert_eq!(
+        client
+            .get_replica_list("upsert-key".to_owned(), "ignored".to_owned())
+            .await
+            .unwrap(),
+        Err(ErrorCode::ReplicaIsNotReady)
+    );
+    client
+        .upsert_revoke(
+            writer.clone(),
+            "upsert-key".to_owned(),
+            ReplicaType::All,
+            "ignored".to_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    client
+        .get_replica_list("upsert-key".to_owned(), "ignored".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        client
+            .remove("upsert-key".to_owned(), false, "ignored".to_owned())
+            .await
+            .unwrap(),
+        Err(ErrorCode::ObjectHasLease)
+    );
+    client
+        .remove("upsert-key".to_owned(), true, "ignored".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let keys = vec![
+        "regex-a".to_owned(),
+        "regex-b".to_owned(),
+        "other".to_owned(),
+    ];
+    let started = client
+        .batch_upsert_start(
+            writer.clone(),
+            keys.clone(),
+            vec![1024; keys.len()],
+            config(1, 0),
+            "ignored".to_owned(),
+        )
+        .await
+        .unwrap();
+    assert!(started.iter().all(Result::is_ok));
+    assert!(
+        client
+            .batch_upsert_end(
+                writer.clone(),
+                keys.iter()
+                    .map(|key| ObjectMeta {
+                        key: key.clone(),
+                        object_checksum: None,
+                    })
+                    .collect(),
+                "ignored".to_owned(),
+            )
+            .await
+            .unwrap()
+            .iter()
+            .all(Result::is_ok)
+    );
+    assert_eq!(
+        client
+            .remove_by_regex("^regex-".to_owned(), false, "ignored".to_owned())
+            .await
+            .unwrap(),
+        Ok(2)
+    );
+    assert_eq!(
+        client
+            .remove_by_regex("[".to_owned(), false, "ignored".to_owned())
+            .await
+            .unwrap(),
+        Err(ErrorCode::InvalidParams)
+    );
+    assert_eq!(
+        client
+            .remove_all(false, "ignored".to_owned())
+            .await
+            .unwrap(),
+        1
+    );
+
+    let batch_keys = vec!["batch-a".to_owned(), "batch-b".to_owned()];
+    client
+        .batch_upsert_start(
+            writer.clone(),
+            batch_keys.clone(),
+            vec![1024; batch_keys.len()],
+            config(1, 0),
+            "ignored".to_owned(),
+        )
+        .await
+        .unwrap();
+    client
+        .batch_upsert_revoke(writer, batch_keys.clone(), "ignored".to_owned())
+        .await
+        .unwrap();
+    assert_eq!(
+        client
+            .batch_remove(batch_keys, false, "ignored".to_owned())
+            .await
+            .unwrap(),
+        vec![
+            Err(ErrorCode::ObjectNotFound),
+            Err(ErrorCode::ObjectNotFound)
+        ]
+    );
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    server_task.await.unwrap().unwrap();
+}
+
 #[tokio::test]
 async fn multi_tenant_rpc_resolves_once_per_batch_and_maps_tenant_errors() {
     let tenant_a = TenantId::try_from("tenant-a").unwrap();
@@ -565,5 +754,20 @@ async fn multi_tenant_rpc_resolves_once_per_batch_and_maps_tenant_errors() {
             .await
             .unwrap(),
         vec![Err(ErrorCode::TenantQuotaExceeded)]
+    );
+    assert_eq!(service.remove_all(true, String::new()).await.unwrap(), 2);
+    assert_eq!(
+        service
+            .exist_key("same-key".to_owned(), tenant_a.to_string())
+            .await
+            .unwrap(),
+        Ok(false)
+    );
+    assert_eq!(
+        service
+            .exist_key("same-key".to_owned(), tenant_b.to_string())
+            .await
+            .unwrap(),
+        Ok(false)
     );
 }

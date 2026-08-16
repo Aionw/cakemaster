@@ -13,7 +13,7 @@ use thiserror::Error;
 
 pub use manager::{
     TenantCatalog, TenantGetError, TenantObjectManager, TenantObjectManagerCreateError,
-    TenantPutRequest,
+    TenantPutRequest, TenantRemoveError,
 };
 pub(crate) use quota::QuotaReservationGuard;
 pub(crate) use quota::TenantQuotaCharge;

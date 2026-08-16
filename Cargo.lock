@@ -152,6 +152,7 @@ dependencies = [
  "logforth",
  "offset-allocator",
  "parking_lot",
+ "regex",
  "scc",
  "thiserror",
  "tokio",

@@ -2,7 +2,7 @@
 
 use cakemaster::MOONCAKE_STORE_VERSION;
 use cakemaster::mooncake::{
-    ExpectedBool, ExpectedGetReplicaListResponse, ExpectedGetStorageConfigResponse,
+    ExpectedBool, ExpectedGetReplicaListResponse, ExpectedGetStorageConfigResponse, ExpectedI64,
     ExpectedPingResponse, ExpectedReplicaDescriptors, ExpectedString, ExpectedVoid,
     GetStorageConfigResponse, ObjectDataType, ObjectMeta, ReplicaType, ReplicateConfig, Segment,
     SoftPinAction, Uuid,
@@ -26,6 +26,14 @@ type RemountRequest = (Vec<Segment>, Uuid);
 type MountSegmentRequest = (Segment, Uuid);
 type UnmountSegmentRequest = (Uuid, Uuid);
 type GracefulUnmountSegmentRequest = (Uuid, Uuid, u64);
+type UpsertStartRequest = (Uuid, String, u64, ReplicateConfig, String);
+type UpsertEndRequest = (Uuid, ObjectMeta, ReplicaType, String);
+type UpsertRevokeRequest = (Uuid, String, ReplicaType, String);
+type BatchUpsertEndRequest = (Uuid, Vec<ObjectMeta>, String);
+type BatchUpsertRevokeRequest = (Uuid, Vec<String>, String);
+type RemoveRequest = (String, bool, String);
+type RemoveAllRequest = (bool, String);
+type BatchRemoveRequest = (Vec<String>, bool, String);
 
 #[test]
 fn mooncake_rpc_schema_matches_yalantinglibs_metadata() {
@@ -65,6 +73,18 @@ fn mooncake_rpc_schema_matches_yalantinglibs_metadata() {
     assert_type::<BatchPutEndRequest>("fdfd04048989ff84fd800c8504ff01800cff", 4_118_718_408);
     assert_type::<BatchPutRevokeRequest>("fdfd04048989ff84800c01800cff", 2_498_649_412);
     assert_type::<BatchVoidResponse>("8487fa01", 972_837_582);
+    assert_type::<UpsertStartRequest>(
+        "fdfd04048989ff800c04fd04040685040b84800c800c84800c0b06800c8584800cff800cff",
+        2_413_733_834,
+    );
+    assert_type::<UpsertEndRequest>("fdfd04048989fffd800c8504ff01800cff", 3_514_929_698);
+    assert_type::<UpsertRevokeRequest>("fdfd04048989ff800c01800cff", 460_989_066);
+    assert_eq!(type_hash::<BatchUpsertEndRequest>(), 3_706_271_504);
+    assert_eq!(type_hash::<BatchUpsertRevokeRequest>(), 3_590_919_318);
+    assert_type::<RemoveRequest>("fd800c0b800cff", 417_898_478);
+    assert_type::<ExpectedI64>("870301", 3_090_383_358);
+    assert_type::<RemoveAllRequest>("fd0b800cff", 1_218_888_308);
+    assert_type::<BatchRemoveRequest>("fd84800c0b800cff", 427_465_888);
 }
 
 #[test]
@@ -124,6 +144,46 @@ fn mooncake_rpc_routes_match_wrapped_master_service() {
     assert_eq!(
         function_id("mooncake::WrappedMasterService::ServiceReady"),
         2_072_099_670
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::UpsertStart"),
+        2_704_498_241
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::UpsertEnd"),
+        773_907_032
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::UpsertRevoke"),
+        1_628_111_918
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::BatchUpsertStart"),
+        3_580_146_723
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::BatchUpsertEnd"),
+        2_981_943_087
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::BatchUpsertRevoke"),
+        2_425_597_561
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::Remove"),
+        4_054_882_164
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::RemoveByRegex"),
+        4_241_235_923
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::RemoveAll"),
+        3_648_573_104
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::BatchRemove"),
+        1_493_319_805
     );
 }
 

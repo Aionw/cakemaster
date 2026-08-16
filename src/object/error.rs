@@ -106,6 +106,26 @@ pub enum RemoveError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ObjectRemoveError {
+    #[error("object was not found")]
+    NotFound,
+    #[error("object is not ready")]
+    NotReady,
+    #[error("object is leased until catalog tick {}", .expires_at.get())]
+    Leased { expires_at: CatalogTick },
+}
+
+impl From<RemoveError> for ObjectRemoveError {
+    fn from(error: RemoveError) -> Self {
+        match error {
+            RemoveError::NotFound => Self::NotFound,
+            RemoveError::NotReady => Self::NotReady,
+            RemoveError::Leased { expires_at } => Self::Leased { expires_at },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ObjectManagerError {
     #[error("object put plan is invalid")]
     InvalidPlan,

@@ -237,6 +237,11 @@ union ExpectedString {
   2: ErrorCode error
 } (coro_rpc.expected)
 
+union ExpectedI64 {
+  1: i64 value
+  2: ErrorCode error
+} (coro_rpc.expected)
+
 union ExpectedVoid {
   1: ErrorCode error
 } (coro_rpc.expected)
@@ -314,4 +319,69 @@ service WrappedMasterService {
     3: required ReplicaType replica_type,
     4: required string tenant_id
   ) (coro_rpc.name = "mooncake::WrappedMasterService::BatchPutRevoke")
+
+  ExpectedReplicaDescriptors UpsertStart(
+    1: required UUID client_id,
+    2: required string key,
+    3: required u64 slice_length,
+    4: required ReplicateConfig config,
+    5: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::UpsertStart")
+
+  ExpectedVoid UpsertEnd(
+    1: required UUID client_id,
+    2: required ObjectMeta object_meta,
+    3: required ReplicaType replica_type,
+    4: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::UpsertEnd")
+
+  ExpectedVoid UpsertRevoke(
+    1: required UUID client_id,
+    2: required string key,
+    3: required ReplicaType replica_type,
+    4: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::UpsertRevoke")
+
+  list<ExpectedReplicaDescriptors> BatchUpsertStart(
+    1: required UUID client_id,
+    2: required list<string> keys,
+    3: required list<u64> slice_lengths,
+    4: required ReplicateConfig config,
+    5: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::BatchUpsertStart")
+
+  list<ExpectedVoid> BatchUpsertEnd(
+    1: required UUID client_id,
+    2: required list<ObjectMeta> object_metas,
+    3: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::BatchUpsertEnd")
+
+  list<ExpectedVoid> BatchUpsertRevoke(
+    1: required UUID client_id,
+    2: required list<string> keys,
+    3: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::BatchUpsertRevoke")
+
+  ExpectedVoid Remove(
+    1: required string key,
+    2: required bool force,
+    3: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::Remove")
+
+  ExpectedI64 RemoveByRegex(
+    1: required string regex,
+    2: required bool force,
+    3: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::RemoveByRegex")
+
+  i64 RemoveAll(
+    1: required bool force,
+    2: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::RemoveAll")
+
+  list<ExpectedVoid> BatchRemove(
+    1: required list<string> keys,
+    2: required bool force,
+    3: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::BatchRemove")
 }

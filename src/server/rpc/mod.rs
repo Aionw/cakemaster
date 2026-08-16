@@ -15,15 +15,19 @@ use crate::client::{
 };
 use crate::mooncake::{
     ClientStatus, ErrorCode, ExpectedBool, ExpectedGetReplicaListResponse,
-    ExpectedGetStorageConfigResponse, ExpectedPingResponse, ExpectedReplicaDescriptors,
-    ExpectedString, ExpectedVoid, GetReplicaListResponse, GetStorageConfigResponse, ObjectMeta,
-    PingResponse, ReplicaStatus, ReplicaType, ReplicateConfig, Segment, Uuid, WrappedMasterService,
+    ExpectedGetStorageConfigResponse, ExpectedI64, ExpectedPingResponse,
+    ExpectedReplicaDescriptors, ExpectedString, ExpectedVoid, GetReplicaListResponse,
+    GetStorageConfigResponse, ObjectMeta, PingResponse, ReplicaStatus, ReplicaType,
+    ReplicateConfig, Segment, Uuid, WrappedMasterService,
 };
-use crate::object::{ObjectManager, ObjectRead, TenantObjectManager, TenantPutRequest};
+use crate::object::{
+    ObjectManager, ObjectRead, ReplicaSelector, TenantObjectManager, TenantPutRequest,
+};
 use crate::segment::error::AttachError;
 use backend::{ObjectBatchBackend, batch_error};
 use coro_rpc::RpcFailure;
 use observability::{RpcLabels, observe_batch, observe_internal_mapping, observe_result};
+use regex::Regex;
 use request::{
     PutPlanTemplate, client_id_from_uuid, replica_selector, segment_id_from_uuid,
     segment_spec_from_wire,
@@ -456,6 +460,319 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
                 });
         Ok(observe_batch(labels, results))
     }
+
+    async fn upsert_start(
+        &self,
+        client_id: Uuid,
+        key: String,
+        slice_length: u64,
+        config: ReplicateConfig,
+        tenant_id: String,
+    ) -> Result<ExpectedReplicaDescriptors, RpcFailure> {
+        let client_id = client_id_from_uuid(&client_id);
+        let labels = RpcLabels::new("upsert_start")
+            .with_client(client_id)
+            .with_tenant(&tenant_id);
+        let template = match PutPlanTemplate::try_from(&config) {
+            Ok(template) => template,
+            Err(error) => return Ok(observe_result(labels, Err(error))),
+        };
+        let admission = match self.clients.write_admission(client_id) {
+            Ok(admission) => admission,
+            Err(error) => {
+                return Ok(observe_result(labels, Err(client_lifecycle_error(error))));
+            }
+        };
+        let requests = vec![TenantPutRequest::new(key, template.plan(slice_length))];
+        let now = self.clock().now();
+        let started = only_item(self.backend.execute_batch(
+            &tenant_id,
+            1,
+            now,
+            move |backend, tenant| backend.start_upsert_batch(tenant, admission, requests, now),
+        ));
+        let result = started.and_then(|started| {
+            started
+                .replicas()
+                .iter()
+                .map(started_replica_descriptor)
+                .collect()
+        });
+        Ok(observe_result(labels, result))
+    }
+
+    async fn upsert_end(
+        &self,
+        client_id: Uuid,
+        object_meta: ObjectMeta,
+        replica_type: ReplicaType,
+        tenant_id: String,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        let client_id = client_id_from_uuid(&client_id);
+        let labels = RpcLabels::new("upsert_end")
+            .with_client(client_id)
+            .with_tenant(&tenant_id);
+        if object_meta.object_checksum.is_some() {
+            return Ok(observe_result(labels, Err(ErrorCode::InvalidParams)));
+        }
+        let selector = match replica_selector(replica_type) {
+            Ok(selector) => selector,
+            Err(error) => return Ok(observe_result(labels, Err(error))),
+        };
+        let owner = match self.clients.write_owner(client_id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                return Ok(observe_result(labels, Err(client_lifecycle_error(error))));
+            }
+        };
+        let now = self.clock().now();
+        let result = only_item(self.backend.execute_batch(
+            &tenant_id,
+            1,
+            now,
+            |backend, tenant| {
+                backend.finish_put_batch(tenant, &[object_meta.key.as_str()], owner, selector)
+            },
+        ));
+        Ok(observe_result(labels, result))
+    }
+
+    async fn upsert_revoke(
+        &self,
+        client_id: Uuid,
+        key: String,
+        replica_type: ReplicaType,
+        tenant_id: String,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        let client_id = client_id_from_uuid(&client_id);
+        let labels = RpcLabels::new("upsert_revoke")
+            .with_client(client_id)
+            .with_tenant(&tenant_id);
+        let selector = match replica_selector(replica_type) {
+            Ok(selector) => selector,
+            Err(error) => return Ok(observe_result(labels, Err(error))),
+        };
+        let owner = match self.clients.write_owner(client_id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                return Ok(observe_result(labels, Err(client_lifecycle_error(error))));
+            }
+        };
+        let now = self.clock().now();
+        let result = only_item(self.backend.execute_batch(
+            &tenant_id,
+            1,
+            now,
+            |backend, tenant| {
+                backend.revoke_put_batch(tenant, std::slice::from_ref(&key), owner, selector, now)
+            },
+        ));
+        Ok(observe_result(labels, result))
+    }
+
+    async fn batch_upsert_start(
+        &self,
+        client_id: Uuid,
+        keys: Vec<String>,
+        slice_lengths: Vec<u64>,
+        config: ReplicateConfig,
+        tenant_id: String,
+    ) -> Result<Vec<ExpectedReplicaDescriptors>, RpcFailure> {
+        let item_count = keys.len();
+        let client_id = client_id_from_uuid(&client_id);
+        let labels = RpcLabels::new("batch_upsert_start")
+            .with_client(client_id)
+            .with_tenant(&tenant_id);
+        if item_count != slice_lengths.len() {
+            return Ok(observe_batch(
+                labels,
+                batch_error(item_count, ErrorCode::InvalidParams),
+            ));
+        }
+        let template = match PutPlanTemplate::try_from(&config) {
+            Ok(template) => template,
+            Err(error) => return Ok(observe_batch(labels, batch_error(item_count, error))),
+        };
+        let admission = match self.clients.write_admission(client_id) {
+            Ok(admission) => admission,
+            Err(error) => {
+                return Ok(observe_batch(
+                    labels,
+                    batch_error(item_count, client_lifecycle_error(error)),
+                ));
+            }
+        };
+        let requests = keys
+            .into_iter()
+            .zip(slice_lengths)
+            .map(|(key, logical_bytes)| TenantPutRequest::new(key, template.plan(logical_bytes)))
+            .collect();
+        let now = self.clock().now();
+        let results = self
+            .backend
+            .execute_batch(&tenant_id, item_count, now, move |backend, tenant| {
+                backend.start_upsert_batch(tenant, admission, requests, now)
+            })
+            .into_iter()
+            .map(|started| {
+                started.and_then(|started| {
+                    started
+                        .replicas()
+                        .iter()
+                        .map(started_replica_descriptor)
+                        .collect()
+                })
+            })
+            .collect();
+        Ok(observe_batch(labels, results))
+    }
+
+    async fn batch_upsert_end(
+        &self,
+        client_id: Uuid,
+        object_metas: Vec<ObjectMeta>,
+        tenant_id: String,
+    ) -> Result<Vec<ExpectedVoid>, RpcFailure> {
+        let item_count = object_metas.len();
+        let client_id = client_id_from_uuid(&client_id);
+        let labels = RpcLabels::new("batch_upsert_end")
+            .with_client(client_id)
+            .with_tenant(&tenant_id);
+        let owner = match self.clients.write_owner(client_id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                return Ok(observe_batch(
+                    labels,
+                    batch_error(item_count, client_lifecycle_error(error)),
+                ));
+            }
+        };
+        let mut output = batch_error(item_count, ErrorCode::InvalidParams);
+        let valid: Vec<_> = object_metas
+            .iter()
+            .enumerate()
+            .filter(|(_, metadata)| metadata.object_checksum.is_none())
+            .map(|(index, metadata)| (index, metadata.key.as_str()))
+            .collect();
+        if valid.is_empty() {
+            return Ok(observe_batch(labels, output));
+        }
+        let keys: Vec<_> = valid.iter().map(|(_, key)| *key).collect();
+        let now = self.clock().now();
+        let results = self
+            .backend
+            .execute_batch(&tenant_id, keys.len(), now, |backend, tenant| {
+                backend.finish_put_batch(tenant, &keys, owner, ReplicaSelector::All)
+            });
+        debug_assert_eq!(valid.len(), results.len());
+        for ((index, _), result) in valid.into_iter().zip(results) {
+            output[index] = result;
+        }
+        Ok(observe_batch(labels, output))
+    }
+
+    async fn batch_upsert_revoke(
+        &self,
+        client_id: Uuid,
+        keys: Vec<String>,
+        tenant_id: String,
+    ) -> Result<Vec<ExpectedVoid>, RpcFailure> {
+        let item_count = keys.len();
+        let client_id = client_id_from_uuid(&client_id);
+        let labels = RpcLabels::new("batch_upsert_revoke")
+            .with_client(client_id)
+            .with_tenant(&tenant_id);
+        let owner = match self.clients.write_owner(client_id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                return Ok(observe_batch(
+                    labels,
+                    batch_error(item_count, client_lifecycle_error(error)),
+                ));
+            }
+        };
+        let now = self.clock().now();
+        let results =
+            self.backend
+                .execute_batch(&tenant_id, item_count, now, move |backend, tenant| {
+                    backend.revoke_put_batch(tenant, &keys, owner, ReplicaSelector::All, now)
+                });
+        Ok(observe_batch(labels, results))
+    }
+
+    async fn remove(
+        &self,
+        key: String,
+        force: bool,
+        tenant_id: String,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        let labels = RpcLabels::new("remove").with_tenant(&tenant_id);
+        let now = self.clock().now();
+        let result = only_item(self.backend.execute_batch(
+            &tenant_id,
+            1,
+            now,
+            |backend, tenant| backend.remove_batch(tenant, std::slice::from_ref(&key), now, force),
+        ));
+        Ok(observe_result(labels, result))
+    }
+
+    async fn remove_by_regex(
+        &self,
+        regex: String,
+        force: bool,
+        tenant_id: String,
+    ) -> Result<ExpectedI64, RpcFailure> {
+        let labels = RpcLabels::new("remove_by_regex").with_tenant(&tenant_id);
+        let pattern = match Regex::new(&regex) {
+            Ok(pattern) => pattern,
+            Err(_) => return Ok(observe_result(labels, Err(ErrorCode::InvalidParams))),
+        };
+        let now = self.clock().now();
+        let removed =
+            only_item(
+                self.backend
+                    .execute_batch(&tenant_id, 1, now, |backend, tenant| {
+                        vec![
+                            backend
+                                .remove_matching(tenant, Some(&pattern), now, force)
+                                .and_then(usize_to_i64),
+                        ]
+                    }),
+            );
+        Ok(observe_result(labels, removed))
+    }
+
+    async fn remove_all(&self, force: bool, tenant_id: String) -> Result<i64, RpcFailure> {
+        let labels = RpcLabels::new("remove_all").with_tenant(&tenant_id);
+        let now = self.clock().now();
+        let removed = self
+            .backend
+            .remove_all(&tenant_id, now, force)
+            .and_then(usize_to_i64);
+        Ok(observe_result(labels, removed).unwrap_or(0))
+    }
+
+    async fn batch_remove(
+        &self,
+        keys: Vec<String>,
+        force: bool,
+        tenant_id: String,
+    ) -> Result<Vec<ExpectedVoid>, RpcFailure> {
+        let item_count = keys.len();
+        let labels = RpcLabels::new("batch_remove").with_tenant(&tenant_id);
+        let now = self.clock().now();
+        let results = self
+            .backend
+            .execute_batch(&tenant_id, item_count, now, |backend, tenant| {
+                backend.remove_batch(tenant, &keys, now, force)
+            });
+        Ok(observe_batch(labels, results))
+    }
+}
+
+fn usize_to_i64(value: usize) -> Result<i64, ErrorCode> {
+    i64::try_from(value).map_err(|_| ErrorCode::InternalError)
 }
 
 fn client_manager_error(error: ClientManagerError) -> ErrorCode {

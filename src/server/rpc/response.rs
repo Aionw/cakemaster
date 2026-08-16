@@ -5,7 +5,7 @@ use crate::mooncake::{
     BufferDescriptor, DescriptorVariant, ErrorCode, MemoryDescriptor, NoFDescriptor,
     ReplicaDescriptor, ReplicaStatus,
 };
-use crate::object::error::{LookupError, ObjectManagerError};
+use crate::object::error::{LookupError, ObjectManagerError, ObjectRemoveError};
 use crate::object::{AllocatedReplica, ReplicaLease, TenantObjectError};
 use crate::segment::{ReservationDescriptor, ReservationDescriptorRef};
 
@@ -102,6 +102,14 @@ pub(super) fn map_manager_error(error: ObjectManagerError) -> ErrorCode {
     };
     observe_internal_mapping("object_manager", &error, error_code);
     error_code
+}
+
+pub(super) fn map_remove_error(error: ObjectRemoveError) -> ErrorCode {
+    match error {
+        ObjectRemoveError::NotFound => ErrorCode::ObjectNotFound,
+        ObjectRemoveError::NotReady => ErrorCode::ReplicaIsNotReady,
+        ObjectRemoveError::Leased { .. } => ErrorCode::ObjectHasLease,
+    }
 }
 
 pub(super) fn map_tenant_error(error: TenantObjectError) -> ErrorCode {

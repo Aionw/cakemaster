@@ -13,7 +13,7 @@ impl ObjectCatalog {
         for _ in 0..3 {
             let node = slot.current.load_full().ok_or(LookupError::NotFound)?;
             match node.mutation.state() {
-                ObjectState::Claimed | ObjectState::Pending => {
+                ObjectState::Claimed | ObjectState::Pending | ObjectState::Updating => {
                     return Err(LookupError::NotReady);
                 }
                 ObjectState::Retiring => return Err(LookupError::NotFound),
