@@ -20,6 +20,8 @@ use crate::struct_pack::{
 };
 
 const DRIVER_POLL_BUDGET: usize = 1024;
+const CLIENT_CONNECTION_LOG_TARGET: &str = "coro_rpc::client::connection";
+const CLIENT_REQUEST_LOG_TARGET: &str = "coro_rpc::client::request";
 
 /// Configuration for a multiplexed coro_rpc connection.
 #[derive(Debug, Clone)]
@@ -84,6 +86,14 @@ impl RpcClient {
         stream
             .set_nodelay(config.tcp_nodelay)
             .map_err(RpcError::io)?;
+        let peer_addr = stream.peer_addr().ok();
+        let local_addr = stream.local_addr().ok();
+        log::debug!(
+            target: CLIENT_CONNECTION_LOG_TARGET,
+            peer_addr:? = peer_addr,
+            local_addr:? = local_addr;
+            "RPC client connected"
+        );
 
         let (request_tx, request_rx) = mpsc::channel(config.pending_request_buffer.max(1));
         let (cancellation_tx, cancellation_rx) = mpsc::unbounded_channel();
@@ -91,7 +101,21 @@ impl RpcClient {
         let connection =
             ClientConnection::new(stream, request_rx, cancellation_rx, closed.clone(), &config);
         tokio::spawn(async move {
-            let _ = connection.await;
+            match connection.await {
+                Ok(()) => log::debug!(
+                    target: CLIENT_CONNECTION_LOG_TARGET,
+                    peer_addr:? = peer_addr,
+                    local_addr:? = local_addr;
+                    "RPC client connection closed"
+                ),
+                Err(error) => log::warn!(
+                    target: CLIENT_CONNECTION_LOG_TARGET,
+                    peer_addr:? = peer_addr,
+                    local_addr:? = local_addr,
+                    error:% = error;
+                    "RPC client connection failed"
+                ),
+            }
         });
 
         Ok(Self {
@@ -197,7 +221,16 @@ impl RpcClient {
         if let Some(timeout) = self.inner.config.request_timeout {
             match tokio::time::timeout(timeout, dispatch).await {
                 Ok(result) => result,
-                Err(_) => Err(RpcError::TimedOut),
+                Err(_) => {
+                    log::warn!(
+                        target: CLIENT_REQUEST_LOG_TARGET,
+                        sequence = sequence,
+                        function_id = route_id,
+                        timeout_millis = timeout.as_millis();
+                        "RPC client request timed out"
+                    );
+                    Err(RpcError::TimedOut)
+                }
             }
         } else {
             dispatch.await

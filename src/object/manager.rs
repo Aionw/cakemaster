@@ -112,8 +112,17 @@ pub(super) struct PreparedPut {
 impl PreparedPut {
     #[inline]
     pub(super) fn actual_charge_bytes(&self) -> Result<u64, ObjectManagerError> {
-        let replica_count =
-            u64::try_from(self.replicas.len()).map_err(|_| ObjectManagerError::Internal)?;
+        let replica_count = match u64::try_from(self.replicas.len()) {
+            Ok(replica_count) => replica_count,
+            Err(_) => {
+                log::error!(
+                    target: "cakemaster::object::manager",
+                    replica_count = self.replicas.len();
+                    "replica count cannot be represented by object accounting"
+                );
+                return Err(ObjectManagerError::Internal);
+            }
+        };
         self.content
             .logical_bytes()
             .checked_mul(replica_count)
@@ -188,7 +197,14 @@ impl ObjectManager {
 
         let mut allocated = Vec::with_capacity(replicas.len());
         for replica in replicas.replicas() {
-            let direct = replica.direct().ok_or(ObjectManagerError::Internal)?;
+            let Some(direct) = replica.direct() else {
+                log::error!(
+                    target: "cakemaster::object::manager",
+                    replica_id = replica.id().get();
+                    "direct placement produced a non-direct replica"
+                );
+                return Err(ObjectManagerError::Internal);
+            };
             allocated.push(AllocatedReplica {
                 id: direct.id(),
                 descriptor: direct.owned_descriptor(),
@@ -260,7 +276,13 @@ impl ObjectManager {
             }
             Err(PublishError::ReplicasInvalidated) => Err(ObjectManagerError::NoAvailableReplicas),
             Err(PublishError::PublicationInProgress) => Err(ObjectManagerError::InvalidWrite),
-            Err(PublishError::ForeignCatalog | PublishError::CommitConflict) => {
+            Err(error @ (PublishError::ForeignCatalog | PublishError::CommitConflict)) => {
+                log::error!(
+                    target: "cakemaster::object::manager",
+                    namespace = lookup.namespace().get(),
+                    source_error:% = error;
+                    "object publication violated a catalog invariant"
+                );
                 Err(ObjectManagerError::Internal)
             }
         }
@@ -301,7 +323,15 @@ impl ObjectManager {
             Ok(()) => Ok(()),
             Err(RevokeError::ObjectGone) => Err(ObjectManagerError::NotFound),
             Err(RevokeError::AlreadyPublished) => Err(ObjectManagerError::InvalidWrite),
-            Err(RevokeError::ForeignCatalog) => Err(ObjectManagerError::Internal),
+            Err(error @ RevokeError::ForeignCatalog) => {
+                log::error!(
+                    target: "cakemaster::object::manager",
+                    namespace = lookup.namespace().get(),
+                    source_error:% = error;
+                    "object revocation violated a catalog invariant"
+                );
+                Err(ObjectManagerError::Internal)
+            }
         }
     }
 
@@ -386,6 +416,10 @@ fn validate_replicas<'a>(
     selector: ReplicaSelector,
 ) -> Result<(), ObjectManagerError> {
     let Some(replica) = replicas.next() else {
+        log::error!(
+            target: "cakemaster::object::manager",
+            "published or pending object has no replicas"
+        );
         return Err(ObjectManagerError::Internal);
     };
     let actual = replica
@@ -399,6 +433,10 @@ fn validate_replicas<'a>(
             .unwrap_or(ReplicaClass::LocalSsd)
             != actual
     }) {
+        log::error!(
+            target: "cakemaster::object::manager",
+            "object replicas have inconsistent storage classes"
+        );
         return Err(ObjectManagerError::Internal);
     }
     validate_selector(actual, selector)

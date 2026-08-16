@@ -19,6 +19,7 @@ default-members = [
 resolver = "3"
 
 [workspace.dependencies]
+log = { version = "0.4", features = ["kv"] }
 thiserror = "2"
 
 [dependencies]
@@ -27,7 +28,7 @@ clap = { version = "4", features = ["derive"] }
 coro-rpc = { path = "crates/coro-rpc" }
 crossbeam-queue = "0.3"
 futures-util = "0.3"
-log = { version = "0.4", features = ["kv"] }
+log.workspace = true
 logforth = { version = "0.30", features = ["append-async", "append-file", "bridge-log", "filter-rustlog", "layout-text"] }
 offset-allocator = "0.2"
 parking_lot = "0.12"

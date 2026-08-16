@@ -18,7 +18,8 @@ pub use error::{RemoteError, RpcError, RpcErrorCode};
 pub use hash::function_id;
 pub use method::{RpcMethod, RpcNoArgsMethod};
 pub use server::{
-    BoundRpcServer, RegisterError, RequestContext, RpcFailure, RpcResponse, RpcServer, ServerConfig,
+    BoundRpcServer, RegisterError, RequestContext, RpcFailure, RpcResponse, RpcServer,
+    ServerConfig, current_request_context,
 };
 pub use struct_pack::{ByteString, StructPack, StructPackError};
 pub use tokio::net::ToSocketAddrs;

@@ -2,6 +2,7 @@
 
 mod backend;
 mod multi_tenant;
+mod observability;
 mod request;
 mod response;
 mod single_tenant;
@@ -22,6 +23,7 @@ use crate::object::{ObjectManager, ObjectRead, TenantObjectManager, TenantPutReq
 use crate::segment::error::AttachError;
 use backend::{ObjectBatchBackend, batch_error};
 use coro_rpc::RpcFailure;
+use observability::{RpcLabels, observe_batch, observe_internal_mapping, observe_result};
 use request::{
     PutPlanTemplate, client_id_from_uuid, replica_selector, segment_id_from_uuid,
     segment_spec_from_wire,
@@ -164,15 +166,20 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         client_id: Uuid,
     ) -> Result<ExpectedVoid, RpcFailure> {
         let client_id = client_id_from_uuid(&client_id);
+        let segment_id = segment_id_from_uuid(&segment.id);
+        let labels = RpcLabels::new("mount_segment")
+            .with_client(client_id)
+            .with_segment(segment_id);
         let segment = match segment_spec_from_wire(segment, client_id) {
             Ok(segment) => segment,
-            Err(error) => return Ok(Err(error)),
+            Err(error) => return Ok(observe_result(labels, Err(error))),
         };
-        Ok(self
+        let result = self
             .clients
             .mount_segment(client_id, segment, self.clock.client_now())
             .map(|_| ())
-            .map_err(mount_segment_error))
+            .map_err(mount_segment_error);
+        Ok(observe_result(labels, result))
     }
 
     async fn re_mount_segment(
@@ -181,19 +188,21 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         client_id: Uuid,
     ) -> Result<ExpectedVoid, RpcFailure> {
         let client_id = client_id_from_uuid(&client_id);
+        let labels = RpcLabels::new("re_mount_segment").with_client(client_id);
         let segments = match segments
             .into_iter()
             .map(|segment| segment_spec_from_wire(segment, client_id))
             .collect::<Result<Vec<_>, _>>()
         {
             Ok(segments) => segments,
-            Err(error) => return Ok(Err(error)),
+            Err(error) => return Ok(observe_result(labels, Err(error))),
         };
-        Ok(self
+        let result = self
             .clients
             .remount(client_id, segments, self.clock.client_now())
             .map(|_| ())
-            .map_err(client_manager_error))
+            .map_err(client_manager_error);
+        Ok(observe_result(labels, result))
     }
 
     async fn unmount_segment(
@@ -201,14 +210,19 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         segment_id: Uuid,
         client_id: Uuid,
     ) -> Result<ExpectedVoid, RpcFailure> {
-        let result = self.clients.unmount_segment(
-            client_id_from_uuid(&client_id),
-            segment_id_from_uuid(&segment_id),
-        );
+        let client_id = client_id_from_uuid(&client_id);
+        let segment_id = segment_id_from_uuid(&segment_id);
+        let labels = RpcLabels::new("unmount_segment")
+            .with_client(client_id)
+            .with_segment(segment_id);
+        let result = self.clients.unmount_segment(client_id, segment_id);
         if result.is_ok() {
             self.reconcile_notify.notify_one();
         }
-        Ok(result.map(|_| ()).map_err(client_manager_error))
+        Ok(observe_result(
+            labels,
+            result.map(|_| ()).map_err(client_manager_error),
+        ))
     }
 
     async fn graceful_unmount_segment(
@@ -217,26 +231,33 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         client_id: Uuid,
         grace_period_ms: u64,
     ) -> Result<ExpectedVoid, RpcFailure> {
+        let client_id = client_id_from_uuid(&client_id);
+        let segment_id = segment_id_from_uuid(&segment_id);
+        let labels = RpcLabels::new("graceful_unmount_segment")
+            .with_client(client_id)
+            .with_segment(segment_id);
         let deadline = self.clock.client_now().saturating_add(grace_period_ms);
-        let result = self.clients.schedule_graceful_unmount(
-            client_id_from_uuid(&client_id),
-            segment_id_from_uuid(&segment_id),
-            deadline,
-        );
+        let result = self
+            .clients
+            .schedule_graceful_unmount(client_id, segment_id, deadline);
         if result.is_ok() {
             self.reconcile_notify.notify_one();
         }
-        Ok(result.map_err(client_manager_error))
+        Ok(observe_result(labels, result.map_err(client_manager_error)))
     }
 
     async fn exist_key(&self, key: String, tenant_id: String) -> Result<ExpectedBool, RpcFailure> {
         let now = self.clock().now();
-        Ok(only_item(self.backend.execute_batch(
+        let result = only_item(self.backend.execute_batch(
             &tenant_id,
             1,
             now,
             |backend, tenant| backend.exists_batch(tenant, std::slice::from_ref(&key), now),
-        )))
+        ));
+        Ok(observe_result(
+            RpcLabels::new("exist_key").with_tenant(&tenant_id),
+            result,
+        ))
     }
 
     async fn get_replica_list(
@@ -251,7 +272,10 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
                     backend.get_batch(tenant, std::slice::from_ref(&key), now)
                 }),
         );
-        Ok(get_replica_list_response(read, now))
+        Ok(observe_result(
+            RpcLabels::new("get_replica_list").with_tenant(&tenant_id),
+            get_replica_list_response(read, now),
+        ))
     }
 
     async fn batch_exist_key(
@@ -261,11 +285,15 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
     ) -> Result<Vec<ExpectedBool>, RpcFailure> {
         let now = self.clock().now();
         let item_count = keys.len();
-        Ok(self
+        let results = self
             .backend
             .execute_batch(&tenant_id, item_count, now, |backend, tenant| {
                 backend.exists_batch(tenant, &keys, now)
-            }))
+            });
+        Ok(observe_batch(
+            RpcLabels::new("batch_exist_key").with_tenant(&tenant_id),
+            results,
+        ))
     }
 
     async fn batch_get_replica_list(
@@ -275,14 +303,18 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
     ) -> Result<Vec<ExpectedGetReplicaListResponse>, RpcFailure> {
         let now = self.clock().now();
         let item_count = keys.len();
-        Ok(self
+        let results = self
             .backend
             .execute_batch(&tenant_id, item_count, now, |backend, tenant| {
                 backend.get_batch(tenant, &keys, now)
             })
             .into_iter()
             .map(|read| get_replica_list_response(read, now))
-            .collect())
+            .collect();
+        Ok(observe_batch(
+            RpcLabels::new("batch_get_replica_list").with_tenant(&tenant_id),
+            results,
+        ))
     }
 
     async fn batch_put_start(
@@ -294,19 +326,28 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         tenant_id: String,
     ) -> Result<Vec<ExpectedReplicaDescriptors>, RpcFailure> {
         let item_count = keys.len();
+        let client_id = client_id_from_uuid(&client_id);
+        let labels = RpcLabels::new("batch_put_start")
+            .with_client(client_id)
+            .with_tenant(&tenant_id);
         if item_count != slice_lengths.len() {
-            return Ok(batch_error(item_count, ErrorCode::InvalidParams));
+            return Ok(observe_batch(
+                labels,
+                batch_error(item_count, ErrorCode::InvalidParams),
+            ));
         }
         let template = match PutPlanTemplate::try_from(&config) {
             Ok(template) => template,
-            Err(error) => return Ok(batch_error(item_count, error)),
+            Err(error) => return Ok(observe_batch(labels, batch_error(item_count, error))),
         };
-        let admission = match self
-            .clients
-            .write_admission(client_id_from_uuid(&client_id))
-        {
+        let admission = match self.clients.write_admission(client_id) {
             Ok(admission) => admission,
-            Err(error) => return Ok(batch_error(item_count, client_lifecycle_error(error))),
+            Err(error) => {
+                return Ok(observe_batch(
+                    labels,
+                    batch_error(item_count, client_lifecycle_error(error)),
+                ));
+            }
         };
         let requests = keys
             .into_iter()
@@ -319,7 +360,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
                 .execute_batch(&tenant_id, item_count, now, move |backend, tenant| {
                     backend.start_put_batch(tenant, admission, requests, now)
                 });
-        Ok(started
+        let results = started
             .into_iter()
             .map(|started| {
                 let started = started?;
@@ -329,7 +370,8 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
                     .map(started_replica_descriptor)
                     .collect()
             })
-            .collect())
+            .collect();
+        Ok(observe_batch(labels, results))
     }
 
     async fn batch_put_end(
@@ -340,13 +382,22 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         tenant_id: String,
     ) -> Result<Vec<ExpectedVoid>, RpcFailure> {
         let item_count = object_metas.len();
+        let client_id = client_id_from_uuid(&client_id);
+        let labels = RpcLabels::new("batch_put_end")
+            .with_client(client_id)
+            .with_tenant(&tenant_id);
         let selector = match replica_selector(replica_type) {
             Ok(selector) => selector,
-            Err(error) => return Ok(batch_error(item_count, error)),
+            Err(error) => return Ok(observe_batch(labels, batch_error(item_count, error))),
         };
-        let owner = match self.clients.write_owner(client_id_from_uuid(&client_id)) {
+        let owner = match self.clients.write_owner(client_id) {
             Ok(owner) => owner,
-            Err(error) => return Ok(batch_error(item_count, client_lifecycle_error(error))),
+            Err(error) => {
+                return Ok(observe_batch(
+                    labels,
+                    batch_error(item_count, client_lifecycle_error(error)),
+                ));
+            }
         };
         let mut output = batch_error(item_count, ErrorCode::InvalidParams);
         let valid: Vec<_> = object_metas
@@ -356,7 +407,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
             .map(|(index, metadata)| (index, metadata.key.as_str()))
             .collect();
         if valid.is_empty() {
-            return Ok(output);
+            return Ok(observe_batch(labels, output));
         }
         let keys: Vec<_> = valid.iter().map(|(_, key)| *key).collect();
         let now = self.clock().now();
@@ -369,7 +420,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         for ((index, _), result) in valid.into_iter().zip(results) {
             output[index] = result;
         }
-        Ok(output)
+        Ok(observe_batch(labels, output))
     }
 
     async fn batch_put_revoke(
@@ -380,25 +431,35 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         tenant_id: String,
     ) -> Result<Vec<ExpectedVoid>, RpcFailure> {
         let item_count = keys.len();
+        let client_id = client_id_from_uuid(&client_id);
+        let labels = RpcLabels::new("batch_put_revoke")
+            .with_client(client_id)
+            .with_tenant(&tenant_id);
         let selector = match replica_selector(replica_type) {
             Ok(selector) => selector,
-            Err(error) => return Ok(batch_error(item_count, error)),
+            Err(error) => return Ok(observe_batch(labels, batch_error(item_count, error))),
         };
-        let owner = match self.clients.write_owner(client_id_from_uuid(&client_id)) {
+        let owner = match self.clients.write_owner(client_id) {
             Ok(owner) => owner,
-            Err(error) => return Ok(batch_error(item_count, client_lifecycle_error(error))),
+            Err(error) => {
+                return Ok(observe_batch(
+                    labels,
+                    batch_error(item_count, client_lifecycle_error(error)),
+                ));
+            }
         };
         let now = self.clock().now();
-        Ok(self
-            .backend
-            .execute_batch(&tenant_id, item_count, now, move |backend, tenant| {
-                backend.revoke_put_batch(tenant, &keys, owner, selector, now)
-            }))
+        let results =
+            self.backend
+                .execute_batch(&tenant_id, item_count, now, move |backend, tenant| {
+                    backend.revoke_put_batch(tenant, &keys, owner, selector, now)
+                });
+        Ok(observe_batch(labels, results))
     }
 }
 
 fn client_manager_error(error: ClientManagerError) -> ErrorCode {
-    match error {
+    let error_code = match &error {
         ClientManagerError::Lifecycle(ClientLifecycleError::NilClientId) => {
             ErrorCode::InvalidParams
         }
@@ -439,7 +500,9 @@ fn client_manager_error(error: ClientManagerError) -> ErrorCode {
         ClientManagerError::Attach(_) | ClientManagerError::ActiveRemountConflict => {
             ErrorCode::InvalidParams
         }
-    }
+    };
+    observe_internal_mapping("client_manager", &error, error_code);
+    error_code
 }
 
 fn mount_segment_error(error: ClientManagerError) -> ErrorCode {

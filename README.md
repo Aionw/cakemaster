@@ -102,7 +102,28 @@ cakemaster \
 接受 `stderr`、`file` 或 `both`，选择 `stderr` 时不会创建日志目录。环境变量
 `RUST_LOG`、`CAKEMASTER_LOG_LEVEL`、`CAKEMASTER_LOG_DIR` 和
 `CAKEMASTER_LOG_OUTPUT` 提供相同配置能力，优先级为命令行、环境变量、内置默认值。
-Access 日志的 target 是 `coro_rpc::access`，同样受这些等级和模块过滤规则控制。
+过滤器在进程启动时解析，当前不支持运行时热更新。常用的稳定日志 target 包括：
+
+- `coro_rpc::access`：通过 `--access-log` 显式开启的逐请求 access 日志；
+- `coro_rpc::server::connection`：连接建立、关闭和帧/协议故障；
+- `coro_rpc::server::request`：请求方法、peer、sequence、耗时和 RPC transport 错误；
+- `coro_rpc::client::{connection,request}`：客户端连接驱动错误和请求超时；
+- `cakemaster::server::rpc::{business,mapping}`：Mooncake 业务错误摘要及内部错误映射；
+- `cakemaster::client::{lifecycle,manager}`：client generation 状态转换和 cleanup/unmount 重试；
+- `cakemaster::object::manager`、`cakemaster::server::reconciler`：领域 invariant 与后台收敛。
+
+例如，保留默认业务日志、打开 RPC 请求完成记录并压低正常连接日志：
+
+```bash
+cakemaster --log-filter \
+  'info,coro_rpc::server::request=debug,coro_rpc::server::connection=warn,cakemaster::server::rpc::business=debug'
+```
+
+成功 RPC 只在 `DEBUG` 记录（包含耗时），收到请求的 payload 大小只在 `TRACE` 记录；
+协议/RPC 失败进入 `WARN`。未打开请求 `DEBUG` 时，默认热路径不会为每个成功请求读取时钟。
+业务 `InternalError` 进入 `ERROR`，容量或暂时不可用进入 `WARN`，参数、not-found 等调用方
+可处理的拒绝进入 `DEBUG`。batch 只记录聚合错误数，不记录 object key，避免高基数和敏感
+数据进入日志。Access 日志同样受等级和模块过滤规则控制。
 
 当前 production 默认值是保守的单进程、单租户内存态配置：最多 65,536 个 client 和预期
 65,536 个 object，client TTL/lease TTL 均为 10 秒，pending write timeout 为 30 秒，

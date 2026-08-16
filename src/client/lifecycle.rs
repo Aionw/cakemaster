@@ -8,6 +8,43 @@ use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+const LIFECYCLE_LOG_TARGET: &str = "cakemaster::client::lifecycle";
+
+fn state_name(state: ClientState) -> &'static str {
+    match state {
+        ClientState::Active => "active",
+        ClientState::Draining => "draining",
+        ClientState::Expired => "expired",
+    }
+}
+
+fn reason_name(reason: CleanupReason) -> &'static str {
+    match reason {
+        CleanupReason::GracefulUnmount => "graceful_unmount",
+        CleanupReason::HeartbeatExpired => "heartbeat_expired",
+        CleanupReason::ServerShutdown => "server_shutdown",
+    }
+}
+
+fn log_transition(
+    level: log::Level,
+    session: ClientSession,
+    old_state: &'static str,
+    new_state: &'static str,
+    reason: &'static str,
+) {
+    log::log!(
+        target: LIFECYCLE_LOG_TARGET,
+        level,
+        client_id:% = session.client_id(),
+        generation = session.generation(),
+        old_state = old_state,
+        new_state = new_state,
+        reason = reason;
+        "client lifecycle state changed"
+    );
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ClientTick(u64);
 
@@ -143,7 +180,7 @@ impl ClientCleanup {
         self.registry
             .as_ref()
             .expect("unfinished cleanup retains its registry")
-            .finish_cleanup(self.session)?;
+            .finish_cleanup(self.session, self.reason)?;
         self.registry = None;
         Ok(())
     }
@@ -284,6 +321,15 @@ impl ClientRegistry {
                 });
             }
             if entry.expire_if_due(now) {
+                let session = entry.session;
+                drop(registry);
+                log_transition(
+                    log::Level::Warn,
+                    session,
+                    state_name(ClientState::Active),
+                    state_name(ClientState::Expired),
+                    reason_name(CleanupReason::HeartbeatExpired),
+                );
                 return Err(ClientLifecycleError::CleanupInProgress {
                     state: ClientState::Expired,
                 });
@@ -324,6 +370,14 @@ impl ClientRegistry {
             client_id,
             generation,
         }));
+        drop(registry);
+        log_transition(
+            log::Level::Info,
+            session,
+            "absent",
+            state_name(ClientState::Active),
+            "mount_or_remount",
+        );
         Ok(ActivateOutcome::Activated(session))
     }
 
@@ -334,7 +388,19 @@ impl ClientRegistry {
         let Some(entry) = registry.entries.get_mut(&client_id) else {
             return HeartbeatOutcome::NeedRemount;
         };
-        if !entry.is_active() || entry.expire_if_due(now) {
+        if !entry.is_active() {
+            return HeartbeatOutcome::NeedRemount;
+        }
+        if entry.expire_if_due(now) {
+            let session = entry.session;
+            drop(registry);
+            log_transition(
+                log::Level::Warn,
+                session,
+                state_name(ClientState::Active),
+                state_name(ClientState::Expired),
+                reason_name(CleanupReason::HeartbeatExpired),
+            );
             return HeartbeatOutcome::NeedRemount;
         }
 
@@ -397,6 +463,14 @@ impl ClientRegistry {
         }
         entry.guard.invalidate();
         registry.entries.remove(&session.client_id);
+        drop(registry);
+        log_transition(
+            log::Level::Warn,
+            session,
+            state_name(ClientState::Active),
+            "absent",
+            "activation_rollback",
+        );
         Ok(())
     }
 
@@ -412,11 +486,28 @@ impl ClientRegistry {
         };
         entry.ensure_session(session)?;
 
-        if entry.is_active() {
+        let transitioned = entry.is_active();
+        if transitioned {
             entry.fence(reason);
         }
 
         let cleanup = entry.claim_cleanup(CleanupClaimState::Ready);
+        drop(registry);
+        if transitioned {
+            let new_state = match reason {
+                CleanupReason::HeartbeatExpired => ClientState::Expired,
+                CleanupReason::GracefulUnmount | CleanupReason::ServerShutdown => {
+                    ClientState::Draining
+                }
+            };
+            log_transition(
+                log::Level::Info,
+                session,
+                state_name(ClientState::Active),
+                state_name(new_state),
+                reason_name(reason),
+            );
+        }
         Ok(cleanup.map(|(session, reason)| self.cleanup_claim(session, reason)))
     }
 
@@ -429,6 +520,7 @@ impl ClientRegistry {
     pub fn claim_due_cleanups(&self, now: ClientTick, budget: usize) -> Vec<ClientCleanup> {
         let mut registry = self.inner.state.lock();
         let mut cleanups = Vec::new();
+        let mut expired_sessions = Vec::new();
         let budget = budget.min(self.inner.config.cleanup_scan_budget);
 
         let mut processed = 0;
@@ -469,6 +561,7 @@ impl ClientRegistry {
                     }
                     ClientPhase::Active => {
                         entry.mark_expired();
+                        expired_sessions.push(entry.session);
                         if let Some((session, reason)) =
                             entry.claim_cleanup(CleanupClaimState::Ready)
                         {
@@ -493,6 +586,16 @@ impl ClientRegistry {
             }
         }
 
+        drop(registry);
+        for session in expired_sessions {
+            log_transition(
+                log::Level::Warn,
+                session,
+                state_name(ClientState::Active),
+                state_name(ClientState::Expired),
+                reason_name(CleanupReason::HeartbeatExpired),
+            );
+        }
         cleanups
     }
     fn cleanup_claim(&self, session: ClientSession, reason: CleanupReason) -> ClientCleanup {
@@ -521,7 +624,11 @@ impl RegistryState {
 }
 
 impl ClientRegistryInner {
-    fn finish_cleanup(&self, session: ClientSession) -> Result<(), ClientLifecycleError> {
+    fn finish_cleanup(
+        &self,
+        session: ClientSession,
+        reason: CleanupReason,
+    ) -> Result<(), ClientLifecycleError> {
         let mut registry = self.state.lock();
         let Some(entry) = registry.entries.get(&session.client_id) else {
             return Ok(());
@@ -531,17 +638,47 @@ impl ClientRegistryInner {
             return Err(ClientLifecycleError::CleanupNotStarted);
         }
         registry.entries.remove(&session.client_id);
+        drop(registry);
+        let old_state = match reason {
+            CleanupReason::HeartbeatExpired => ClientState::Expired,
+            CleanupReason::GracefulUnmount | CleanupReason::ServerShutdown => ClientState::Draining,
+        };
+        log_transition(
+            log::Level::Info,
+            session,
+            state_name(old_state),
+            "absent",
+            reason_name(reason),
+        );
         Ok(())
     }
 
     fn release_cleanup(&self, session: ClientSession) {
         let mut registry = self.state.lock();
-        let should_retry = registry
+        let retry_reason = registry
             .entries
             .get_mut(&session.client_id)
-            .is_some_and(|entry| entry.session == session && entry.queue_running_cleanup());
-        if should_retry {
+            .and_then(|entry| {
+                if entry.session != session || !entry.queue_running_cleanup() {
+                    return None;
+                }
+                match entry.phase {
+                    ClientPhase::CleanupPending { reason, .. } => Some(reason),
+                    ClientPhase::Active => None,
+                }
+            });
+        if retry_reason.is_some() {
             registry.cleanup_ready.push_back(session);
+        }
+        drop(registry);
+        if let Some(reason) = retry_reason {
+            log::warn!(
+                target: LIFECYCLE_LOG_TARGET,
+                client_id:% = session.client_id(),
+                generation = session.generation(),
+                cleanup_reason = reason_name(reason);
+                "client lifecycle cleanup will be retried"
+            );
         }
     }
 }

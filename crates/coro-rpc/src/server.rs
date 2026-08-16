@@ -4,6 +4,7 @@ use std::future::Future;
 use std::io;
 use std::marker::PhantomData;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -11,7 +12,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use futures_util::stream::FuturesUnordered;
-use futures_util::{Sink, Stream};
+use futures_util::{FutureExt, Sink, Stream};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_util::codec::Framed;
@@ -23,10 +24,17 @@ use crate::error::RpcErrorCode;
 use crate::method::{RpcMethod, RpcNoArgsMethod};
 use crate::protocol::{FrameError, FrameLimits, RequestFrame, ResponseFrame, ServerCodec};
 use crate::struct_pack::{
-    StructPack, deserialize_with_type_hash, serialize, serialize_with_type_hash,
+    StructPack, deserialize, deserialize_with_type_hash, serialize, serialize_with_type_hash,
 };
 
 const DRIVER_POLL_BUDGET: usize = 1024;
+const ACCESS_LOG_TARGET: &str = "coro_rpc::access";
+const SERVER_CONNECTION_LOG_TARGET: &str = "coro_rpc::server::connection";
+const SERVER_REQUEST_LOG_TARGET: &str = "coro_rpc::server::request";
+
+tokio::task_local! {
+    static CURRENT_REQUEST_CONTEXT: RequestContext;
+}
 
 /// Server-side limits and connection settings.
 #[derive(Debug, Clone)]
@@ -63,6 +71,15 @@ pub struct RequestContext {
     pub function_id: u32,
     pub attachment: Bytes,
     pub peer_addr: SocketAddr,
+}
+
+/// Returns the context of the RPC request currently polling this task.
+///
+/// Generated services that do not accept attachments can use this accessor for
+/// diagnostics without changing their public method signatures. The context is
+/// available only while a server handler future is being polled.
+pub fn current_request_context() -> Option<RequestContext> {
+    CURRENT_REQUEST_CONTEXT.try_with(Clone::clone).ok()
 }
 
 /// A successful handler value with an optional response attachment.
@@ -162,12 +179,12 @@ where
         };
         let future = (self.function)(arguments);
         let response_type_hash = self.response_type_hash;
-        Box::pin(async move {
+        Box::pin(CURRENT_REQUEST_CONTEXT.scope(context, async move {
             Ok(match future.await {
                 Ok(value) => success_frame(sequence, &value, Bytes::new(), response_type_hash),
                 Err(error) => failure_frame(sequence, error),
             })
-        })
+        }))
     }
 }
 
@@ -199,9 +216,9 @@ where
                 );
             }
         };
-        let future = (self.function)(arguments, context);
+        let future = (self.function)(arguments, context.clone());
         let response_type_hash = self.response_type_hash;
-        Box::pin(async move {
+        Box::pin(CURRENT_REQUEST_CONTEXT.scope(context, async move {
             Ok(match future.await {
                 Ok(response) => success_frame(
                     sequence,
@@ -211,7 +228,7 @@ where
                 ),
                 Err(error) => failure_frame(sequence, error),
             })
-        })
+        }))
     }
 }
 
@@ -237,12 +254,12 @@ where
         }
         let future = (self.function)();
         let response_type_hash = self.response_type_hash;
-        Box::pin(async move {
+        Box::pin(CURRENT_REQUEST_CONTEXT.scope(context, async move {
             Ok(match future.await {
                 Ok(value) => success_frame(sequence, &value, Bytes::new(), response_type_hash),
                 Err(error) => failure_frame(sequence, error),
             })
-        })
+        }))
     }
 }
 
@@ -266,9 +283,9 @@ where
                 RpcFailure::standard(RpcErrorCode::InvalidRpcArguments),
             );
         }
-        let future = (self.function)(context);
+        let future = (self.function)(context.clone());
         let response_type_hash = self.response_type_hash;
-        Box::pin(async move {
+        Box::pin(CURRENT_REQUEST_CONTEXT.scope(context, async move {
             Ok(match future.await {
                 Ok(response) => success_frame(
                     sequence,
@@ -278,7 +295,7 @@ where
                 ),
                 Err(error) => failure_frame(sequence, error),
             })
-        })
+        }))
     }
 }
 
@@ -462,8 +479,19 @@ impl BoundRpcServer {
                         Err(error) => break Err(error),
                     };
                     if let Err(error) = stream.set_nodelay(self.config.tcp_nodelay) {
+                        log::error!(
+                            target: SERVER_CONNECTION_LOG_TARGET,
+                            peer_addr:% = peer_addr,
+                            error:% = error;
+                            "failed to configure accepted RPC connection"
+                        );
                         break Err(error);
                     }
+                    log::debug!(
+                        target: SERVER_CONNECTION_LOG_TARGET,
+                        peer_addr:% = peer_addr;
+                        "accepted RPC connection"
+                    );
                     let connection = ServerConnection::new(
                         stream,
                         peer_addr,
@@ -473,8 +501,32 @@ impl BoundRpcServer {
                     let connection_cancellation = cancellation.child_token();
                     connections.spawn(async move {
                         tokio::select! {
-                            _ = connection_cancellation.cancelled() => {}
-                            _ = connection => {}
+                            _ = connection_cancellation.cancelled() => {
+                                log::debug!(
+                                    target: SERVER_CONNECTION_LOG_TARGET,
+                                    peer_addr:% = peer_addr;
+                                    "RPC connection cancelled during server shutdown"
+                                );
+                            }
+                            result = AssertUnwindSafe(connection).catch_unwind() => match result {
+                                Ok(Ok(())) => log::debug!(
+                                    target: SERVER_CONNECTION_LOG_TARGET,
+                                    peer_addr:% = peer_addr;
+                                    "RPC connection closed"
+                                ),
+                                Ok(Err(error)) => log::warn!(
+                                    target: SERVER_CONNECTION_LOG_TARGET,
+                                    peer_addr:% = peer_addr,
+                                    error:% = error;
+                                    "RPC connection failed"
+                                ),
+                                Err(panic) => log::error!(
+                                    target: SERVER_CONNECTION_LOG_TARGET,
+                                    peer_addr:% = peer_addr,
+                                    panic_message = panic_message(&panic);
+                                    "RPC connection task panicked"
+                                ),
+                            }
                         }
                     });
                 }
@@ -488,11 +540,37 @@ impl BoundRpcServer {
     }
 }
 
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> &str {
+    panic
+        .downcast_ref::<&'static str>()
+        .copied()
+        .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
 #[derive(Clone)]
 struct RpcService {
     peer_addr: SocketAddr,
     routes: Arc<HashMap<u32, Route>>,
+    request_logging: RequestLogging,
     access_log: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RequestLogging {
+    trace: bool,
+    debug: bool,
+    warn: bool,
+}
+
+impl RequestLogging {
+    fn capture() -> Self {
+        Self {
+            trace: log::log_enabled!(target: SERVER_REQUEST_LOG_TARGET, log::Level::Trace),
+            debug: log::log_enabled!(target: SERVER_REQUEST_LOG_TARGET, log::Level::Debug),
+            warn: log::log_enabled!(target: SERVER_REQUEST_LOG_TARGET, log::Level::Warn),
+        }
+    }
 }
 
 impl Service<RequestFrame> for RpcService {
@@ -509,56 +587,135 @@ impl Service<RequestFrame> for RpcService {
         let function_id = request.header.function_id;
         let request_body_bytes = request.body.len();
         let request_attachment_bytes = request.attachment.len();
-        let started_at = self.access_log.then(Instant::now);
-        let (rpc_method, response) = match self.routes.get(&function_id) {
+        let request_logging = self.request_logging;
+        let access_log = self.access_log;
+        let started_at = (request_logging.debug || access_log).then(Instant::now);
+        let (method, response, registered) = match self.routes.get(&function_id) {
             Some(route) => {
+                if request_logging.trace {
+                    log::trace!(
+                        target: SERVER_REQUEST_LOG_TARGET,
+                        peer_addr:% = self.peer_addr,
+                        sequence = sequence,
+                        function_id = function_id,
+                        method = route.name,
+                        body_bytes = request_body_bytes,
+                        attachment_bytes = request_attachment_bytes;
+                        "RPC request received"
+                    );
+                }
                 let context = RequestContext {
                     sequence,
                     function_id,
                     attachment: request.attachment,
                     peer_addr: self.peer_addr,
                 };
-                (route.name, route.handler.call(request.body, context))
+                (route.name, route.handler.call(request.body, context), true)
             }
-            None => (
-                "<unregistered>",
-                ready_failure(
-                    sequence,
-                    RpcFailure::new(
-                        RpcErrorCode::FunctionNotRegistered as u16,
-                        "function not registered",
+            None => {
+                if request_logging.warn {
+                    log::warn!(
+                        target: SERVER_REQUEST_LOG_TARGET,
+                        peer_addr:% = self.peer_addr,
+                        sequence = sequence,
+                        function_id = function_id;
+                        "RPC function is not registered"
+                    );
+                }
+                (
+                    "<unregistered>",
+                    ready_failure(
+                        sequence,
+                        RpcFailure::new(
+                            RpcErrorCode::FunctionNotRegistered as u16,
+                            "function not registered",
+                        ),
                     ),
-                ),
-            ),
+                    false,
+                )
+            }
         };
-        let Some(started_at) = started_at else {
+
+        if !access_log && !request_logging.debug && (!request_logging.warn || !registered) {
             return response;
-        };
+        }
 
         let peer_addr = self.peer_addr;
         Box::pin(async move {
-            let response = response.await?;
-            let duration_us = u64::try_from(started_at.elapsed().as_micros()).unwrap_or(u64::MAX);
-            let status = if response.header.error_code == 0 {
-                "ok"
-            } else {
-                "error"
+            let response = match response.await {
+                Ok(response) => response,
+                Err(never) => match never {},
             };
-            log::info!(
-                target: "coro_rpc::access",
-                peer_addr:% = peer_addr,
-                rpc_method = rpc_method,
-                function_id = function_id,
-                sequence = sequence,
-                status = status,
-                error_code = response.header.error_code,
-                request_body_bytes = request_body_bytes,
-                request_attachment_bytes = request_attachment_bytes,
-                response_body_bytes = response.body.len(),
-                response_attachment_bytes = response.attachment.len(),
-                duration_us = duration_us;
-                "RPC request"
-            );
+            let error_code = response.header.error_code;
+
+            if registered && error_code == 0 && request_logging.debug {
+                let elapsed_micros = started_at
+                    .expect("debug request logging captures a start time")
+                    .elapsed()
+                    .as_micros();
+                log::debug!(
+                    target: SERVER_REQUEST_LOG_TARGET,
+                    peer_addr:% = peer_addr,
+                    sequence = sequence,
+                    function_id = function_id,
+                    method = method,
+                    elapsed_micros = elapsed_micros;
+                    "RPC request completed"
+                );
+            } else if registered && error_code != 0 && request_logging.warn {
+                let (rpc_error_code, rpc_error_message) = response_failure_details(&response);
+                if let Some(started_at) = started_at {
+                    log::warn!(
+                        target: SERVER_REQUEST_LOG_TARGET,
+                        peer_addr:% = peer_addr,
+                        sequence = sequence,
+                        function_id = function_id,
+                        method = method,
+                        rpc_error_code = rpc_error_code,
+                        rpc_error_message:? = rpc_error_message,
+                        elapsed_micros = started_at.elapsed().as_micros();
+                        "RPC request failed"
+                    );
+                } else {
+                    log::warn!(
+                        target: SERVER_REQUEST_LOG_TARGET,
+                        peer_addr:% = peer_addr,
+                        sequence = sequence,
+                        function_id = function_id,
+                        method = method,
+                        rpc_error_code = rpc_error_code,
+                        rpc_error_message:? = rpc_error_message;
+                        "RPC request failed"
+                    );
+                }
+            }
+
+            if access_log {
+                let duration_us = u64::try_from(
+                    started_at
+                        .expect("access logging captures a start time")
+                        .elapsed()
+                        .as_micros(),
+                )
+                .unwrap_or(u64::MAX);
+                let status = if error_code == 0 { "ok" } else { "error" };
+                log::info!(
+                    target: ACCESS_LOG_TARGET,
+                    peer_addr:% = peer_addr,
+                    rpc_method = method,
+                    function_id = function_id,
+                    sequence = sequence,
+                    status = status,
+                    error_code = error_code,
+                    request_body_bytes = request_body_bytes,
+                    request_attachment_bytes = request_attachment_bytes,
+                    response_body_bytes = response.body.len(),
+                    response_attachment_bytes = response.attachment.len(),
+                    duration_us = duration_us;
+                    "RPC request"
+                );
+            }
+
             Ok(response)
         })
     }
@@ -586,7 +743,9 @@ impl ServerConnection {
             service: RpcService {
                 peer_addr,
                 routes,
-                access_log: config.access_log,
+                request_logging: RequestLogging::capture(),
+                access_log: config.access_log
+                    && log::log_enabled!(target: ACCESS_LOG_TARGET, log::Level::Info),
             },
             in_flight: FuturesUnordered::new(),
             pending_responses: VecDeque::new(),
@@ -691,6 +850,16 @@ fn ready_failure(sequence: u32, failure: RpcFailure) -> ResponseFuture {
     Box::pin(std::future::ready(Ok(failure_frame(sequence, failure))))
 }
 
+fn response_failure_details(response: &ResponseFrame) -> (u16, Option<String>) {
+    if response.header.error_code == 255 {
+        return deserialize::<(u16, String)>(&response.body)
+            .map(|(code, message)| (code, Some(message)))
+            .unwrap_or((u16::from(response.header.error_code), None));
+    }
+    let message = deserialize::<String>(&response.body).ok();
+    (u16::from(response.header.error_code), message)
+}
+
 fn success_frame<R: StructPack>(
     sequence: u32,
     value: &R,
@@ -726,4 +895,55 @@ fn failure_frame(sequence: u32, failure: RpcFailure) -> ResponseFrame {
     };
     ResponseFrame::new(sequence, wire_code, body, Bytes::new())
         .expect("a small RPC error frame always fits in u32 lengths")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn current_context_is_scoped_to_the_handler_future() {
+        assert!(current_request_context().is_none());
+        let expected = RequestContext {
+            sequence: 17,
+            function_id: 23,
+            attachment: Bytes::from_static(b"diagnostic"),
+            peer_addr: "127.0.0.1:4123".parse().unwrap(),
+        };
+        CURRENT_REQUEST_CONTEXT
+            .scope(expected.clone(), async {
+                assert_eq!(
+                    current_request_context().unwrap().sequence,
+                    expected.sequence
+                );
+                tokio::task::yield_now().await;
+                assert_eq!(
+                    current_request_context().unwrap().peer_addr,
+                    expected.peer_addr
+                );
+            })
+            .await;
+        assert!(current_request_context().is_none());
+    }
+
+    #[test]
+    fn failure_details_decode_standard_and_extended_codes() {
+        let standard = failure_frame(
+            1,
+            RpcFailure::new(RpcErrorCode::InvalidRpcArguments as u16, "bad request"),
+        );
+        assert_eq!(
+            response_failure_details(&standard),
+            (
+                RpcErrorCode::InvalidRpcArguments as u16,
+                Some("bad request".to_owned())
+            )
+        );
+
+        let extended = failure_frame(2, RpcFailure::new(1001, "application failure"));
+        assert_eq!(
+            response_failure_details(&extended),
+            (1001, Some("application failure".to_owned()))
+        );
+    }
 }

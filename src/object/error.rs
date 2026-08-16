@@ -142,7 +142,7 @@ impl From<PutError> for ObjectManagerError {
 
 impl From<PlacementError> for ObjectManagerError {
     fn from(error: PlacementError) -> Self {
-        match error {
+        let mapped = match error {
             PlacementError::ZeroSize
             | PlacementError::ZeroReplicas
             | PlacementError::Reserve(ReserveError::ZeroSize) => Self::InvalidPlan,
@@ -157,13 +157,21 @@ impl From<PlacementError> for ObjectManagerError {
                 | ReserveError::NotDirectlyAllocatable(_)
                 | ReserveError::AddressOverflow(_),
             ) => Self::Internal,
+        };
+        if mapped == Self::Internal {
+            log::error!(
+                target: "cakemaster::object::manager",
+                source_error:% = error;
+                "placement error violated an object manager invariant"
+            );
         }
+        mapped
     }
 }
 
 impl From<StageError> for ObjectManagerError {
     fn from(error: StageError) -> Self {
-        match error {
+        let mapped = match error {
             StageError::ZeroSize => Self::InvalidPlan,
             StageError::NoReplicas | StageError::ReplicaInvalidated { .. } => {
                 Self::NoAvailableReplicas
@@ -172,6 +180,14 @@ impl From<StageError> for ObjectManagerError {
             | StageError::ClaimLost
             | StageError::ReplicaTooSmall { .. } => Self::Internal,
             StageError::OwnerInactive => Self::InvalidWrite,
+        };
+        if mapped == Self::Internal {
+            log::error!(
+                target: "cakemaster::object::manager",
+                source_error:% = error;
+                "catalog staging error violated an object manager invariant"
+            );
         }
+        mapped
     }
 }
