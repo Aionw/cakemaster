@@ -11,7 +11,7 @@ use crate::segment::placement::FulfillmentPolicy;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
-pub(crate) const CHARGE_RESERVED: u8 = 0;
+const CHARGE_RESERVED: u8 = 0;
 const CHARGE_COMMITTED: u8 = 1;
 const CHARGE_RETIRING: u8 = 2;
 const CHARGE_RELEASED: u8 = 3;
@@ -37,14 +37,10 @@ pub(crate) struct QuotaReservationGuard {
 /// RAII accounting token stored with an object record. Explicit lifecycle
 /// transitions keep diagnostics precise; the owning catalog node's `Drop` is
 /// the final safety net when physical replicas are actually released.
-#[repr(transparent)]
 pub(crate) struct TenantQuotaCharge {
     entry: Arc<TenantEntry>,
+    phase: AtomicU8,
 }
-
-const _: () = assert!(
-    std::mem::size_of::<Option<TenantQuotaCharge>>() == std::mem::size_of::<Arc<TenantEntry>>()
-);
 
 impl TenantEntry {
     pub(super) fn new(
@@ -277,7 +273,10 @@ impl QuotaReservationGuard {
             .entry
             .take()
             .expect("live quota reservations retain their tenant");
-        TenantQuotaCharge { entry }
+        TenantQuotaCharge {
+            entry,
+            phase: AtomicU8::new(CHARGE_RESERVED),
+        }
     }
 }
 
@@ -296,35 +295,30 @@ impl TenantQuotaCharge {
         self.entry.account(class)
     }
 
-    pub(crate) fn commit(&self, phase: &AtomicU8, replica_class: ReplicaClass, bytes: u64) {
-        debug_assert_eq!(phase.load(Ordering::Relaxed), CHARGE_RESERVED);
+    pub(crate) fn commit(&self, replica_class: ReplicaClass, bytes: u64) {
+        debug_assert_eq!(self.phase.load(Ordering::Relaxed), CHARGE_RESERVED);
         self.account(replica_class)
             .used
             .fetch_add(bytes, Ordering::Relaxed);
-        phase.store(CHARGE_COMMITTED, Ordering::Release);
+        self.phase.store(CHARGE_COMMITTED, Ordering::Release);
     }
 
-    pub(crate) fn abort(&self, phase: &AtomicU8, replica_class: ReplicaClass, bytes: u64) {
-        debug_assert_eq!(phase.load(Ordering::Relaxed), CHARGE_RESERVED);
+    pub(crate) fn abort(&self, replica_class: ReplicaClass, bytes: u64) {
+        debug_assert_eq!(self.phase.load(Ordering::Relaxed), CHARGE_RESERVED);
         self.account(replica_class).release_reserved(bytes);
-        phase.store(CHARGE_RELEASED, Ordering::Release);
+        self.phase.store(CHARGE_RELEASED, Ordering::Release);
     }
 
-    pub(crate) fn mark_retiring(&self, phase: &AtomicU8, replica_class: ReplicaClass, bytes: u64) {
-        debug_assert_eq!(phase.load(Ordering::Relaxed), CHARGE_COMMITTED);
+    pub(crate) fn mark_retiring(&self, replica_class: ReplicaClass, bytes: u64) {
+        debug_assert_eq!(self.phase.load(Ordering::Relaxed), CHARGE_COMMITTED);
         self.account(replica_class)
             .retiring
             .fetch_add(bytes, Ordering::Relaxed);
-        phase.store(CHARGE_RETIRING, Ordering::Release);
+        self.phase.store(CHARGE_RETIRING, Ordering::Release);
     }
 
-    pub(crate) fn release_committed_partial(
-        &self,
-        phase: &AtomicU8,
-        replica_class: ReplicaClass,
-        bytes: u64,
-    ) {
-        debug_assert_eq!(phase.load(Ordering::Acquire), CHARGE_COMMITTED);
+    pub(crate) fn release_committed_partial(&self, replica_class: ReplicaClass, bytes: u64) {
+        debug_assert_eq!(self.phase.load(Ordering::Acquire), CHARGE_COMMITTED);
         let account = self.account(replica_class);
         atomic_saturating_sub(&account.used, bytes);
         atomic_saturating_sub(&account.demand, bytes);
@@ -334,9 +328,9 @@ impl TenantQuotaCharge {
         self.account(replica_class).release_reserved(bytes);
     }
 
-    pub(crate) fn release(&self, phase: &AtomicU8, replica_class: ReplicaClass, bytes: u64) {
-        let current_phase = phase.load(Ordering::Acquire);
-        phase.store(CHARGE_RELEASED, Ordering::Release);
+    pub(crate) fn release(&self, replica_class: ReplicaClass, bytes: u64) {
+        let current_phase = self.phase.load(Ordering::Acquire);
+        self.phase.store(CHARGE_RELEASED, Ordering::Release);
         let account = self.account(replica_class);
         match current_phase {
             CHARGE_RESERVED => {

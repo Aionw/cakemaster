@@ -275,7 +275,6 @@ impl ObjectManager {
                 Err(ObjectManagerError::NotFound)
             }
             Err(PublishError::ReplicasInvalidated) => Err(ObjectManagerError::NoAvailableReplicas),
-            Err(PublishError::PublicationInProgress) => Err(ObjectManagerError::InvalidWrite),
             Err(error @ (PublishError::ForeignCatalog | PublishError::CommitConflict)) => {
                 log::error!(
                     target: "cakemaster::object::manager",
