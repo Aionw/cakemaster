@@ -11,6 +11,7 @@ pub struct ObjectCatalogStats {
     pub retired_bytes: u64,
     pub reclaim_debt: u64,
     pub pending_candidates: usize,
+    pub soft_pin_candidates: usize,
     pub liveness_scan_remaining: usize,
     pub young_candidates: usize,
     pub protected_candidates: usize,

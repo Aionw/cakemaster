@@ -50,7 +50,7 @@ Mooncake Store。
 
 | 能力 | 当前实现 | 边界 |
 | --- | --- | --- |
-| Object metadata | `ObjectCatalog` 和 `ObjectManager` 已有 claim、pending、publish、revoke、原子 upsert、remove、get/exists、lease、pending timeout、按 client session 主动回滚、有界回收，以及 segment 失效后的 replica 级剪枝 | 没有 replica 自动修复/补齐和完整上游 API；checksum、pin、group、upsert 抢占/busy-refcnt 等语义未接入 |
+| Object metadata | `ObjectCatalog` 和 `ObjectManager` 已有 claim、pending、publish、revoke、原子 upsert、remove、get/exists、lease、soft/hard pin、pending timeout、按 client session 主动回滚、有界回收，以及 segment 失效后的 replica 级剪枝 | 没有 replica 自动修复/补齐和完整上游 API；checksum、group、upsert 抢占/busy-refcnt 等语义未接入；pin 尚无持久化恢复 |
 | Segment/placement | `ClientManager` 已把 `Ping`、Memory/CXL `MountSegment`/`ReMountSegment`、立即/Graceful unmount、session TTL fencing 和批量 cleanup 接到 `SegmentPool`；production runtime 显式运行并 join 兼有 100ms 周期维护和 Graceful deadline 唤醒的 `MasterReconciler` | 没有 NoF lifecycle RPC、探活和真实 I/O |
 | Placement | 支持 preferred segment、free-capacity 排序、replica failure domain 和 RAII 回滚 | 不是上游可配置的五种策略；不支持 mixed Memory+NoF 和 host-local placement |
 | Tenant | `TenantObjectManager` 已有 namespace 隔离、Memory/NoF 分账、quota admission、RAII accounting 和定向回收 | 没有上游 policy connector、HTTP admin、持久化和启动恢复 |
@@ -82,8 +82,8 @@ std::optional<uint64_t> soft_pin_ttl_ms;
 literal/type hash。C++ yalantinglibs 生成的 metadata 和代表性请求字节固定在 golden
 测试中。
 
-当前 adapter 接受 `PRESERVE` 和无 TTL 的 `DISABLE`；`ENABLE` 或任意 request TTL 会返回
-`INVALID_PARAMS`，因为领域层尚未保存 pin deadline。当前选择只支持最新 schema；旧
+当前 adapter 已接受并执行 `PRESERVE/ENABLE/DISABLE`、optional TTL 和 hard pin；领域层
+使用提交 tick 保存 deadline，并校验默认 30 分钟、最大 24 小时。当前只支持最新 schema；旧
 `8c6095c` client 的 `BatchPutStart` 会按 type hash 明确拒绝，不做模糊双解码。
 
 ## 功能差距明细
@@ -99,8 +99,8 @@ literal/type hash。C++ yalantinglibs 生成的 metadata 和代表性请求字�
 - `BatchReplicaClear` 和 `BatchQueryIp`；
 - checksum 的保存、返回、数据面校验、snapshot/oplog 兼容；当前 RPC 明确拒绝非空
   checksum，get 永远返回 `None`；
-- soft pin 的 `PRESERVE/ENABLE/DISABLE`、请求级 TTL、过期和 eviction priority；
-- hard pin 的保存、查询与 eviction 保护；
+- pin 的 snapshot/oplog 恢复、独立 metrics，以及允许 soft-pin eviction 时与 C++ 完全一致的
+  全局两阶段 priority；
 - optional object group 的同 shard 路由、group lease refresh 和 best-effort group eviction；
 - 同一对象同时拥有 Memory 与 NoF replica；当前请求转换只允许二选一；
 - Disk/LocalDisk replica 的对象提交和选择；
@@ -113,8 +113,8 @@ literal/type hash。C++ yalantinglibs 生成的 metadata 和代表性请求字�
 
 Upsert 已支持缺失 key 插入、同尺寸 allocation 复用、变尺寸 generation 替换，以及
 end/revoke/timeout/session-fence 回滚；尚未实现上游对既有 PROCESSING writer 的立即抢占和
-replica busy refcnt 检查。Remove 已支持 single/batch/regex/all、lease 与 force；由于 hard
-pin 和 replication task 尚未建模，force 当前只影响 lease 检查。
+replica busy refcnt 检查。Remove 已支持 single/batch/regex/all、lease、hard pin 与 force；
+force 同时绕过 lease/hard pin。replication task 尚未建模。
 
 上游依据：[`rpc_service.h`](https://github.com/kvcache-ai/Mooncake/blob/5c0724d22e7f04513a3453c8b6642a5a21b80b47/mooncake-store/include/rpc_service.h)、
 [`Master/Store 设计`](https://github.com/kvcache-ai/Mooncake/blob/5c0724d22e7f04513a3453c8b6642a5a21b80b47/docs/source/design/mooncake-store.md)。
@@ -138,8 +138,8 @@ controller，但产品 server 没有上游的持续后台控制：
 
 - Memory 和 NoF 独立 high watermark/eviction ratio；
 - allocation failure 触发同步/有界 eviction retry；
-- lease、soft pin、hard pin、group、replica busy 和 incomplete write 的完整候选过滤；
-- soft-pin deadline 管理、Count-Min Sketch promotion admission；
+- group、replica busy 和 incomplete write 的完整候选过滤；
+- Count-Min Sketch promotion admission，以及 soft-pin 两阶段全局 priority；
 - client/segment 故障后的定向清理和容量重算。
 
 因此现有回收内核可保留，但还不能声称与 Mooncake eviction policy 等价。
@@ -421,7 +421,7 @@ MarkTaskToComplete
 - `ClientManager` 已接入 production composition 并运行 TTL cleanup；仍需补齐 NoF
   Mount/ReMount/Unmount；
 - 补齐单 key put、query 和管理所需的对象 API；remove/upsert 路由已完成基础内存语义；
-- 补 checksum、pin、group、mixed replica 和两个 pending timeout 语义；
+- 补 checksum、group、mixed replica、pin 持久化和两个 pending timeout 语义；
 - 接入 production watermark/eviction controller 与 metrics；
 - 用上游 C++ Client 完成 mount -> put -> get metadata -> remove -> remount 的 E2E。
 

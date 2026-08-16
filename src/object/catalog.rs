@@ -1,4 +1,7 @@
-use super::config::ObjectCatalogConfig;
+use super::config::{
+    ObjectCatalogConfig, ObjectPinRequest, ResolvedObjectPinRequest, ResolvedSoftPinRequest,
+    SoftPinAction,
+};
 use super::content::ObjectContent;
 use super::diagnostics::ObjectCatalogStats;
 use super::error::{
@@ -108,6 +111,7 @@ struct CollectorState {
     young: SegQueue<GcCandidate>,
     protected: SegQueue<GcCandidate>,
     pending: SegQueue<PendingCandidate>,
+    soft_pins: SegQueue<SoftPinCandidate>,
     empty_slots: SegQueue<EmptySlotCandidate>,
     retired: SegQueue<RetiredObject>,
     gate: Mutex<()>,
@@ -169,6 +173,7 @@ struct WriteMetadata {
     id: WriteId,
     owner: WriteOwner,
     rollback: WriteRollback,
+    pending_soft_pin: Option<ResolvedSoftPinRequest>,
 }
 
 /// Only one rollback strategy can belong to a write generation.
@@ -182,6 +187,8 @@ enum WriteRollback {
 struct AccessControl {
     lease_until: AtomicU64,
     recent: AtomicBool,
+    soft_pin_until: AtomicU64,
+    hard_pinned: bool,
 }
 
 #[derive(Clone)]
@@ -193,6 +200,11 @@ struct GcCandidate {
 struct PendingCandidate {
     candidate: GcCandidate,
     write_id: WriteId,
+    deadline: CatalogTick,
+}
+
+struct SoftPinCandidate {
+    candidate: GcCandidate,
     deadline: CatalogTick,
 }
 
@@ -282,6 +294,7 @@ impl ObjectCatalog {
                     young: SegQueue::new(),
                     protected: SegQueue::new(),
                     pending: SegQueue::new(),
+                    soft_pins: SegQueue::new(),
                     empty_slots: SegQueue::new(),
                     retired: SegQueue::new(),
                     gate: Mutex::new(()),
@@ -309,6 +322,7 @@ impl ObjectCatalog {
             retired_bytes: lifecycle.retired_bytes.load(Ordering::Relaxed),
             reclaim_debt: collector.reclaim_debt.load(Ordering::Relaxed),
             pending_candidates: collector.pending.len(),
+            soft_pin_candidates: collector.soft_pins.len(),
             liveness_scan_remaining: collector
                 .liveness_young_remaining
                 .load(Ordering::Relaxed)
@@ -333,6 +347,13 @@ impl ObjectCatalog {
             true
         });
         identities
+    }
+
+    pub(in crate::object) fn resolve_pin_request(
+        &self,
+        request: ObjectPinRequest,
+    ) -> Result<ResolvedObjectPinRequest, ObjectCatalogConfigError> {
+        self.inner.config.resolve_pin_request(request)
     }
 }
 
@@ -439,15 +460,22 @@ impl ObjectSlot {
 }
 
 impl CatalogNode {
-    fn claimed(id: WriteId, owner: WriteOwner) -> Self {
-        Self::claimed_replacement(id, owner, None)
+    fn claimed(id: WriteId, owner: WriteOwner, pins: ResolvedObjectPinRequest) -> Self {
+        Self::claimed_replacement(id, owner, None, pins)
     }
 
     fn claimed_replacement(
         id: WriteId,
         owner: WriteOwner,
         previous: Option<Arc<CatalogNode>>,
+        pins: ResolvedObjectPinRequest,
     ) -> Self {
+        let previous_soft_pin = previous
+            .as_ref()
+            .map_or(0, |node| node.access.soft_pin_until.load(Ordering::Acquire));
+        let hard_pinned = previous.as_ref().map_or(pins.with_hard_pin, |node| {
+            node.access.hard_pinned || pins.with_hard_pin
+        });
         Self {
             record: OnceLock::new(),
             mutation: MutationControl {
@@ -459,12 +487,15 @@ impl CatalogNode {
                     rollback: previous.map_or(WriteRollback::None, |previous| {
                         WriteRollback::Replacement { previous }
                     }),
+                    pending_soft_pin: Some(pins.soft_pin),
                 }),
                 commit: OnceLock::new(),
             },
             access: AccessControl {
                 lease_until: AtomicU64::new(0),
                 recent: AtomicBool::new(false),
+                soft_pin_until: AtomicU64::new(previous_soft_pin),
+                hard_pinned,
             },
         }
     }
@@ -683,18 +714,29 @@ impl MutationControl {
 
     /// Installs all externally inspectable write identity under one lock.
     /// The caller holds `gate` and has already hidden the published node.
-    fn begin_in_place_update(&self, id: WriteId, owner: WriteOwner) {
+    fn begin_in_place_update(
+        &self,
+        id: WriteId,
+        owner: WriteOwner,
+        soft_pin: ResolvedSoftPinRequest,
+    ) {
         let mut metadata = self.metadata.write();
         debug_assert!(matches!(&metadata.rollback, WriteRollback::None));
         let previous_owner = metadata.owner;
         metadata.id = id;
         metadata.owner = owner;
         metadata.rollback = WriteRollback::InPlace { previous_owner };
+        metadata.pending_soft_pin = Some(soft_pin);
     }
 
-    fn commit_in_place_update(&self) {
-        let rollback = std::mem::replace(&mut self.metadata.write().rollback, WriteRollback::None);
+    fn commit_in_place_update(&self) -> ResolvedSoftPinRequest {
+        let mut metadata = self.metadata.write();
+        let rollback = std::mem::replace(&mut metadata.rollback, WriteRollback::None);
         assert!(matches!(rollback, WriteRollback::InPlace { .. }));
+        metadata
+            .pending_soft_pin
+            .take()
+            .expect("an in-place update retains its soft-pin action")
     }
 
     fn rollback_in_place_update(&self) {
@@ -704,6 +746,7 @@ impl MutationControl {
             unreachable!("updating an in-place object retains its previous owner");
         };
         metadata.owner = previous_owner;
+        metadata.pending_soft_pin = None;
     }
 
     fn has_replacement(&self) -> bool {
@@ -737,6 +780,14 @@ impl MutationControl {
 
     fn set_commit(&self, commit: ObjectCommit) -> Result<(), ObjectCommit> {
         self.commit.set(commit)
+    }
+
+    fn take_pending_soft_pin(&self) -> ResolvedSoftPinRequest {
+        self.metadata
+            .write()
+            .pending_soft_pin
+            .take()
+            .expect("a pending generation retains its soft-pin action")
     }
 }
 
@@ -785,6 +836,53 @@ impl AccessControl {
 
     fn is_leased(&self, now: CatalogTick) -> bool {
         self.lease_until() > now
+    }
+
+    fn hard_pinned(&self) -> bool {
+        self.hard_pinned
+    }
+
+    fn soft_pin_until(&self) -> Option<CatalogTick> {
+        match self.soft_pin_until.load(Ordering::Acquire) {
+            0 => None,
+            deadline => Some(CatalogTick::new(deadline)),
+        }
+    }
+
+    fn is_soft_pinned(&self, now: CatalogTick) -> bool {
+        self.soft_pin_until().is_some_and(|deadline| deadline > now)
+    }
+
+    fn expire_soft_pin(&self, expected: CatalogTick, now: CatalogTick) -> bool {
+        expected <= now
+            && self
+                .soft_pin_until
+                .compare_exchange(expected.get(), 0, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+    }
+
+    fn apply_soft_pin(
+        &self,
+        request: ResolvedSoftPinRequest,
+        now: CatalogTick,
+    ) -> Option<CatalogTick> {
+        match request.action {
+            SoftPinAction::Preserve => {
+                if let Some(deadline) = self.soft_pin_until() {
+                    let _ = self.expire_soft_pin(deadline, now);
+                }
+            }
+            SoftPinAction::Enable if request.ttl_ticks != 0 => {
+                self.soft_pin_until.store(
+                    now.saturating_add(request.ttl_ticks).get(),
+                    Ordering::Release,
+                );
+            }
+            SoftPinAction::Enable | SoftPinAction::Disable => {
+                self.soft_pin_until.store(0, Ordering::Release);
+            }
+        }
+        self.soft_pin_until()
     }
 }
 

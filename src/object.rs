@@ -25,7 +25,10 @@ mod write;
 pub use catalog::{
     LiveReplicaView, ObjectCatalog, ObjectHandle, ObjectRead, PutClaim, PutTicket, ReplicaSetView,
 };
-pub use config::ObjectCatalogConfig;
+pub use config::{
+    DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS, DEFAULT_MAX_SOFT_PIN_TTL_TICKS,
+    DEFAULT_SOFT_PIN_TTL_TICKS, ObjectCatalogConfig, ObjectPinRequest, SoftPinAction,
+};
 pub use content::{ObjectContent, ObjectKind};
 pub use identity::{NamespaceId, ObjectIdentity, ObjectKey, ObjectLookup};
 pub use manager::{

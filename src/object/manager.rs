@@ -2,6 +2,7 @@ use super::catalog::{
     ObjectCatalog, ObjectHandle, ObjectRead, ObjectWriteState, PutClaim, PutTicket, UpsertClaim,
 };
 use super::config::ObjectCatalogConfig;
+use super::config::{ObjectPinRequest, ResolvedObjectPinRequest};
 use super::content::ObjectContent;
 use super::error::{
     LookupError, ObjectCatalogConfigError, ObjectManagerError, ObjectRemoveError, PublishError,
@@ -47,11 +48,16 @@ impl PendingWriteRevoker {
 pub struct ObjectPutPlan {
     content: ObjectContent,
     placement: PlacementRequest,
+    pins: ObjectPinRequest,
 }
 
 impl ObjectPutPlan {
     pub const fn new(content: ObjectContent, placement: PlacementRequest) -> Self {
-        Self { content, placement }
+        Self {
+            content,
+            placement,
+            pins: ObjectPinRequest::new(super::config::SoftPinAction::Preserve, None, false),
+        }
     }
 
     pub const fn content(&self) -> ObjectContent {
@@ -60,6 +66,15 @@ impl ObjectPutPlan {
 
     pub const fn placement(&self) -> &PlacementRequest {
         &self.placement
+    }
+
+    pub const fn with_pins(mut self, pins: ObjectPinRequest) -> Self {
+        self.pins = pins;
+        self
+    }
+
+    pub const fn pins(&self) -> ObjectPinRequest {
+        self.pins
     }
 }
 
@@ -207,8 +222,10 @@ impl ObjectManager {
         plan: ObjectPutPlan,
         now: CatalogTick,
     ) -> Result<PreparedPut, ObjectManagerError> {
-        self.validate_plan(&plan)?;
-        let claim = self.catalog.claim_put(identity, admission, now)?;
+        let pins = self.validate_plan(&plan)?;
+        let claim = self
+            .catalog
+            .claim_put_with_pins(identity, admission, pins, now)?;
         self.prepare_claimed_put(claim, plan)
     }
 
@@ -219,10 +236,10 @@ impl ObjectManager {
         plan: ObjectPutPlan,
         now: CatalogTick,
     ) -> Result<PreparedUpsert, ObjectManagerError> {
-        self.validate_plan(&plan)?;
+        let pins = self.validate_plan(&plan)?;
         match self
             .catalog
-            .claim_upsert(identity, admission, plan.content(), now)?
+            .claim_upsert(identity, admission, plan.content(), pins, now)?
         {
             UpsertClaim::Reuse(ticket) => {
                 let started = {
@@ -301,7 +318,18 @@ impl ObjectManager {
         owner: WriteOwner,
         selector: ReplicaSelector,
     ) -> Result<(), ObjectManagerError> {
-        self.finish_put_lookup(identity.as_lookup(), owner, selector)
+        self.finish_put_at(identity, owner, selector, CatalogTick::ZERO)
+    }
+
+    /// Finishes a write using the supplied catalog time for commit-time pin changes.
+    pub fn finish_put_at(
+        &self,
+        identity: &ObjectIdentity,
+        owner: WriteOwner,
+        selector: ReplicaSelector,
+        now: CatalogTick,
+    ) -> Result<(), ObjectManagerError> {
+        self.finish_put_lookup_at(identity.as_lookup(), owner, selector, now)
     }
 
     pub(super) fn finish_put_lookup(
@@ -309,6 +337,16 @@ impl ObjectManager {
         lookup: ObjectLookup<'_>,
         owner: WriteOwner,
         selector: ReplicaSelector,
+    ) -> Result<(), ObjectManagerError> {
+        self.finish_put_lookup_at(lookup, owner, selector, CatalogTick::ZERO)
+    }
+
+    pub(super) fn finish_put_lookup_at(
+        &self,
+        lookup: ObjectLookup<'_>,
+        owner: WriteOwner,
+        selector: ReplicaSelector,
+        now: CatalogTick,
     ) -> Result<(), ObjectManagerError> {
         let write = match self.catalog.inspect_write(lookup) {
             Ok(write) => write,
@@ -322,7 +360,10 @@ impl ObjectManager {
             }
         };
         validate_pending(&ticket, owner, selector)?;
-        match self.catalog.publish(&ticket, ObjectCommit::new(None)) {
+        match self
+            .catalog
+            .publish_at(&ticket, ObjectCommit::new(None), now)
+        {
             Ok(_) => Ok(()),
             Err(PublishError::ObjectGone | PublishError::NotPending) => {
                 Err(ObjectManagerError::NotFound)
@@ -464,7 +505,10 @@ impl ObjectManager {
         }
     }
 
-    fn validate_plan(&self, plan: &ObjectPutPlan) -> Result<(), ObjectManagerError> {
+    fn validate_plan(
+        &self,
+        plan: &ObjectPutPlan,
+    ) -> Result<ResolvedObjectPinRequest, ObjectManagerError> {
         if plan.content().logical_bytes() == 0
             || plan.placement().allocation().bytes() != plan.content().logical_bytes()
             || plan.placement().replicas().count() == 0
@@ -475,7 +519,9 @@ impl ObjectManager {
         {
             return Err(ObjectManagerError::InvalidPlan);
         }
-        Ok(())
+        self.catalog
+            .resolve_pin_request(plan.pins())
+            .map_err(|_| ObjectManagerError::InvalidPlan)
     }
 }
 

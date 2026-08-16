@@ -65,6 +65,7 @@ pub(super) trait ObjectBatchBackend: Send + Sync + 'static {
         keys: &[&str],
         owner: WriteOwner,
         selector: ReplicaSelector,
+        now: CatalogTick,
     ) -> Vec<ExpectedVoid>;
     fn revoke_put_batch(
         &self,

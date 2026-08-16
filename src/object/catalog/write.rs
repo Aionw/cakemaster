@@ -128,17 +128,32 @@ impl ObjectCatalog {
         admission: WriteAdmission,
         now: CatalogTick,
     ) -> Result<PutClaim, PutError> {
+        let pins = self
+            .inner
+            .config
+            .resolve_pin_request(ObjectPinRequest::default())
+            .expect("the default pin request is valid");
+        self.claim_put_with_pins(identity, admission, pins, now)
+    }
+
+    pub(in super::super) fn claim_put_with_pins(
+        &self,
+        identity: ObjectIdentity,
+        admission: WriteAdmission,
+        pins: ResolvedObjectPinRequest,
+        now: CatalogTick,
+    ) -> Result<PutClaim, PutError> {
         self.validate_claim_request(&identity)?;
 
         loop {
-            let slot = match self.claim_or_get_slot(&identity, &admission, now) {
+            let slot = match self.claim_or_get_slot(&identity, &admission, pins, now) {
                 ClaimedOrOccupied::Claimed(claim) => return Ok(claim),
                 ClaimedOrOccupied::Occupied(slot) => slot,
             };
             if !self.prepare_indexed_slot(&slot) {
                 continue;
             }
-            if let Some(claim) = self.try_claim_empty_slot(&slot, &admission, now) {
+            if let Some(claim) = self.try_claim_empty_slot(&slot, &admission, pins, now) {
                 return Ok(claim);
             }
 
@@ -160,12 +175,13 @@ impl ObjectCatalog {
         identity: ObjectIdentity,
         admission: WriteAdmission,
         content: ObjectContent,
+        pins: ResolvedObjectPinRequest,
         now: CatalogTick,
     ) -> Result<UpsertClaim, PutError> {
         self.validate_claim_request(&identity)?;
 
         loop {
-            let slot = match self.claim_or_get_slot(&identity, &admission, now) {
+            let slot = match self.claim_or_get_slot(&identity, &admission, pins, now) {
                 ClaimedOrOccupied::Claimed(claim) => return Ok(UpsertClaim::Write(claim)),
                 ClaimedOrOccupied::Occupied(slot) => slot,
             };
@@ -174,7 +190,7 @@ impl ObjectCatalog {
             }
 
             let Some(previous) = slot.current.load_full() else {
-                if let Some(claim) = self.try_claim_empty_slot(&slot, &admission, now) {
+                if let Some(claim) = self.try_claim_empty_slot(&slot, &admission, pins, now) {
                     return Ok(UpsertClaim::Write(claim));
                 }
                 continue;
@@ -203,7 +219,7 @@ impl ObjectCatalog {
                 let id = slot.next_write_id();
                 previous
                     .mutation
-                    .begin_in_place_update(id, admission.owner());
+                    .begin_in_place_update(id, admission.owner(), pins.soft_pin);
                 drop(write);
 
                 let ticket = PutTicket::new(&self.inner, &slot, previous.clone(), id);
@@ -224,6 +240,7 @@ impl ObjectCatalog {
                 id,
                 admission.owner(),
                 Some(previous.clone()),
+                pins,
             ));
             let observed = slot.current.compare_and_swap(&previous, Some(node.clone()));
             if observed
@@ -245,6 +262,15 @@ impl ObjectCatalog {
         ticket: &PutTicket,
         commit: ObjectCommit,
     ) -> Result<ObjectHandle, PublishError> {
+        self.publish_at(ticket, commit, CatalogTick::ZERO)
+    }
+
+    pub fn publish_at(
+        &self,
+        ticket: &PutTicket,
+        commit: ObjectCommit,
+        now: CatalogTick,
+    ) -> Result<ObjectHandle, PublishError> {
         let (slot, _write) = self.lock_ticket(ticket).map_err(PublishError::from)?;
         if !ticket.node.record().replicas.read().all_live() {
             return Err(PublishError::ReplicasInvalidated);
@@ -255,7 +281,8 @@ impl ObjectCatalog {
                 if ticket.node.mutation.commit() != Some(commit) {
                     return Err(PublishError::CommitConflict);
                 }
-                ticket.node.mutation.commit_in_place_update();
+                let soft_pin = ticket.node.mutation.commit_in_place_update();
+                ticket.node.access.apply_soft_pin(soft_pin, now);
                 ticket.node.mutation.store(ObjectState::Published);
             }
             ObjectState::Pending => {
@@ -264,6 +291,8 @@ impl ObjectCatalog {
                     .mutation
                     .set_commit(commit)
                     .expect("the node write gate gives publication one owner");
+                let soft_pin = ticket.node.mutation.take_pending_soft_pin();
+                ticket.node.access.apply_soft_pin(soft_pin, now);
                 let reserved_bytes = ticket.node.record().reserved_bytes();
                 ticket.node.commit_accounting();
                 self.inner.lifecycle.on_publish(reserved_bytes);
@@ -297,6 +326,12 @@ impl ObjectCatalog {
             .collector
             .young
             .push(GcCandidate::new(&slot, &ticket.node));
+        if let Some(deadline) = ticket.node.access.soft_pin_until() {
+            self.inner.collector.soft_pins.push(SoftPinCandidate {
+                candidate: GcCandidate::new(&slot, &ticket.node),
+                deadline,
+            });
+        }
         Ok(ObjectHandle {
             node: ticket.node.clone(),
         })
@@ -392,13 +427,14 @@ impl ObjectCatalog {
         &self,
         identity: &ObjectIdentity,
         admission: &WriteAdmission,
+        pins: ResolvedObjectPinRequest,
         now: CatalogTick,
     ) -> ClaimedOrOccupied {
         match self.inner.index.entries.entry_sync(identity.clone()) {
             Entry::Occupied(entry) => ClaimedOrOccupied::Occupied(entry.get().clone()),
             Entry::Vacant(entry) => {
                 let id = WriteId::new(1);
-                let node = Arc::new(CatalogNode::claimed(id, admission.owner()));
+                let node = Arc::new(CatalogNode::claimed(id, admission.owner(), pins));
                 // Publish an already-claimed slot into the index so the
                 // fresh-key fast path never invokes an ArcSwap writer.
                 let slot = Arc::new(ObjectSlot {
@@ -438,10 +474,11 @@ impl ObjectCatalog {
         &self,
         slot: &Arc<ObjectSlot>,
         admission: &WriteAdmission,
+        pins: ResolvedObjectPinRequest,
         now: CatalogTick,
     ) -> Option<PutClaim> {
         let id = slot.next_write_id();
-        let node = Arc::new(CatalogNode::claimed(id, admission.owner()));
+        let node = Arc::new(CatalogNode::claimed(id, admission.owner(), pins));
         if slot
             .current
             .compare_and_swap(&None::<Arc<CatalogNode>>, Some(node.clone()))

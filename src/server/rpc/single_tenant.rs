@@ -104,14 +104,16 @@ impl ObjectBatchBackend for ObjectManager {
         keys: &[&str],
         owner: WriteOwner,
         selector: ReplicaSelector,
+        now: CatalogTick,
     ) -> Vec<ExpectedVoid> {
         keys.iter()
             .map(|key| {
-                ObjectManager::finish_put(
+                ObjectManager::finish_put_at(
                     self,
                     &ObjectIdentity::new(NamespaceId::DEFAULT, *key),
                     owner,
                     selector,
+                    now,
                 )
                 .map_err(map_manager_error)
             })

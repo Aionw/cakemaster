@@ -79,6 +79,18 @@ impl ObjectHandle {
     pub fn owner(&self) -> WriteOwner {
         self.node.owner()
     }
+
+    pub fn is_hard_pinned(&self) -> bool {
+        self.node.access.hard_pinned()
+    }
+
+    pub fn soft_pin_expires_at(&self) -> Option<CatalogTick> {
+        self.node.access.soft_pin_until()
+    }
+
+    pub fn is_soft_pinned(&self, now: CatalogTick) -> bool {
+        self.node.access.is_soft_pinned(now)
+    }
 }
 
 impl fmt::Debug for ObjectHandle {

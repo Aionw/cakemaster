@@ -24,6 +24,22 @@ pub enum ObjectCatalogConfigError {
     ZeroPendingTimeout,
     #[error("`max_retired_bytes` must be greater than zero")]
     ZeroMaxRetiredBytes,
+    #[error(
+        "default soft-pin TTL ({default_soft_pin_ttl_ticks}) must not exceed the maximum ({max_soft_pin_ttl_ticks})"
+    )]
+    DefaultSoftPinTtlExceedsMaximum {
+        default_soft_pin_ttl_ticks: u64,
+        max_soft_pin_ttl_ticks: u64,
+    },
+    #[error("soft-pin TTL is only valid with the enable action")]
+    SoftPinTtlRequiresEnable,
+    #[error(
+        "soft-pin TTL ({soft_pin_ttl_ticks}) exceeds the configured maximum ({max_soft_pin_ttl_ticks})"
+    )]
+    SoftPinTtlExceedsMaximum {
+        soft_pin_ttl_ticks: u64,
+        max_soft_pin_ttl_ticks: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -103,6 +119,8 @@ pub enum RemoveError {
     NotReady,
     #[error("object is leased until catalog tick {}", .expires_at.get())]
     Leased { expires_at: CatalogTick },
+    #[error("object is hard-pinned")]
+    HardPinned,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -113,6 +131,8 @@ pub enum ObjectRemoveError {
     NotReady,
     #[error("object is leased until catalog tick {}", .expires_at.get())]
     Leased { expires_at: CatalogTick },
+    #[error("object is hard-pinned")]
+    HardPinned,
 }
 
 impl From<RemoveError> for ObjectRemoveError {
@@ -121,6 +141,7 @@ impl From<RemoveError> for ObjectRemoveError {
             RemoveError::NotFound => Self::NotFound,
             RemoveError::NotReady => Self::NotReady,
             RemoveError::Leased { expires_at } => Self::Leased { expires_at },
+            RemoveError::HardPinned => Self::HardPinned,
         }
     }
 }

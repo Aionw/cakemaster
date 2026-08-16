@@ -16,7 +16,7 @@ async WrappedMasterService handler
         ├── ServiceReady / GetStorageConfig → 固定 wire 兼容配置
         ├── Ping / segment lifecycle → ClientManager → ClientRegistry + SegmentPool
         └── object RPC → ObjectManager / TenantObjectManager
-                         ├── ObjectCatalog：key 生命周期、owner、lease、回收状态
+                         ├── ObjectCatalog：key 生命周期、owner、lease、pin、回收状态
                          └── ReplicaAllocator：placement 与 SegmentPool reservation
 ```
 
@@ -135,7 +135,7 @@ Catalog node 的对外 lifecycle 收敛为 `Claimed`、`Pending`、`Published`�
 3. 让 `ReplicaAllocator` 按 placement plan 预留空间。
 4. 把 reservation 转成由 catalog 持有的 `ReplicaSet`，并将 claim stage 为
    pending object。
-5. Catalog node 只保留纯身份 `WriteOwner`、`WriteId`、replica 和超时 deadline；
+5. Catalog node 只保留纯身份 `WriteOwner`、`WriteId`、replica、pin 和超时 deadline；
    start/stage 使用的 `WriteAdmission` fence 随 claim 离开后即释放，Manager 丢弃临时
    ticket，向 RPC 返回可写 descriptor。
 
@@ -158,15 +158,27 @@ revoke 删除。
 timeout 或 client session fencing 都会恢复旧 generation。同一对象已有 pending write 时
 当前仍返回冲突，不实现上游 UpsertStart 对旧 PROCESSING writer 的立即抢占。
 
-`remove` 只删除已发布对象；普通删除受 lease 保护，`force=true` 绕过 lease。pending 或
+pin 变更与 write transaction 一起提交：`ENABLE` 使用请求 TTL，缺省为 30 分钟，单次
+请求上限为 24 小时；`PRESERVE`/`DISABLE` 携带 TTL 会被拒绝，`ENABLE + 0` 表示提交后
+没有 soft pin。deadline 从 `finish_put_at` 的提交 tick 起算。Upsert 的 soft pin action
+只在 End 生效，Revoke、timeout 和 session fence 都保留旧 deadline；同尺寸
+`PRESERVE` 保留 deadline，`ENABLE` 刷新，`DISABLE` 清除。hard pin 对普通 Put 在创建时
+固定；同尺寸 Upsert 不改变它，变尺寸 replacement 会保留旧 hard pin，并允许请求把它
+从 false 提升为 true。
+
+`remove` 只删除已发布对象；普通删除受 lease 和 hard pin 保护，`force=true` 同时绕过
+两者。pending 或
 upsert 中对象返回 `REPLICA_IS_NOT_READY`，缺失对象返回 `OBJECT_NOT_FOUND`。batch 删除逐项
 返回结果；regex/all 删除只统计实际成功删除的对象，并跳过仍受保护或未完成的对象。
-当前没有 hard pin 和 replication task，因此 force 尚没有这两类额外状态可绕过或检查。
+wire 没有 hard-pin 专用错误码，普通删除 hard-pinned 对象复用 `OBJECT_HAS_LEASE`。
+replication task 仍未建模，因此 force 不会绕过这类尚不存在的状态。
 
 `get` 只返回完整 publish 的对象并刷新 lease，pending object 返回
 `REPLICA_IS_NOT_READY`。`exists` 与 get 使用同一可见性和 lease 语义，但只返回
 bool。`maintenance(now, budget)` 由 catalog 的单一 bounded collector 同时处理到期
-pending write、淘汰、物理回收和空 slot；它不会在一次调用中无限扫描。诊断 snapshot
+soft pin、pending write、淘汰、物理回收和空 slot；soft-pin queue 每步最多扫描
+`max_candidates` 个注册项，旧 generation 和被刷新 deadline 的 stale 项通过 weak node
+与 deadline CAS 自动失效，不需要全表扫描。它不会在一次调用中无限扫描。诊断 snapshot
 同时暴露各 candidate queue 深度，用于发现清理吞吐落后于写入吞吐。
 
 ## ReplicaAllocator 具体负责什么
@@ -195,8 +207,9 @@ pending write、淘汰、物理回收和空 slot；它不会在一次调用中�
 | `replica_num == 0, nof_replica_num > 0` | NoF，all-or-nothing |
 | Memory 与 NoF 同时请求 | `INVALID_PARAMS` |
 | preferred Memory/NoF segment | 转成 placement preferred names |
-| soft pin `PRESERVE` 或无 TTL 的 `DISABLE` | 接受；当前对象保持未 soft-pin 状态 |
-| soft pin `ENABLE`、任意 request TTL、hard pin、same-node、host/group | `INVALID_PARAMS`，避免静默降级 |
+| soft pin `PRESERVE/ENABLE/DISABLE` | 完整接入事务；TTL 只允许用于 `ENABLE`，缺省 30 分钟、最大 24 小时、0 表示不 pin |
+| hard pin | 保存到 metadata；eviction 永远跳过，普通 Remove 拒绝，force Remove 可删除 |
+| same-node、host/group | `INVALID_PARAMS`，避免静默降级 |
 | Disk/LocalDisk selector | `INVALID_PARAMS` |
 | `ObjectMeta.object_checksum=Some(...)` | `INVALID_PARAMS` |
 | Get/BatchGet checksum | 永远返回 `None` |
@@ -209,7 +222,7 @@ pending write、淘汰、物理回收和空 slot；它不会在一次调用中�
 | `UnmountSegment` | 立即摘除单个 segment；不存在幂等成功，client session 保持 active |
 | `GracefulUnmountSegment` | 立即停止新分配并在 grace deadline 摘除；不存在返回 `SEGMENT_NOT_FOUND`；依赖显式运行的 `MasterReconciler` |
 | `UpsertStart/End/Revoke` + batch | 缺失 key 等价 put；同尺寸复用 allocation；变尺寸保留旧 generation 并支持 end/revoke/timeout/session-fence 回滚 |
-| `Remove` / `BatchRemove` | 普通模式遵守 lease，force 绕过 lease；pending/upsert 中对象拒绝删除 |
+| `Remove` / `BatchRemove` | 普通模式遵守 lease 和 hard pin，force 同时绕过两者；pending/upsert 中对象拒绝删除 |
 | `RemoveByRegex` / `RemoveAll` | 删除所有当前可删除的匹配对象并返回成功数量；multi-tenant 下空 tenant 的 `RemoveAll` 覆盖所有租户 |
 | tenant id（single 构造） | 忽略并统一映射到 `NamespaceId::DEFAULT` |
 | tenant id（multi 构造） | 映射到隔离 namespace；未知租户和超额分别返回现有 tenant 错误码 |
@@ -222,8 +235,26 @@ pending write、淘汰、物理回收和空 slot；它不会在一次调用中�
 RPC adapter 本身已经是薄层。tenant quota 已按 Memory/NoF 分账，并通过 scoped
 filter 在现有 generation queue 上定向回收；整体物理水位控制仍由部署侧 controller
 决定。支持混合 Memory+NoF replica 仍需要把一个 object plan 从单 class 扩展成多
-class 子计划及原子回滚。group、checksum 和 pin 是当前明确不支持的能力，不在 RPC
-层用占位实现掩盖。tenant 的完整约束见 `docs/tenant_quota.md`。
+class 子计划及原子回滚。group 和 checksum 是当前明确不支持的能力，不在 RPC
+层用占位实现掩盖。pin 已覆盖内存态生命周期，但尚无 snapshot/oplog 恢复和独立指标。
+tenant 的完整约束见 `docs/tenant_quota.md`。
+
+## 与当前 C++ Mooncake 的已知边角差异
+
+行为核对基于本机 `/home/aione/src/cpp/Mooncake` 的 `07422af7d81eb905fb8054c0f8f87bea243343f7`
+源码（其 `extern/yalantinglibs` 子模块有本地改动，但不影响 Master pin 逻辑）。本实现对齐提交/回滚、Upsert preserve/enable/disable、hard-pin eviction 保护以及 TTL
+校验等可观察语义，但没有复制 C++ 内部数据结构：Rust 使用单调 `CatalogTick`、原子
+deadline 和现有 bounded collector；C++ 使用 system clock、deadline index 和 metadata
+shard。仍有这些已知差异：
+
+- C++ 在允许 soft-pin eviction 时做“先无 pin、仍不足再 soft pin”的全局两阶段选择；
+  Rust 在有界分代队列内允许该候选，不能保证跨全部对象的严格 soft-pin 低优先级。
+- 本实现按需求让非 force Remove 受 hard pin 保护、force 同时绕过 lease/hard pin；当前
+  C++ `Remove` 实际只检查 lease，hard pin 主要保护 eviction，因此这是有意的安全增强。
+- C++ 对 mixed Memory/NoF 的 pending pin action 可在首个合格 replica 完成时提交，并让
+  后续 replica End 不刷新 TTL；Rust 当前每个对象只支持单一 replica class，End 一次提交
+  整个对象，所以还没有该 partial-End 边角。
+- pin metadata 仍是纯内存状态，服务重启不会恢复；也尚未接入上游 soft-pin key metric。
 
 实现入口：
 
