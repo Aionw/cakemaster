@@ -104,18 +104,42 @@ struct LifecycleCounters {
     retired_bytes: AtomicU64,
 }
 
+/// Mutable state owned by the incremental collector. The nested groups make
+/// synchronization and accounting ownership explicit without leaking that
+/// shape into the public, metrics-oriented stats snapshot.
 struct CollectorState {
+    eviction: EvictionQueues,
+    pending: PendingQueue,
+    retired: SegQueue<RetiredObject>,
+    empty_slots: SegQueue<EmptySlotCandidate>,
+    step_gate: Mutex<()>,
+    reclaim: ReclaimDebt,
+    liveness: LivenessSweep,
+}
+
+struct EvictionQueues {
     young: SegQueue<GcCandidate>,
     protected: SegQueue<GcCandidate>,
-    pending: SegQueue<PendingCandidate>,
-    empty_slots: SegQueue<EmptySlotCandidate>,
-    retired: SegQueue<RetiredObject>,
-    gate: Mutex<()>,
-    pending_stage_gate: RwLock<()>,
-    reclaim_debt: AtomicU64,
-    liveness_scan_requested: AtomicBool,
-    liveness_young_remaining: AtomicUsize,
-    liveness_protected_remaining: AtomicUsize,
+}
+
+/// The queue and gate form one producer/cleanup synchronization boundary.
+struct PendingQueue {
+    candidates: SegQueue<PendingCandidate>,
+    stage_gate: RwLock<()>,
+}
+
+/// Independent reclaim producers share physical progress, but retain their
+/// own remaining debt so refreshing one source never erases the other.
+struct ReclaimDebt {
+    requested: AtomicU64,
+    watermark: AtomicU64,
+}
+
+/// Progress of a bounded segment-liveness sweep across both eviction queues.
+struct LivenessSweep {
+    requested: AtomicBool,
+    young_remaining: AtomicUsize,
+    protected_remaining: AtomicUsize,
 }
 
 struct ObjectSlot {
@@ -266,31 +290,9 @@ impl ObjectCatalog {
         Ok(Self {
             inner: Arc::new(CatalogInner {
                 config,
-                index: CatalogIndex {
-                    entries: HashMap::with_capacity(config.expected_objects),
-                    slots: AtomicUsize::new(0),
-                },
-                lifecycle: LifecycleCounters {
-                    claims: AtomicUsize::new(0),
-                    pending_objects: AtomicUsize::new(0),
-                    published_objects: AtomicUsize::new(0),
-                    pending_bytes: AtomicU64::new(0),
-                    live_bytes: AtomicU64::new(0),
-                    retired_bytes: AtomicU64::new(0),
-                },
-                collector: CollectorState {
-                    young: SegQueue::new(),
-                    protected: SegQueue::new(),
-                    pending: SegQueue::new(),
-                    empty_slots: SegQueue::new(),
-                    retired: SegQueue::new(),
-                    gate: Mutex::new(()),
-                    pending_stage_gate: RwLock::new(()),
-                    reclaim_debt: AtomicU64::new(0),
-                    liveness_scan_requested: AtomicBool::new(false),
-                    liveness_young_remaining: AtomicUsize::new(0),
-                    liveness_protected_remaining: AtomicUsize::new(0),
-                },
+                index: CatalogIndex::new(config.expected_objects),
+                lifecycle: LifecycleCounters::new(),
+                collector: CollectorState::new(),
             }),
         })
     }
@@ -307,18 +309,13 @@ impl ObjectCatalog {
             pending_bytes: lifecycle.pending_bytes.load(Ordering::Relaxed),
             live_bytes: lifecycle.live_bytes.load(Ordering::Relaxed),
             retired_bytes: lifecycle.retired_bytes.load(Ordering::Relaxed),
-            reclaim_debt: collector.reclaim_debt.load(Ordering::Relaxed),
-            pending_candidates: collector.pending.len(),
-            liveness_scan_remaining: collector
-                .liveness_young_remaining
-                .load(Ordering::Relaxed)
-                .saturating_add(
-                    collector
-                        .liveness_protected_remaining
-                        .load(Ordering::Relaxed),
-                ),
-            young_candidates: collector.young.len(),
-            protected_candidates: collector.protected.len(),
+            reclaim_debt: collector.reclaim.outstanding(),
+            requested_reclaim_debt: collector.reclaim.requested(),
+            watermark_reclaim_debt: collector.reclaim.watermark(),
+            pending_candidates: collector.pending.candidates.len(),
+            liveness_scan_remaining: collector.liveness.remaining(),
+            young_candidates: collector.eviction.young.len(),
+            protected_candidates: collector.eviction.protected.len(),
             retired_candidates: collector.retired.len(),
             empty_slot_candidates: collector.empty_slots.len(),
         }
@@ -356,6 +353,13 @@ impl CatalogInner {
 }
 
 impl CatalogIndex {
+    fn new(expected_objects: usize) -> Self {
+        Self {
+            entries: HashMap::with_capacity(expected_objects),
+            slots: AtomicUsize::new(0),
+        }
+    }
+
     fn on_slot_inserted(&self) {
         self.slots.fetch_add(1, Ordering::Relaxed);
     }
@@ -372,11 +376,25 @@ impl CatalogInner {
         debug_assert_eq!(node.mutation.state(), ObjectState::Updating);
         node.mutation.rollback_in_place_update();
         node.mutation.store(ObjectState::Published);
-        self.collector.young.push(GcCandidate::new(slot, node));
+        self.collector
+            .eviction
+            .young
+            .push(GcCandidate::new(slot, node));
     }
 }
 
 impl LifecycleCounters {
+    const fn new() -> Self {
+        Self {
+            claims: AtomicUsize::new(0),
+            pending_objects: AtomicUsize::new(0),
+            published_objects: AtomicUsize::new(0),
+            pending_bytes: AtomicU64::new(0),
+            live_bytes: AtomicU64::new(0),
+            retired_bytes: AtomicU64::new(0),
+        }
+    }
+
     fn on_claim(&self) {
         self.claims.fetch_add(1, Ordering::Relaxed);
     }
@@ -423,12 +441,103 @@ impl LifecycleCounters {
 }
 
 impl CollectorState {
-    fn request_reclaim(&self, bytes: u64) {
-        self.reclaim_debt.fetch_max(bytes, Ordering::Relaxed);
+    fn new() -> Self {
+        Self {
+            eviction: EvictionQueues::new(),
+            pending: PendingQueue::new(),
+            retired: SegQueue::new(),
+            empty_slots: SegQueue::new(),
+            step_gate: Mutex::new(()),
+            reclaim: ReclaimDebt::new(),
+            liveness: LivenessSweep::new(),
+        }
+    }
+}
+
+impl EvictionQueues {
+    fn new() -> Self {
+        Self {
+            young: SegQueue::new(),
+            protected: SegQueue::new(),
+        }
+    }
+}
+
+impl PendingQueue {
+    fn new() -> Self {
+        Self {
+            candidates: SegQueue::new(),
+            stage_gate: RwLock::new(()),
+        }
+    }
+}
+
+impl ReclaimDebt {
+    const fn new() -> Self {
+        Self {
+            requested: AtomicU64::new(0),
+            watermark: AtomicU64::new(0),
+        }
+    }
+
+    fn request(&self, bytes: u64) {
+        self.requested.fetch_max(bytes, Ordering::Relaxed);
+    }
+
+    fn set_watermark(&self, bytes: u64) {
+        self.watermark.store(bytes, Ordering::Relaxed);
+    }
+
+    fn requested(&self) -> u64 {
+        self.requested.load(Ordering::Relaxed)
+    }
+
+    fn watermark(&self) -> u64 {
+        self.watermark.load(Ordering::Relaxed)
+    }
+
+    fn outstanding(&self) -> u64 {
+        self.requested().max(self.watermark())
     }
 
     fn on_reclaim(&self, bytes: u64) {
-        atomic_saturating_sub(&self.reclaim_debt, bytes);
+        atomic_saturating_sub(&self.requested, bytes);
+        atomic_saturating_sub(&self.watermark, bytes);
+    }
+}
+
+impl LivenessSweep {
+    const fn new() -> Self {
+        Self {
+            requested: AtomicBool::new(false),
+            young_remaining: AtomicUsize::new(0),
+            protected_remaining: AtomicUsize::new(0),
+        }
+    }
+
+    fn request(&self) {
+        self.requested.store(true, Ordering::Release);
+    }
+
+    fn remaining(&self) -> usize {
+        self.young_remaining
+            .load(Ordering::Relaxed)
+            .saturating_add(self.protected_remaining.load(Ordering::Relaxed))
+    }
+
+    fn begin_if_requested(&self, eviction: &EvictionQueues) {
+        if !self.requested.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        self.young_remaining
+            .fetch_max(eviction.young.len(), Ordering::Release);
+        self.protected_remaining
+            .fetch_max(eviction.protected.len(), Ordering::Release);
+    }
+
+    fn is_incomplete(&self) -> bool {
+        self.young_remaining.load(Ordering::Acquire) != 0
+            || self.protected_remaining.load(Ordering::Acquire) != 0
     }
 }
 

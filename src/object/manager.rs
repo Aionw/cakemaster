@@ -7,6 +7,7 @@ use super::error::{
     LookupError, ObjectCatalogConfigError, ObjectManagerError, ObjectRemoveError, PublishError,
     RevokeError,
 };
+use super::eviction::{MemoryEvictionConfig, MemoryEvictionController, MemoryEvictionStats};
 use super::identity::{NamespaceId, ObjectIdentity, ObjectLookup};
 use super::reclamation::{CatalogTick, CollectBudget, CollectReport, ReclaimTarget};
 use super::replica::{ReplicaId, ReplicaLease, ReplicaSet};
@@ -22,6 +23,7 @@ pub struct ObjectManager {
     catalog: ObjectCatalog,
     allocator: ReplicaAllocator,
     observed_segment_epoch: AtomicU64,
+    memory_eviction: Option<MemoryEvictionController>,
 }
 
 /// Narrow capability for revoking pending writes after their sessions fence.
@@ -141,6 +143,7 @@ impl PreparedPut {
 pub struct ObjectManagerMaintenance {
     pub expired_writes: usize,
     pub catalog: CollectReport,
+    pub memory_eviction: Option<MemoryEvictionStats>,
 }
 
 impl ObjectManager {
@@ -153,11 +156,29 @@ impl ObjectManager {
         pool: Arc<SegmentPool>,
         config: ObjectCatalogConfig,
     ) -> Result<Self, ObjectCatalogConfigError> {
+        Self::with_optional_eviction(pool, config, None)
+    }
+
+    /// Creates a manager with production memory-watermark eviction enabled.
+    pub fn with_eviction_config(
+        pool: Arc<SegmentPool>,
+        config: ObjectCatalogConfig,
+        eviction: MemoryEvictionConfig,
+    ) -> Result<Self, ObjectCatalogConfigError> {
+        Self::with_optional_eviction(pool, config, Some(MemoryEvictionController::new(eviction)))
+    }
+
+    fn with_optional_eviction(
+        pool: Arc<SegmentPool>,
+        config: ObjectCatalogConfig,
+        memory_eviction: Option<MemoryEvictionController>,
+    ) -> Result<Self, ObjectCatalogConfigError> {
         let observed_segment_epoch = pool.invalidation_epoch();
         Ok(Self {
             catalog: ObjectCatalog::with_config(config)?,
             allocator: ReplicaAllocator::new(pool),
             observed_segment_epoch: AtomicU64::new(observed_segment_epoch),
+            memory_eviction,
         })
     }
 
@@ -173,6 +194,19 @@ impl ObjectManager {
 
     pub fn pool(&self) -> &Arc<SegmentPool> {
         self.allocator.pool()
+    }
+
+    /// Returns production memory-eviction diagnostics when the controller is enabled.
+    pub fn memory_eviction_stats(&self) -> Option<MemoryEvictionStats> {
+        self.memory_eviction
+            .as_ref()
+            .map(MemoryEvictionController::stats)
+    }
+
+    pub(crate) fn memory_eviction_notify(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.memory_eviction
+            .as_ref()
+            .map(MemoryEvictionController::notify)
     }
 
     pub fn start_put(
@@ -208,8 +242,35 @@ impl ObjectManager {
         now: CatalogTick,
     ) -> Result<PreparedPut, ObjectManagerError> {
         self.validate_plan(&plan)?;
-        let claim = self.catalog.claim_put(identity, admission, now)?;
-        self.prepare_claimed_put(claim, plan)
+        let retry_limit = self.allocation_retry_limit(plan.placement().replica_class());
+        let mut retries = 0;
+        loop {
+            let claim = self
+                .catalog
+                .claim_put(identity.clone(), admission.clone(), now)?;
+            match self.prepare_claimed_put(claim, plan.clone()) {
+                Ok(prepared) => {
+                    if retries != 0 {
+                        self.record_allocation_retry_success();
+                    }
+                    return Ok(prepared);
+                }
+                Err(ObjectManagerError::NoAvailableReplicas) => {
+                    let made_progress = plan.placement().replica_class() == ReplicaClass::Memory
+                        && self.evict_after_allocation_failure(
+                            allocation_failure_reclaim_bytes(&plan),
+                            plan.placement().allocation().bytes(),
+                            now,
+                        );
+                    if retries >= retry_limit || !made_progress {
+                        return Err(ObjectManagerError::NoAvailableReplicas);
+                    }
+                    retries += 1;
+                    self.record_allocation_retry();
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     pub(super) fn prepare_upsert(
@@ -220,38 +281,70 @@ impl ObjectManager {
         now: CatalogTick,
     ) -> Result<PreparedUpsert, ObjectManagerError> {
         self.validate_plan(&plan)?;
-        match self
-            .catalog
-            .claim_upsert(identity, admission, plan.content(), now)?
-        {
-            UpsertClaim::Reuse(ticket) => {
-                let started = {
-                    let replicas = ticket.replicas();
-                    if replicas.is_empty() || replicas.iter().any(|replica| !replica.is_live()) {
-                        Err(ObjectManagerError::NoAvailableReplicas)
-                    } else {
-                        replicas
-                            .first()
-                            .and_then(ReplicaLease::direct)
-                            .map(|replica| replica.replica_class())
-                            .ok_or(ObjectManagerError::Internal)
-                            .and_then(|replica_class| started_put(replica_class, replicas.iter()))
+        let retry_limit = self.allocation_retry_limit(plan.placement().replica_class());
+        let mut retries = 0;
+        loop {
+            match self.catalog.claim_upsert(
+                identity.clone(),
+                admission.clone(),
+                plan.content(),
+                now,
+            )? {
+                UpsertClaim::Reuse(ticket) => {
+                    let started = {
+                        let replicas = ticket.replicas();
+                        if replicas.is_empty() || replicas.iter().any(|replica| !replica.is_live())
+                        {
+                            Err(ObjectManagerError::NoAvailableReplicas)
+                        } else {
+                            replicas
+                                .first()
+                                .and_then(ReplicaLease::direct)
+                                .map(|replica| replica.replica_class())
+                                .ok_or(ObjectManagerError::Internal)
+                                .and_then(|replica_class| {
+                                    started_put(replica_class, replicas.iter())
+                                })
+                        }
+                    };
+                    let started = match started {
+                        Ok(started) => started,
+                        Err(error) => {
+                            // The catalog is already hidden in the upserting state. Restore the
+                            // published generation if its reusable descriptors cannot be returned.
+                            let _ = self.catalog.revoke(&ticket, now);
+                            return Err(error);
+                        }
+                    };
+                    if retries != 0 {
+                        self.record_allocation_retry_success();
                     }
-                };
-                let started = match started {
-                    Ok(started) => started,
-                    Err(error) => {
-                        // The catalog is already hidden in the upserting state. Restore the
-                        // published generation if its reusable descriptors cannot be returned.
-                        let _ = self.catalog.revoke(&ticket, now);
-                        return Err(error);
+                    return Ok(PreparedUpsert::Reused(started));
+                }
+                UpsertClaim::Write(claim) => match self.prepare_claimed_put(claim, plan.clone()) {
+                    Ok(prepared) => {
+                        if retries != 0 {
+                            self.record_allocation_retry_success();
+                        }
+                        return Ok(PreparedUpsert::Write(prepared));
                     }
-                };
-                Ok(PreparedUpsert::Reused(started))
+                    Err(ObjectManagerError::NoAvailableReplicas) => {
+                        let made_progress = plan.placement().replica_class()
+                            == ReplicaClass::Memory
+                            && self.evict_after_allocation_failure(
+                                allocation_failure_reclaim_bytes(&plan),
+                                plan.placement().allocation().bytes(),
+                                now,
+                            );
+                        if retries >= retry_limit || !made_progress {
+                            return Err(ObjectManagerError::NoAvailableReplicas);
+                        }
+                        retries += 1;
+                        self.record_allocation_retry();
+                    }
+                    Err(error) => return Err(error),
+                },
             }
-            UpsertClaim::Write(claim) => self
-                .prepare_claimed_put(claim, plan)
-                .map(PreparedUpsert::Write),
         }
     }
 
@@ -457,10 +550,33 @@ impl ObjectManager {
         {
             self.catalog.request_liveness_scan();
         }
-        let catalog = self.catalog.collect_step_with_targets(now, budget, targets);
+        let watermark_reclaim = self.memory_eviction.as_ref().map(|eviction| {
+            eviction.prepare_step(
+                self.pool().space_for(ReplicaClass::Memory),
+                self.catalog.stats(),
+            )
+        });
+        let catalog = self.catalog.collect_step_with_targets_and_watermark(
+            now,
+            budget,
+            targets,
+            watermark_reclaim,
+        );
+        if let Some(eviction) = &self.memory_eviction {
+            let active = eviction.finish_step(
+                self.pool().space_for(ReplicaClass::Memory),
+                self.catalog.stats(),
+                catalog,
+            );
+            if !active && self.catalog.stats().watermark_reclaim_debt != 0 {
+                self.catalog.try_clear_watermark_reclaim();
+            }
+            eviction.refresh_catalog(self.catalog.stats());
+        }
         ObjectManagerMaintenance {
             expired_writes: catalog.expired_pending,
             catalog,
+            memory_eviction: self.memory_eviction_stats(),
         }
     }
 
@@ -476,6 +592,64 @@ impl ObjectManager {
             return Err(ObjectManagerError::InvalidPlan);
         }
         Ok(())
+    }
+
+    fn allocation_retry_limit(&self, replica_class: ReplicaClass) -> usize {
+        if replica_class != ReplicaClass::Memory {
+            return 0;
+        }
+        self.memory_eviction
+            .as_ref()
+            .map_or(0, |eviction| eviction.config().allocation_retry_limit())
+    }
+
+    fn evict_after_allocation_failure(
+        &self,
+        reclaim_bytes: u64,
+        allocation_bytes: u64,
+        now: CatalogTick,
+    ) -> bool {
+        let Some(eviction) = &self.memory_eviction else {
+            return false;
+        };
+        eviction.record_allocation_failure();
+        self.catalog.request_reclaim(reclaim_bytes);
+        let before = self.pool().space_for(ReplicaClass::Memory);
+        let report = self
+            .maintenance(now, eviction.config().allocation_failure_budget())
+            .catalog;
+        let after = self.pool().space_for(ReplicaClass::Memory);
+        let should_retry = !report.busy
+            && after.largest_free_region_bytes >= allocation_bytes
+            && (report.reclaimed_bytes != 0
+                || after.used_bytes < before.used_bytes
+                || after.largest_free_region_bytes > before.largest_free_region_bytes);
+        log::debug!(
+            target: "cakemaster::object::eviction",
+            reclaim_bytes = reclaim_bytes,
+            allocation_bytes = allocation_bytes,
+            used_bytes_before = before.used_bytes,
+            used_bytes_after = after.used_bytes,
+            largest_free_region_before = before.largest_free_region_bytes,
+            largest_free_region_after = after.largest_free_region_bytes,
+            reclaimed_bytes = report.reclaimed_bytes,
+            collector_busy = report.busy,
+            should_retry = should_retry;
+            "bounded allocation-failure eviction completed"
+        );
+        should_retry
+    }
+
+    fn record_allocation_retry(&self) {
+        if let Some(eviction) = &self.memory_eviction {
+            eviction.record_allocation_retry();
+        }
+    }
+
+    fn record_allocation_retry_success(&self) {
+        if let Some(eviction) = &self.memory_eviction {
+            eviction.record_allocation_retry_success();
+        }
     }
 }
 
@@ -504,6 +678,14 @@ fn started_put<'a>(
         replica_class,
         replicas,
     })
+}
+
+fn allocation_failure_reclaim_bytes(plan: &ObjectPutPlan) -> u64 {
+    let replica_count = u64::try_from(plan.placement().replicas().count()).unwrap_or(u64::MAX);
+    plan.placement()
+        .allocation()
+        .bytes()
+        .saturating_mul(replica_count)
 }
 
 fn validate_pending(

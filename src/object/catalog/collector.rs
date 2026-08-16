@@ -70,20 +70,25 @@ impl ObjectCatalog {
     }
 
     pub fn request_reclaim(&self, bytes: u64) {
-        self.inner.collector.request_reclaim(bytes);
+        self.inner.collector.reclaim.request(bytes);
     }
 
     /// Requests one bounded liveness sweep after segment membership changes.
     /// Repeated requests extend the current sweep to cover the full queue.
     pub(in crate::object) fn request_liveness_scan(&self) {
-        self.inner
-            .collector
-            .liveness_scan_requested
-            .store(true, Ordering::Release);
+        self.inner.collector.liveness.request();
     }
 
     pub fn collect_step(&self, now: CatalogTick, budget: CollectBudget) -> CollectReport {
         self.collect_step_with_targets(now, budget, &[])
+    }
+
+    pub(in super::super) fn try_clear_watermark_reclaim(&self) -> bool {
+        let Some(_collector) = self.inner.collector.step_gate.try_lock() else {
+            return false;
+        };
+        self.inner.collector.reclaim.set_watermark(0);
+        true
     }
 
     pub(in super::super) fn collect_step_with_targets(
@@ -92,28 +97,31 @@ impl ObjectCatalog {
         budget: CollectBudget,
         targets: &[ReclaimTarget],
     ) -> CollectReport {
-        let Some(_collector) = self.inner.collector.gate.try_lock() else {
+        self.collect_step_with_targets_and_watermark(now, budget, targets, None)
+    }
+
+    pub(in super::super) fn collect_step_with_targets_and_watermark(
+        &self,
+        now: CatalogTick,
+        budget: CollectBudget,
+        targets: &[ReclaimTarget],
+        watermark_reclaim_bytes: Option<u64>,
+    ) -> CollectReport {
+        let Some(_collector) = self.inner.collector.step_gate.try_lock() else {
             return CollectReport {
                 busy: true,
                 ..CollectReport::default()
             };
         };
 
-        if self
-            .inner
-            .collector
-            .liveness_scan_requested
-            .swap(false, Ordering::AcqRel)
-        {
-            self.inner
-                .collector
-                .liveness_young_remaining
-                .fetch_max(self.inner.collector.young.len(), Ordering::Release);
-            self.inner
-                .collector
-                .liveness_protected_remaining
-                .fetch_max(self.inner.collector.protected.len(), Ordering::Release);
+        if let Some(bytes) = watermark_reclaim_bytes {
+            self.inner.collector.reclaim.set_watermark(bytes);
         }
+
+        self.inner
+            .collector
+            .liveness
+            .begin_if_requested(&self.inner.collector.eviction);
 
         // Pending expiration has its own queue allowance. Liveness, scoped
         // eviction, and global eviction share the eviction allowance. Normal
@@ -124,18 +132,7 @@ impl ObjectCatalog {
             .inner
             .retire_invalidated_published(now, budget, &mut report);
         self.inner.expire_pending(now, budget, &mut report);
-        let liveness_incomplete = self
-            .inner
-            .collector
-            .liveness_young_remaining
-            .load(Ordering::Acquire)
-            != 0
-            || self
-                .inner
-                .collector
-                .liveness_protected_remaining
-                .load(Ordering::Acquire)
-                != 0;
+        let liveness_incomplete = self.inner.collector.liveness.is_incomplete();
         if !liveness_incomplete {
             let eviction_budget = CollectBudget::new(
                 budget.max_candidates.saturating_sub(liveness_scanned),
@@ -169,12 +166,12 @@ impl CatalogInner {
     ) -> usize {
         let generations = [
             (
-                &self.collector.young,
-                &self.collector.liveness_young_remaining,
+                &self.collector.eviction.young,
+                &self.collector.liveness.young_remaining,
             ),
             (
-                &self.collector.protected,
-                &self.collector.liveness_protected_remaining,
+                &self.collector.eviction.protected,
+                &self.collector.liveness.protected_remaining,
             ),
         ];
         // Budgets may intentionally be unbounded (`usize::MAX`) for drain-style
@@ -237,7 +234,7 @@ impl CatalogInner {
                         let stale_bytes = stale.reserved_bytes();
                         node.release_pruned_accounting(&stale);
                         self.lifecycle.on_prune_published(stale_bytes);
-                        self.collector.on_reclaim(stale_bytes);
+                        self.collector.reclaim.on_reclaim(stale_bytes);
                         drop(write);
                         resources.extend(stale);
                         report.pruned_objects += 1;
@@ -345,6 +342,7 @@ impl CatalogInner {
                 return false;
             };
             self.collector
+                .eviction
                 .young
                 .push(GcCandidate::new(&slot, &previous));
             self.retire_rolled_back_pending(node.clone(), now);
@@ -369,11 +367,11 @@ impl CatalogInner {
             return 0;
         }
 
-        let _collector = self.collector.gate.lock();
+        let _collector = self.collector.step_gate.lock();
         let candidates = {
-            let _stages = self.collector.pending_stage_gate.write();
-            let mut candidates = Vec::with_capacity(self.collector.pending.len());
-            while let Some(pending) = self.collector.pending.pop() {
+            let _stages = self.collector.pending.stage_gate.write();
+            let mut candidates = Vec::with_capacity(self.collector.pending.candidates.len());
+            while let Some(pending) = self.collector.pending.candidates.pop() {
                 candidates.push(pending);
             }
             candidates
@@ -384,7 +382,7 @@ impl CatalogInner {
                 continue;
             };
             if !owners.contains(&node.owner()) {
-                self.collector.pending.push(pending);
+                self.collector.pending.candidates.push(pending);
                 continue;
             }
             if self.try_revoke_pending(slot, node, pending.write_id, now) {
@@ -448,9 +446,14 @@ impl CatalogInner {
         budget: CollectBudget,
         report: &mut CollectReport,
     ) {
-        let candidates = self.collector.pending.len().min(budget.max_candidates);
+        let candidates = self
+            .collector
+            .pending
+            .candidates
+            .len()
+            .min(budget.max_candidates);
         for _ in 0..candidates {
-            let Some(pending) = self.collector.pending.pop() else {
+            let Some(pending) = self.collector.pending.candidates.pop() else {
                 break;
             };
             let Some((slot, node)) = self.resolve_pending_candidate(&pending) else {
@@ -463,7 +466,7 @@ impl CatalogInner {
                 continue;
             }
             if pending.deadline > now {
-                self.collector.pending.push(pending);
+                self.collector.pending.candidates.push(pending);
                 continue;
             }
             if self.try_revoke_pending(slot, node, pending.write_id, now) {
@@ -481,10 +484,14 @@ impl CatalogInner {
         // Snapshot both generation sizes before scanning. An object promoted
         // from young to protected must not be reconsidered in the same pause.
         let generations = [
-            (&self.collector.young, self.collector.young.len(), false),
             (
-                &self.collector.protected,
-                self.collector.protected.len(),
+                &self.collector.eviction.young,
+                self.collector.eviction.young.len(),
+                false,
+            ),
+            (
+                &self.collector.eviction.protected,
+                self.collector.eviction.protected.len(),
                 true,
             ),
         ];
@@ -527,10 +534,14 @@ impl CatalogInner {
         // All scopes share the existing generation queues. A candidate is
         // scanned once and matched against the small active-debt set.
         let generations = [
-            (&self.collector.young, self.collector.young.len(), false),
             (
-                &self.collector.protected,
-                self.collector.protected.len(),
+                &self.collector.eviction.young,
+                self.collector.eviction.young.len(),
+                false,
+            ),
+            (
+                &self.collector.eviction.protected,
+                self.collector.eviction.protected.len(),
                 true,
             ),
         ];
@@ -603,8 +614,7 @@ impl CatalogInner {
     }
 
     fn reclaim_target_is_covered(&self) -> bool {
-        self.collector.reclaim_debt.load(Ordering::Relaxed)
-            <= self.lifecycle.retired_bytes.load(Ordering::Relaxed)
+        self.collector.reclaim.outstanding() <= self.lifecycle.retired_bytes.load(Ordering::Relaxed)
     }
 
     fn evict_candidate(
@@ -630,7 +640,7 @@ impl CatalogInner {
             return 0;
         }
         if node.access.take_recent() {
-            self.collector.protected.push(candidate);
+            self.collector.eviction.protected.push(candidate);
             return 0;
         }
         if node
@@ -643,7 +653,7 @@ impl CatalogInner {
 
         if node.access.is_leased(now) {
             node.mutation.store(ObjectState::Published);
-            self.collector.protected.push(candidate);
+            self.collector.eviction.protected.push(candidate);
             return 0;
         }
         if clear_slot(&slot, &node) {
@@ -666,9 +676,9 @@ impl CatalogInner {
             node.mutation.store(ObjectState::Published);
             drop(write);
             if from_protected {
-                self.collector.protected.push(candidate);
+                self.collector.eviction.protected.push(candidate);
             } else {
-                self.collector.young.push(candidate);
+                self.collector.eviction.young.push(candidate);
             }
             0
         }
@@ -700,7 +710,7 @@ impl CatalogInner {
                         .expect("retired objects always have records");
                     resources.extend(record.replicas.into_inner());
                     self.lifecycle.on_reclaim(retired.reserved_bytes);
-                    self.collector.on_reclaim(retired.reserved_bytes);
+                    self.collector.reclaim.on_reclaim(retired.reserved_bytes);
                     report.reclaimed_objects += 1;
                     report.reclaimed_bytes = report
                         .reclaimed_bytes

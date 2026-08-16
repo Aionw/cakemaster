@@ -274,10 +274,7 @@ impl ObjectCatalog {
                 // Segment incarnation invalidation is independent of the
                 // node gate, so publication needs one final liveness check.
                 if !ticket.node.record().replicas.read().all_live() {
-                    self.inner
-                        .collector
-                        .liveness_scan_requested
-                        .store(true, Ordering::Release);
+                    self.inner.collector.liveness.request();
                 }
             }
             ObjectState::Published => {
@@ -295,6 +292,7 @@ impl ObjectCatalog {
         }
         self.inner
             .collector
+            .eviction
             .young
             .push(GcCandidate::new(&slot, &ticket.node));
         Ok(ObjectHandle {
@@ -492,12 +490,16 @@ impl ObjectCatalog {
         node: &Arc<CatalogNode>,
         now: CatalogTick,
     ) {
-        let _stage = self.inner.collector.pending_stage_gate.read();
-        self.inner.collector.pending.push(PendingCandidate {
-            candidate: GcCandidate::new(slot, node),
-            write_id: node.write_id(),
-            deadline: now.saturating_add(self.inner.config.pending_timeout_ticks),
-        });
+        let _stage = self.inner.collector.pending.stage_gate.read();
+        self.inner
+            .collector
+            .pending
+            .candidates
+            .push(PendingCandidate {
+                candidate: GcCandidate::new(slot, node),
+                write_id: node.write_id(),
+                deadline: now.saturating_add(self.inner.config.pending_timeout_ticks),
+            });
     }
 
     fn lock_ticket<'ticket>(
@@ -645,6 +647,7 @@ impl Drop for PutClaim {
             catalog.lifecycle.on_claim_dropped();
             catalog
                 .collector
+                .eviction
                 .young
                 .push(GcCandidate::new(&slot, &previous));
         } else if clear_slot(&slot, &node) {

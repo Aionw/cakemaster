@@ -1,8 +1,57 @@
 # ObjectCatalog 与 Mooncake 同口径性能对比
 
-> 本页是固定在 Mooncake `8c6095c` wire 的历史性能记录。当前
-> `interop/mooncake_benchmark.cpp` 已随主线契约升级到 `5c0724d`；若要严格复现本文
-> 数据，需要检出记录该实验的仓库版本，不能直接使用当前互操作程序替代。
+> 2026-08-10 的对比固定在 Mooncake `8c6095c` wire，是历史性能记录。当前
+> `interop/mooncake_benchmark.cpp` 已随主线契约升级到 `5c0724d`；下面先记录当前
+> production high/low watermark 闭环的实测，再保留历史对比。
+
+## Production 1:1:1 高压闭环（2026-08-17）
+
+当前 `object_catalog_rpc_benchmark_server` 不再拥有私有 eviction thread，而是直接构造
+production `MooncakeServerComposition`。RPC listener 与 `MasterReconciler` 共用启动、
+pressure wakeup、shutdown 和 join 生命周期；服务退出时若从未越过 high，benchmark 会
+返回失败。
+
+本轮使用 115,056,180-byte Memory segment、1 KiB 对象、0.90/0.85 high/low watermark。
+先成功预填 100K 对象（约 89%）并触达尾部 50K 热集，然后预热 3 秒、测量 10 秒。
+`BatchPut`、`BatchGet`、`BatchExists` 各有独立连接且各限速 300 batch QPS，batch size
+为 333；这等于 900 logical batch QPS、约 299,700 item ops/s。未绑核，以下是一轮
+高压闭环样本，适合验证策略和建立当前机器基线，不作为跨硬件的固定结论。
+
+| logical batch | 完成数 | p50 | p99 | p99.9 |
+| --- | ---: | ---: | ---: | ---: |
+| BatchPut（Start + End） | 3,000 | 1,260.430 us | 1,853.818 us | 2,017.554 us |
+| BatchGet | 3,000 | 473.565 us | 1,577.689 us | 1,741.405 us |
+| BatchExists | 3,000 | 279.819 us | 1,416.955 us | 1,492.927 us |
+
+测量窗口三类请求数严格为 3,000:3,000:3,000，实际为 900 logical batch QPS、
+299,761 item ops/s，调度迟到为 0。GET 和 EXISTS 各完成 999,000 个 hit，零 miss/错误。
+PUT 尝试 999,000 个 item，其中 996,216 个成功，2,784 个在接近满容量时有界返回
+`NO_AVAILABLE_HANDLE`，无其他错误；成功率为 99.72%。
+
+这轮确实触发了水位闭环，而不只是消耗预留 headroom：最大采样用量为
+115,055,616 bytes（99.9995%），`watermark_triggered=true`；控制器累计物理回收
+1,299,737 个对象、1,330,930,688 bytes。停止写压力并继续 reconcile 后，最终用量为
+97,797,120 bytes（84.9994%，不高于 low 的 97,797,753 bytes），此时
+`retired_bytes=0`、两类 debt 均为 0、`settled_to_low=true`。期间记录 12,554 次
+allocation failure wakeup，9,096 次有限重试且全部成功；失败路径仍只执行配置的有限
+collector budget，没有请求路径无界扫描。
+
+可复现命令（两个终端；client 完成后等待约 3 秒再向 server 发送 Ctrl-C，以打印稳定态
+诊断）：
+
+```bash
+g++ -std=c++20 -O3 -DNDEBUG \
+  -I /path/to/Mooncake/extern/yalantinglibs/include \
+  -I /path/to/Mooncake/extern/yalantinglibs/include/ylt/thirdparty \
+  interop/mooncake_benchmark.cpp -pthread -o /tmp/mooncake_benchmark
+
+cargo build --release --bin object_catalog_rpc_benchmark_server
+target/release/object_catalog_rpc_benchmark_server \
+  127.0.0.1:19094 8 115056180 2000000 500000 0.90 0.85
+
+/tmp/mooncake_benchmark mixed-client \
+  127.0.0.1 19094 333 300 10 3 100000 50000 1024
+```
 
 ## Batch RPC 线上比例压测（2026-08-10）
 
@@ -100,9 +149,9 @@ target/release/object_catalog_rpc_benchmark_server \
 但没有直接包含 `<cstdint>`。本次没有修改其源码，Release 构建只增加了
 `-include cstdint` 作为构建期 workaround；这不会改变被测 Master 的业务路径。
 
-Rust benchmark server 的自动压力控制器明确是 Memory-only 测试设施。catalog
-现已支持按 tenant/replica class 的 scoped reclaim filter；通用生产控制器仍需按
-各 class 的物理水位分别产生全局压力目标，详见
+上述历史结果使用当时 benchmark server 的独立 Memory-only 压力控制器。当前 server
+已经切换到 production high/low watermark composition；catalog 继续保留按
+tenant/replica class 的 scoped reclaim filter，详见
 [`object_catalog_rpc.md`](object_catalog_rpc.md)。
 
 ## Direct API 对比（2026-08-07）

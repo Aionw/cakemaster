@@ -38,3 +38,18 @@ pub struct SegmentStats {
     pub usage: SegmentUsageStats,
     pub state: SegmentState,
 }
+
+/// Aggregate physical space for one replica class.
+///
+/// Shared resources such as a CXL arena are counted once even when they are
+/// exposed through multiple logical segments. Both accepting and quiesced
+/// segments are included because quiescing placement does not release the
+/// underlying allocations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ReplicaClassSpaceStats {
+    pub generation: u64,
+    pub capacity_bytes: u64,
+    pub used_bytes: u64,
+    pub available_bytes: u64,
+    pub largest_free_region_bytes: u64,
+}

@@ -6,6 +6,7 @@ use super::{
 use crate::segment::error::{AttachError, LocalSsdError, SegmentStateError};
 use crate::segment::identity::{ClientId, SegmentId};
 use crate::segment::spec::{ReplicaClass, SegmentSpec};
+use crate::segment::stats::ReplicaClassSpaceStats;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
@@ -75,6 +76,36 @@ impl Catalog {
                 .get(&replica_class)
                 .cloned()
                 .unwrap_or_else(|| Arc::from([])),
+        }
+    }
+
+    pub(super) fn space_for(&self, replica_class: ReplicaClass) -> ReplicaClassSpaceStats {
+        let mut resources = HashSet::new();
+        let mut capacity_bytes = 0_u64;
+        let mut used_bytes = 0_u64;
+        let mut available_bytes = 0_u64;
+        let mut largest_free_region_bytes = 0_u64;
+        for entry in self
+            .segments
+            .values()
+            .filter(|entry| entry.spec().replica_class() == replica_class)
+        {
+            if !resources.insert(entry.spec().resource_id()) {
+                continue;
+            }
+            let space = entry.stats().space;
+            capacity_bytes = capacity_bytes.saturating_add(space.capacity_bytes);
+            used_bytes = used_bytes.saturating_add(space.used_bytes);
+            available_bytes = available_bytes.saturating_add(space.available_bytes);
+            largest_free_region_bytes =
+                largest_free_region_bytes.max(space.largest_free_region_bytes);
+        }
+        ReplicaClassSpaceStats {
+            generation: self.indexes.direct_generation,
+            capacity_bytes,
+            used_bytes,
+            available_bytes,
+            largest_free_region_bytes,
         }
     }
 

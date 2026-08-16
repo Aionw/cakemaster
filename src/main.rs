@@ -1,5 +1,6 @@
 mod logging;
 
+use cakemaster::object::MemoryEvictionConfig;
 use cakemaster::server::{DEFAULT_MOONCAKE_LISTEN_ADDR, MooncakeServerConfig};
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
@@ -24,6 +25,24 @@ struct Cli {
     #[arg(long, help_heading = "Server options")]
     access_log: bool,
 
+    /// Physical memory usage ratio that starts background eviction.
+    #[arg(
+        long,
+        default_value_t = 0.90,
+        value_name = "RATIO",
+        help_heading = "Eviction options"
+    )]
+    eviction_high_watermark: f64,
+
+    /// Physical memory usage ratio at which an active eviction cycle stops.
+    #[arg(
+        long,
+        default_value_t = 0.80,
+        value_name = "RATIO",
+        help_heading = "Eviction options"
+    )]
+    eviction_low_watermark: f64,
+
     #[command(flatten, next_help_heading = "Logging options")]
     logging: LoggingOverrides,
 }
@@ -39,8 +58,14 @@ async fn main() {
         eprintln!("{error}");
         std::process::exit(1);
     }
+    let memory_eviction =
+        match MemoryEvictionConfig::new(cli.eviction_high_watermark, cli.eviction_low_watermark) {
+            Ok(config) => config,
+            Err(error) => Cli::command().error(ErrorKind::InvalidValue, error).exit(),
+        };
     let server = MooncakeServerConfig::default()
         .with_listen_addr(cli.listen)
+        .with_memory_eviction(memory_eviction)
         .with_access_log(cli.access_log);
     if let Err(error) = run(server).await {
         log::error!(error:% = error; "cakemaster exited with an error");
@@ -96,6 +121,8 @@ mod tests {
         let default = Cli::try_parse_from(["cakemaster"]).unwrap();
         assert_eq!(default.listen, DEFAULT_MOONCAKE_LISTEN_ADDR);
         assert!(!default.access_log);
+        assert_eq!(default.eviction_high_watermark, 0.90);
+        assert_eq!(default.eviction_low_watermark, 0.80);
         assert_eq!(default.logging, LoggingOverrides::default());
 
         let explicit = Cli::try_parse_from(["cakemaster", "--listen", "127.0.0.1:0"]).unwrap();
@@ -143,6 +170,8 @@ mod tests {
         assert!(Cli::try_parse_from(["cakemaster", "--log-level=verbose"]).is_err());
         assert!(Cli::try_parse_from(["cakemaster", "--log-filter=cakemaster=verbose"]).is_err());
         assert!(Cli::try_parse_from(["cakemaster", "--log-output=stdout"]).is_err());
+        assert!(MemoryEvictionConfig::new(f64::NAN, 0.8).is_err());
+        assert!(MemoryEvictionConfig::new(0.8, 0.8).is_err());
         assert!(
             Cli::try_parse_from([
                 "cakemaster",

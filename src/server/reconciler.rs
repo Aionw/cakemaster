@@ -116,6 +116,7 @@ pub struct MasterReconciler {
     objects: Arc<dyn ObjectReconcileBackend>,
     clock: MasterClock,
     reconcile_notify: Arc<Notify>,
+    memory_eviction_notify: Option<Arc<Notify>>,
     config: MasterReconcileConfig,
 }
 
@@ -127,11 +128,13 @@ impl MasterReconciler {
         reconcile_notify: Arc<Notify>,
         config: MasterReconcileConfig,
     ) -> Self {
+        let memory_eviction_notify = objects.memory_eviction_notify();
         Self {
             clients,
             objects,
             clock,
             reconcile_notify,
+            memory_eviction_notify,
             config,
         }
     }
@@ -143,11 +146,13 @@ impl MasterReconciler {
         reconcile_notify: Arc<Notify>,
         config: MasterReconcileConfig,
     ) -> Self {
+        let memory_eviction_notify = objects.memory_eviction_notify();
         Self {
             clients,
             objects,
             clock,
             reconcile_notify,
+            memory_eviction_notify,
             config,
         }
     }
@@ -198,6 +203,12 @@ impl MasterReconciler {
 
         loop {
             let notified = self.reconcile_notify.notified();
+            let eviction_notified = async {
+                match &self.memory_eviction_notify {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
             let deadline = self.clients.next_graceful_unmount_deadline();
             let deadline_wait = async {
                 match deadline {
@@ -208,6 +219,7 @@ impl MasterReconciler {
                 }
             };
             tokio::pin!(notified);
+            tokio::pin!(eviction_notified);
             tokio::pin!(deadline_wait);
             tokio::select! {
                 biased;
@@ -216,6 +228,7 @@ impl MasterReconciler {
                     self.reconcile_and_log();
                 },
                 _ = &mut deadline_wait => self.reconcile_and_log(),
+                _ = &mut eviction_notified => self.reconcile_and_log(),
                 _ = &mut notified => {},
             }
         }
@@ -232,6 +245,7 @@ impl MasterReconciler {
         }
         let client_cleanup = report.client_cleanup.as_ref().ok();
         let catalog = report.object_collection.catalog;
+        let memory_eviction = report.object_collection.memory_eviction;
         let did_work = client_cleanup.is_some_and(|report| {
             report.completed_sessions != 0
                 || report.revoked_pending_writes != 0
@@ -244,7 +258,8 @@ impl MasterReconciler {
             || catalog.invalidated_published != 0
             || catalog.pruned_objects != 0
             || catalog.reclaimed_objects != 0
-            || catalog.removed_empty_slots != 0;
+            || catalog.removed_empty_slots != 0
+            || memory_eviction.is_some_and(|stats| stats.active);
         if did_work {
             log::debug!(
                 target: "cakemaster::server::reconciler",
@@ -262,6 +277,26 @@ impl MasterReconciler {
                 removed_empty_slots = catalog.removed_empty_slots;
                 "master reconciliation completed work"
             );
+            if let Some(stats) = memory_eviction {
+                log::debug!(
+                    target: "cakemaster::server::eviction",
+                    active = stats.active,
+                    capacity_bytes = stats.capacity_bytes,
+                    used_bytes = stats.used_bytes,
+                    maximum_used_bytes = stats.maximum_used_bytes,
+                    maximum_used_ratio_ppm = stats.maximum_used_ratio_ppm,
+                    high_watermark_bytes = stats.high_watermark_bytes,
+                    low_watermark_bytes = stats.low_watermark_bytes,
+                    live_bytes = stats.live_bytes,
+                    retired_bytes = stats.retired_bytes,
+                    reclaim_debt_bytes = stats.reclaim_debt_bytes,
+                    requested_reclaim_debt_bytes = stats.requested_reclaim_debt_bytes,
+                    watermark_reclaim_debt_bytes = stats.watermark_reclaim_debt_bytes,
+                    trigger_events = stats.trigger_events,
+                    allocation_failures = stats.allocation_failures;
+                    "memory eviction controller sampled pressure"
+                );
+            }
         }
     }
 }

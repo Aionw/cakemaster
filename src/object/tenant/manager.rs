@@ -135,6 +135,10 @@ impl TenantObjectManager {
         self.object.pending_write_revoker()
     }
 
+    pub(crate) fn memory_eviction_notify(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.object.memory_eviction_notify()
+    }
+
     pub fn resolve_tenant(
         &self,
         tenant_id: &TenantId,
