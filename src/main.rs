@@ -20,6 +20,10 @@ struct Cli {
     )]
     listen: std::net::SocketAddr,
 
+    /// Emit one structured info log for each completed RPC request.
+    #[arg(long, help_heading = "Server options")]
+    access_log: bool,
+
     #[command(flatten, next_help_heading = "Logging options")]
     logging: LoggingOverrides,
 }
@@ -35,7 +39,9 @@ async fn main() {
         eprintln!("{error}");
         std::process::exit(1);
     }
-    let server = MooncakeServerConfig::default().with_listen_addr(cli.listen);
+    let server = MooncakeServerConfig::default()
+        .with_listen_addr(cli.listen)
+        .with_access_log(cli.access_log);
     if let Err(error) = run(server).await {
         log::error!(error:% = error; "cakemaster exited with an error");
         eprintln!("error: {error}");
@@ -89,10 +95,14 @@ mod tests {
     fn defaults_to_loopback_and_accepts_an_explicit_listener() {
         let default = Cli::try_parse_from(["cakemaster"]).unwrap();
         assert_eq!(default.listen, DEFAULT_MOONCAKE_LISTEN_ADDR);
+        assert!(!default.access_log);
         assert_eq!(default.logging, LoggingOverrides::default());
 
         let explicit = Cli::try_parse_from(["cakemaster", "--listen", "127.0.0.1:0"]).unwrap();
         assert_eq!(explicit.listen, "127.0.0.1:0".parse().unwrap());
+
+        let access_log = Cli::try_parse_from(["cakemaster", "--access-log"]).unwrap();
+        assert!(access_log.access_log);
     }
 
     #[test]
