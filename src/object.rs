@@ -1,10 +1,10 @@
 //! Object identity, publication, lookup, and incremental reclamation.
 //!
-//! A put moves through `claim_put -> PutClaim::stage -> publish`. Dropping a
-//! claim rolls it back, while dropping tickets or read handles never releases
-//! live storage prematurely. Lookups pin immutable object versions with an
-//! `Arc`; `collect_step` only detaches expired versions and releases their
-//! reservations after the final pin disappears.
+//! A write moves through `begin_write -> WriteClaim::stage -> commit`. Dropping
+//! a claim aborts it, while dropping transaction tokens or read handles never
+//! releases live storage prematurely. Lookups pin immutable committed versions
+//! with an `Arc`; `collect_step` releases retired reservations only after their
+//! lease and final local pin are gone.
 //!
 //! The root index stores stable slots rather than object payloads. Eviction is
 //! therefore a slot-local compare-and-swap followed by bounded queue work; it
@@ -23,7 +23,8 @@ mod tenant;
 mod write;
 
 pub use catalog::{
-    LiveReplicaView, ObjectCatalog, ObjectHandle, ObjectRead, PutClaim, PutTicket, ReplicaSetView,
+    LiveReplicaView, ObjectCatalog, ObjectHandle, ObjectRead, ReplicaSetView, WriteClaim,
+    WriteTransaction,
 };
 pub use config::{
     DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS, DEFAULT_MAX_SOFT_PIN_TTL_TICKS,
@@ -43,4 +44,4 @@ pub use tenant::{
     TenantObjectManagerCreateError, TenantPolicy, TenantPutRequest, TenantQuotaLimits,
     TenantQuotaSnapshot, TenantRemoveError, TenantResourceClass, TenantSnapshot,
 };
-pub use write::{ObjectCommit, WriteAdmission, WriteId, WriteOwner};
+pub use write::{ObjectCommit, TransactionId, VersionId, WriteAdmission, WriteMode, WriteOwner};

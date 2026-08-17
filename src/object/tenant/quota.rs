@@ -324,10 +324,6 @@ impl TenantQuotaCharge {
         atomic_saturating_sub(&account.demand, bytes);
     }
 
-    pub(crate) fn release_reserved(&self, replica_class: ReplicaClass, bytes: u64) {
-        self.account(replica_class).release_reserved(bytes);
-    }
-
     pub(crate) fn release(&self, replica_class: ReplicaClass, bytes: u64) {
         let current_phase = self.phase.load(Ordering::Acquire);
         self.phase.store(CHARGE_RELEASED, Ordering::Release);

@@ -242,10 +242,10 @@ impl GracefulUnmountQueue {
     }
 
     fn retry(&mut self, job: GracefulUnmountJob, deadline: ClientTick) -> bool {
-        if !self
+        if self
             .pending
             .get(&job.key)
-            .is_some_and(|pending| pending.revision == job.revision)
+            .is_none_or(|pending| pending.revision != job.revision)
         {
             return false;
         }

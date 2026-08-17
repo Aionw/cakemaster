@@ -3,7 +3,8 @@
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     DirectReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
-    ObjectIdentity, ReplicaId, ReplicaLease, ReplicaSet, WriteAdmission,
+    ObjectIdentity, ObjectPinRequest, ReplicaId, ReplicaLease, ReplicaSet, WriteAdmission,
+    WriteMode,
 };
 use cakemaster::segment::{
     ClientId, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool, SegmentPoolConfig,
@@ -139,9 +140,11 @@ fn run_once(arguments: Arguments) -> EvictResult {
             .reserve(&candidate, OBJECT_BYTES)
             .expect("benchmark segment must have enough capacity");
         let ticket = catalog
-            .claim_put(
+            .begin_write(
                 identity,
                 WriteAdmission::unmanaged(OWNER),
+                WriteMode::Insert,
+                ObjectPinRequest::default(),
                 CatalogTick::ZERO,
             )
             .expect("benchmark keys are unique")
@@ -155,7 +158,7 @@ fn run_once(arguments: Arguments) -> EvictResult {
             .expect("benchmark replica is valid");
         drop(
             catalog
-                .publish(&ticket, ObjectCommit::default())
+                .commit(&ticket, ObjectCommit::default(), CatalogTick::ZERO)
                 .expect("fresh benchmark objects can be published"),
         );
     }

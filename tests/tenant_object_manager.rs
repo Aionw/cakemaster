@@ -1,3 +1,4 @@
+use cakemaster::object::error::ObjectManagerError;
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     ObjectCatalogConfig, ObjectContent, ObjectKind, ObjectPutPlan, ReplicaSelector,
@@ -239,7 +240,7 @@ fn revoke_returns_reserved_quota_and_unknown_tenants_are_rejected() {
 }
 
 #[test]
-fn tenant_upsert_reuses_charge_and_accounts_replacement_until_reclaim() {
+fn tenant_upsert_reserves_a_fresh_version_and_accounts_replacement_until_reclaim() {
     let manager = manager(12 * 1024, 4096);
     let a = manager.resolve_tenant(&tenant_id("a")).unwrap();
     manager
@@ -253,8 +254,8 @@ fn tenant_upsert_reuses_charge_and_accounts_replacement_until_reclaim() {
         .start_upsert(&a, "key", admission(), plan(4096, 1), CatalogTick::new(1))
         .unwrap();
     let snapshot = manager.tenant_snapshot(&tenant_id("a")).unwrap();
-    assert_eq!(snapshot.memory.demand_bytes, 4096);
-    assert_eq!(snapshot.memory.reserved_bytes, 0);
+    assert_eq!(snapshot.memory.demand_bytes, 8192);
+    assert_eq!(snapshot.memory.reserved_bytes, 4096);
     manager
         .revoke_put(
             &a,
@@ -506,6 +507,44 @@ fn batch_admission_is_atomic_per_resource_class() {
             .iter()
             .all(|result| matches!(result, Err(TenantObjectError::TenantQuotaExceeded { .. })))
     );
+}
+
+#[test]
+fn batch_duplicate_keys_preserve_order_for_insert_and_upsert() {
+    let manager = manager(12 * 1024, 4096);
+    let a = manager.resolve_tenant(&tenant_id("a")).unwrap();
+    let inserted = manager.start_put_batch(
+        &a,
+        admission(),
+        vec![
+            TenantPutRequest::new("duplicate", plan(4096, 1)),
+            TenantPutRequest::new("duplicate", plan(4096, 1)),
+        ],
+        CatalogTick::ZERO,
+    );
+    assert!(inserted[0].is_ok());
+    assert!(matches!(
+        inserted[1],
+        Err(TenantObjectError::Object(ObjectManagerError::AlreadyExists))
+    ));
+    manager
+        .finish_put(&a, "duplicate", owner(), ReplicaSelector::All)
+        .unwrap();
+
+    let replacements = manager.start_upsert_batch(
+        &a,
+        admission(),
+        vec![
+            TenantPutRequest::new("duplicate", plan(4096, 1)),
+            TenantPutRequest::new("duplicate", plan(4096, 1)),
+        ],
+        CatalogTick::new(1),
+    );
+    assert!(replacements[0].is_ok());
+    assert!(matches!(
+        replacements[1],
+        Err(TenantObjectError::Object(ObjectManagerError::AlreadyExists))
+    ));
 }
 
 #[test]

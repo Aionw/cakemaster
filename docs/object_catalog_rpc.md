@@ -118,15 +118,15 @@ backend callback 因此只包含对应的领域 batch 调用。
 ## ObjectManager 的职责与行为
 
 `ObjectManager` 是 put/get/exists 的领域协调器，只拥有一个 `ObjectCatalog` 和一个
-`ReplicaAllocator`。pending node、owner、write generation、ticket 可重建信息和 timeout
-candidate 全部由 catalog 维护，不再在 manager 中复制事务表与 deadline heap。它不决定
-watermark 或淘汰比例。
+`ReplicaAllocator`。owner、per-key transaction、timeout candidate 和 committed version
+全部由 catalog 维护，不在 manager 中复制事务表与 deadline heap。它不决定 watermark
+或淘汰比例。
 
-Catalog node 的对外 lifecycle 收敛为 `Claimed`、`Pending`、`Published`、`Updating` 和
-`Retiring` 五态。publish 和 replica pruning 只是 node `write_gate` 内的临界区，不再暴露
-额外中间态；同尺寸更新和变尺寸更新保留的旧 generation 都使用 `Updating`，具体回滚路径
-由 previous generation/owner metadata 区分。这样状态只表达可见性与资源归属差异，CAS 和
-内存序统一封装在 typed lifecycle 中。
+每个 catalog slot 只有两个正交状态：一个由 `ArcSwapOption` 保存、供 reader 无锁加载的
+immutable committed version，以及一个由 slot-local mutex 保护的 active transaction。
+active transaction 只有 `Claimed` 和 `Staged` 两个 phase；它不改变 committed pointer。
+因此不再用 `Claimed/Pending/Published/Updating/Retiring` 组合状态表达可见性，也没有
+rollback pointer。retired version 属于独立的物理回收队列。
 
 `start_put` 的顺序为：
 
@@ -134,37 +134,42 @@ Catalog node 的对外 lifecycle 收敛为 `Claimed`、`Pending`、`Published`�
 2. 在 catalog 中原子 claim key；同一个 key 同时只能有一个成功者。
 3. 让 `ReplicaAllocator` 按 placement plan 预留空间。
 4. 把 reservation 转成由 catalog 持有的 `ReplicaSet`，并将 claim stage 为
-   pending object。
-5. Catalog node 只保留纯身份 `WriteOwner`、`WriteId`、replica、pin 和超时 deadline；
+   pending version。
+5. Catalog slot 只保留纯身份 `WriteOwner`、`TransactionId`、replica、pin 和超时
+   deadline；
    start/stage 使用的 `WriteAdmission` fence 随 claim 离开后即释放，Manager 丢弃临时
    ticket，向 RPC 返回可写 descriptor。
 
 任何中途失败都依靠 claim/reservation 的 RAII drop 回滚；all-or-nothing
 placement 的部分 reservation 也会在返回错误前释放。
 
-`finish_put` 从 catalog 当前 generation 重建 pending ticket，检查 client owner 和请求的
-replica selector，再原子 publish。提交元数据固定为 `checksum=None`。相同 owner 对已经
-publish 的对象重复调用 finish 是幂等成功；owner 不同返回 `ILLEGAL_CLIENT`，class 不
+`finish_put` 按 key 查找当前 active transaction，检查 client owner 和请求的 replica
+selector，再原子 commit。提交元数据固定为 `checksum=None`。相同 transaction 和 metadata
+的重复 finish 是幂等成功；owner 不同返回 `ILLEGAL_CLIENT`，class 不
 匹配或已失效写事务返回 `INVALID_WRITE`。
 
-`revoke_put` 做同样的 owner/class 校验，然后撤销 pending ticket。reservation
-随 catalog record 进入回收流程并最终归还 allocator；已 publish 的对象不能用
+`revoke_put` 做同样的 owner/class 校验，然后撤销 active transaction。reservation
+随 catalog record 进入回收流程并最终归还 allocator；已 committed 的对象不能用
 revoke 删除。
 
-`start_upsert` 对缺失 key 复用 put 流程；对同尺寸已发布对象进入不可读的更新状态并复用
-原 replica 地址；对变尺寸对象则安装新的 pending generation，同时保留旧 generation
-用于失败回滚。`finish_put` 同时提交普通 put 和 upsert：变尺寸提交后旧 generation 进入
-延迟回收，外部 read handle 释放后才归还 reservation 和 quota；`revoke_put`、pending
-timeout 或 client session fencing 都会恢复旧 generation。同一对象已有 pending write 时
-当前仍返回冲突，不实现上游 UpsertStart 对旧 PROCESSING writer 的立即抢占。
+`start_upsert` 对缺失 key 等价 insert；无论尺寸是否变化都申请新的 allocation，并把当前
+committed version 记为 transaction base。事务期间旧版本持续可读。`finish_put` 完成所有
+可能失败的校验和 quota 转换后，一次原子切换 committed pointer；旧版本按最后一次 reader
+刷新后的 lease deadline 进入延迟回收，并且必须等所有本地 handle 释放后才归还 allocation
+和 quota。`revoke_put`、pending timeout 或 client session fencing 只丢弃 candidate，旧
+committed version 和 pin metadata 完全不变。同一对象已有 active transaction 时返回冲突，
+不实现上游 UpsertStart 对旧 PROCESSING writer 的立即抢占。
+
+当前 Mooncake wire 不携带 transaction id。Manager 只能按 `key + owner` 解析 active
+transaction，因此同一 client session 对同一 key 开启新事务后，旧请求迟到的 End 无法与
+新事务区分；这是保持 IDL 不变时的明确限制。
 
 pin 变更与 write transaction 一起提交：`ENABLE` 使用请求 TTL，缺省为 30 分钟，单次
 请求上限为 24 小时；`PRESERVE`/`DISABLE` 携带 TTL 会被拒绝，`ENABLE + 0` 表示提交后
 没有 soft pin。deadline 从 `finish_put_at` 的提交 tick 起算。Upsert 的 soft pin action
-只在 End 生效，Revoke、timeout 和 session fence 都保留旧 deadline；同尺寸
-`PRESERVE` 保留 deadline，`ENABLE` 刷新，`DISABLE` 清除。hard pin 对普通 Put 在创建时
-固定；同尺寸 Upsert 不改变它，变尺寸 replacement 会保留旧 hard pin，并允许请求把它
-从 false 提升为 true。
+只在 End 生效，Revoke、timeout 和 session fence 都保留旧 deadline；`PRESERVE` 继承
+尚未过期的 deadline，`ENABLE` 从 commit tick 重新计算，`DISABLE` 清除。hard pin 对普通
+Put 在创建时固定；replacement 保留旧 hard pin，并允许请求把它从 false 提升为 true。
 
 `remove` 只删除已发布对象；普通删除受 lease 和 hard pin 保护，`force=true` 同时绕过
 两者。pending 或
@@ -173,9 +178,11 @@ upsert 中对象返回 `REPLICA_IS_NOT_READY`，缺失对象返回 `OBJECT_NOT_F
 wire 没有 hard-pin 专用错误码，普通删除 hard-pinned 对象复用 `OBJECT_HAS_LEASE`。
 replication task 仍未建模，因此 force 不会绕过这类尚不存在的状态。
 
-`get` 只返回完整 publish 的对象并刷新 lease，pending object 返回
-`REPLICA_IS_NOT_READY`。`exists` 与 get 使用同一可见性和 lease 语义，但只返回
-bool。`maintenance(now, budget)` 由 catalog 的单一 bounded collector 同时处理到期
+`get` 只返回完整 committed version：pending insert 返回 `REPLICA_IS_NOT_READY`，pending
+upsert 返回旧 committed version。reader 先刷新该 version 的 lease，再验证 committed
+pointer；如果 pointer 已切换就重试，因此结果在线性化上只可能属于 commit 前或 commit 后。
+`exists` 与 get 使用同一可见性和 lease 语义，但只返回 bool。
+`maintenance(now, budget)` 由 catalog 的单一 bounded collector 同时处理到期
 soft pin、pending write、淘汰、物理回收和空 slot；soft-pin queue 每步最多扫描
 `max_candidates` 个注册项，旧 generation 和被刷新 deadline 的 stale 项通过 weak node
 与 deadline CAS 自动失效，不需要全表扫描。它不会在一次调用中无限扫描。诊断 snapshot
@@ -221,7 +228,7 @@ soft pin、pending write、淘汰、物理回收和空 slot；soft-pin queue 每
 | `ReMountSegment` | 支持 Memory/CXL segment 的原子激活与幂等重挂载；NoF 和冲突配置返回错误 |
 | `UnmountSegment` | 立即摘除单个 segment；不存在幂等成功，client session 保持 active |
 | `GracefulUnmountSegment` | 立即停止新分配并在 grace deadline 摘除；不存在返回 `SEGMENT_NOT_FOUND`；依赖显式运行的 `MasterReconciler` |
-| `UpsertStart/End/Revoke` + batch | 缺失 key 等价 put；同尺寸复用 allocation；变尺寸保留旧 generation 并支持 end/revoke/timeout/session-fence 回滚 |
+| `UpsertStart/End/Revoke` + batch | 缺失 key 等价 put；始终申请新 allocation；pending 时旧 committed version 可读；end 原子切换，revoke/timeout/session-fence 保留旧版本 |
 | `Remove` / `BatchRemove` | 普通模式遵守 lease 和 hard pin，force 同时绕过两者；pending/upsert 中对象拒绝删除 |
 | `RemoveByRegex` / `RemoveAll` | 删除所有当前可删除的匹配对象并返回成功数量；multi-tenant 下空 tenant 的 `RemoveAll` 覆盖所有租户 |
 | tenant id（single 构造） | 忽略并统一映射到 `NamespaceId::DEFAULT` |
@@ -254,6 +261,8 @@ shard。仍有这些已知差异：
 - C++ 对 mixed Memory/NoF 的 pending pin action 可在首个合格 replica 完成时提交，并让
   后续 replica End 不刷新 TTL；Rust 当前每个对象只支持单一 replica class，End 一次提交
   整个对象，所以还没有该 partial-End 边角。
+- Rust 的 Upsert 始终申请 fresh allocation，包括同尺寸更新；C++ 可复用原 allocation。
+  这是 per-key MVCC 保证 pending 期间旧版本持续可读的有意差异。
 - pin metadata 仍是纯内存状态，服务重启不会恢复；也尚未接入上游 soft-pin key metric。
 
 实现入口：

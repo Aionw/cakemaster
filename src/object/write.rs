@@ -6,6 +6,14 @@ pub struct ObjectCommit {
     checksum: Option<u64>,
 }
 
+/// Whether a transaction requires an absent key or replaces the current
+/// committed version when one exists.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WriteMode {
+    Insert,
+    Upsert,
+}
+
 impl ObjectCommit {
     pub const fn new(checksum: Option<u64>) -> Self {
         Self { checksum }
@@ -86,16 +94,27 @@ impl WriteAdmission {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub struct WriteId {
-    generation: u64,
-}
+pub struct TransactionId(u64);
 
-impl WriteId {
-    pub(crate) const fn new(generation: u64) -> Self {
-        Self { generation }
+impl TransactionId {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
     }
 
-    pub const fn generation(self) -> u64 {
-        self.generation
+    pub const fn get(self) -> u64 {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct VersionId(u64);
+
+impl VersionId {
+    pub(crate) const fn new(value: u64) -> Self {
+        Self(value)
+    }
+
+    pub const fn get(self) -> u64 {
+        self.0
     }
 }
