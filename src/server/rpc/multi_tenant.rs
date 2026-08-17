@@ -1,6 +1,6 @@
 //! Multi-tenant RPC backend adapter.
 
-use super::backend::{ObjectBatchBackend, batch_error, batch_maintenance_budget};
+use super::backend::{ObjectBatchBackend, batch_error, mutation_maintenance_budget};
 use super::response::{map_lookup_error, map_manager_error, map_remove_error, map_tenant_error};
 use crate::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
 use crate::object::reclamation::CatalogTick;
@@ -12,10 +12,6 @@ use regex::Regex;
 
 impl ObjectBatchBackend for TenantObjectManager {
     type Tenant = ResolvedTenant;
-
-    fn maintain(&self, now: CatalogTick, item_count: usize) {
-        let _ = TenantObjectManager::maintenance(self, now, batch_maintenance_budget(item_count));
-    }
 
     fn resolve_tenant(&self, tenant_id: &str) -> Result<Self::Tenant, ErrorCode> {
         let tenant_id = TenantId::try_from(tenant_id).map_err(|_| ErrorCode::InvalidParams)?;
@@ -82,7 +78,7 @@ impl ObjectBatchBackend for TenantObjectManager {
         selector: ReplicaSelector,
         now: CatalogTick,
     ) -> Vec<ExpectedVoid> {
-        map_tenant_batch(
+        let results = map_tenant_batch(
             keys.len(),
             TenantObjectManager::finish_put_batch_at(
                 self,
@@ -93,7 +89,10 @@ impl ObjectBatchBackend for TenantObjectManager {
                 now,
             ),
             |result| result.map_err(map_manager_error),
-        )
+        );
+        let _ =
+            TenantObjectManager::maintenance(self, now, mutation_maintenance_budget(keys.len()));
+        results
     }
 
     fn revoke_put_batch(
@@ -104,7 +103,7 @@ impl ObjectBatchBackend for TenantObjectManager {
         selector: ReplicaSelector,
         now: CatalogTick,
     ) -> Vec<ExpectedVoid> {
-        map_tenant_batch(
+        let results = map_tenant_batch(
             keys.len(),
             TenantObjectManager::revoke_put_batch(
                 self,
@@ -115,7 +114,10 @@ impl ObjectBatchBackend for TenantObjectManager {
                 now,
             ),
             |result| result.map_err(map_manager_error),
-        )
+        );
+        let _ =
+            TenantObjectManager::maintenance(self, now, mutation_maintenance_budget(keys.len()));
+        results
     }
 
     fn remove_batch(
@@ -125,7 +127,7 @@ impl ObjectBatchBackend for TenantObjectManager {
         now: CatalogTick,
         force: bool,
     ) -> Vec<ExpectedVoid> {
-        map_tenant_batch(
+        let results = map_tenant_batch(
             keys.len(),
             TenantObjectManager::remove_batch(
                 self,
@@ -135,7 +137,10 @@ impl ObjectBatchBackend for TenantObjectManager {
                 force,
             ),
             |result| result.map_err(map_remove_error),
-        )
+        );
+        let _ =
+            TenantObjectManager::maintenance(self, now, mutation_maintenance_budget(keys.len()));
+        results
     }
 
     fn remove_matching(
@@ -145,8 +150,10 @@ impl ObjectBatchBackend for TenantObjectManager {
         now: CatalogTick,
         force: bool,
     ) -> Result<usize, ErrorCode> {
-        TenantObjectManager::remove_matching(self, tenant, pattern, now, force)
-            .map_err(map_tenant_error)
+        let removed = TenantObjectManager::remove_matching(self, tenant, pattern, now, force)
+            .map_err(map_tenant_error)?;
+        let _ = TenantObjectManager::maintenance(self, now, mutation_maintenance_budget(removed));
+        Ok(removed)
     }
 
     fn remove_all(
@@ -155,13 +162,17 @@ impl ObjectBatchBackend for TenantObjectManager {
         now: CatalogTick,
         force: bool,
     ) -> Result<usize, ErrorCode> {
-        self.maintain(now, 1);
         if tenant_id.is_empty() {
-            return Ok(TenantObjectManager::remove_all_tenants(self, now, force));
+            let removed = TenantObjectManager::remove_all_tenants(self, now, force);
+            let _ =
+                TenantObjectManager::maintenance(self, now, mutation_maintenance_budget(removed));
+            return Ok(removed);
         }
         let tenant = <Self as ObjectBatchBackend>::resolve_tenant(self, tenant_id)?;
-        TenantObjectManager::remove_matching(self, &tenant, None, now, force)
-            .map_err(map_tenant_error)
+        let removed = TenantObjectManager::remove_matching(self, &tenant, None, now, force)
+            .map_err(map_tenant_error)?;
+        let _ = TenantObjectManager::maintenance(self, now, mutation_maintenance_budget(removed));
+        Ok(removed)
     }
 }
 

@@ -1,7 +1,12 @@
 //! Read-only object-catalog diagnostics.
 
+/// Flat metrics projection of the catalog's grouped internal state.
+///
+/// Keeping metric names at one level makes logs and exporters ergonomic;
+/// mutation ownership remains separated inside `CatalogInner`.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct ObjectCatalogStats {
+    // Stable index and write lifecycle.
     pub slots: usize,
     pub claims: usize,
     pub pending_objects: usize,
@@ -9,7 +14,12 @@ pub struct ObjectCatalogStats {
     pub pending_bytes: u64,
     pub live_bytes: u64,
     pub retired_bytes: u64,
+    /// Retired bytes backed by Memory/CXL reservations.
+    pub retired_memory_bytes: u64,
+    // Explicit global reclaim pressure. Watermark and allocation-failure
+    // pressure are controller-owned, class-scoped, and exposed separately.
     pub reclaim_debt: u64,
+    // Bounded collector queue diagnostics.
     pub pending_candidates: usize,
     pub soft_pin_candidates: usize,
     pub liveness_scan_remaining: usize,

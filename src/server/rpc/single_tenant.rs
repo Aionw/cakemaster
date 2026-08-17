@@ -1,6 +1,6 @@
 //! Single-tenant RPC backend adapter.
 
-use super::backend::{ObjectBatchBackend, batch_maintenance_budget};
+use super::backend::{ObjectBatchBackend, mutation_maintenance_budget};
 use super::response::{map_lookup_error, map_manager_error, map_remove_error};
 use crate::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
 use crate::object::reclamation::CatalogTick;
@@ -12,10 +12,6 @@ use regex::Regex;
 
 impl ObjectBatchBackend for ObjectManager {
     type Tenant = ();
-
-    fn maintain(&self, now: CatalogTick, item_count: usize) {
-        let _ = ObjectManager::maintenance(self, now, batch_maintenance_budget(item_count));
-    }
 
     fn resolve_tenant(&self, _tenant_id: &str) -> Result<Self::Tenant, ErrorCode> {
         Ok(())
@@ -106,7 +102,8 @@ impl ObjectBatchBackend for ObjectManager {
         selector: ReplicaSelector,
         now: CatalogTick,
     ) -> Vec<ExpectedVoid> {
-        keys.iter()
+        let results = keys
+            .iter()
             .map(|key| {
                 ObjectManager::finish_put_at(
                     self,
@@ -117,7 +114,9 @@ impl ObjectBatchBackend for ObjectManager {
                 )
                 .map_err(map_manager_error)
             })
-            .collect()
+            .collect();
+        let _ = ObjectManager::maintenance(self, now, mutation_maintenance_budget(keys.len()));
+        results
     }
 
     fn revoke_put_batch(
@@ -128,7 +127,8 @@ impl ObjectBatchBackend for ObjectManager {
         selector: ReplicaSelector,
         now: CatalogTick,
     ) -> Vec<ExpectedVoid> {
-        keys.iter()
+        let results = keys
+            .iter()
             .map(|key| {
                 ObjectManager::revoke_put(
                     self,
@@ -139,7 +139,9 @@ impl ObjectBatchBackend for ObjectManager {
                 )
                 .map_err(map_manager_error)
             })
-            .collect()
+            .collect();
+        let _ = ObjectManager::maintenance(self, now, mutation_maintenance_budget(keys.len()));
+        results
     }
 
     fn remove_batch(
@@ -149,7 +151,7 @@ impl ObjectBatchBackend for ObjectManager {
         now: CatalogTick,
         force: bool,
     ) -> Vec<ExpectedVoid> {
-        ObjectManager::remove_batch(
+        let results = ObjectManager::remove_batch(
             self,
             keys.iter()
                 .map(|key| ObjectLookup::new(NamespaceId::DEFAULT, key)),
@@ -158,7 +160,9 @@ impl ObjectBatchBackend for ObjectManager {
         )
         .into_iter()
         .map(|result| result.map_err(map_remove_error))
-        .collect()
+        .collect();
+        let _ = ObjectManager::maintenance(self, now, mutation_maintenance_budget(keys.len()));
+        results
     }
 
     fn remove_matching(
@@ -168,13 +172,10 @@ impl ObjectBatchBackend for ObjectManager {
         now: CatalogTick,
         force: bool,
     ) -> Result<usize, ErrorCode> {
-        Ok(ObjectManager::remove_matching(
-            self,
-            NamespaceId::DEFAULT,
-            pattern,
-            now,
-            force,
-        ))
+        let removed =
+            ObjectManager::remove_matching(self, NamespaceId::DEFAULT, pattern, now, force);
+        let _ = ObjectManager::maintenance(self, now, mutation_maintenance_budget(removed));
+        Ok(removed)
     }
 
     fn remove_all(
@@ -183,13 +184,8 @@ impl ObjectBatchBackend for ObjectManager {
         now: CatalogTick,
         force: bool,
     ) -> Result<usize, ErrorCode> {
-        self.maintain(now, 1);
-        Ok(ObjectManager::remove_matching(
-            self,
-            NamespaceId::DEFAULT,
-            None,
-            now,
-            force,
-        ))
+        let removed = ObjectManager::remove_matching(self, NamespaceId::DEFAULT, None, now, force);
+        let _ = ObjectManager::maintenance(self, now, mutation_maintenance_budget(removed));
+        Ok(removed)
     }
 }

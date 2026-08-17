@@ -415,6 +415,14 @@ impl TenantRegistry {
         }
         targets.sort_unstable_by_key(|target| match target.filter {
             ReclaimFilter::Any => (0, 0),
+            ReclaimFilter::Class(replica_class) => (
+                0,
+                match replica_class {
+                    ReplicaClass::Memory => 0,
+                    ReplicaClass::Nof => 1,
+                    ReplicaClass::LocalSsd => 2,
+                },
+            ),
             ReclaimFilter::Scope {
                 namespace,
                 replica_class,

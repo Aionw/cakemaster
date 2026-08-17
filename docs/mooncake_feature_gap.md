@@ -134,16 +134,18 @@ force 同时绕过 lease/hard pin。replication task 尚未建模。
 - 没有 host-aware `local_first`；
 - 没有 deployment config 选择策略。
 
-当前 catalog 有 second-chance 风格的有界回收，benchmark binary 也有独立 watermark
-controller，但产品 server 没有上游的持续后台控制：
+当前 catalog 有 second-chance 风格的有界回收，production composition 已接入 Memory
+high/low watermark controller：按去重后的物理 capacity/used 计算回到 low 的 byte debt，
+区分 live/retired/实际 RAII reclaim，支持 allocation-failure 唤醒、有界同步回收和有限重试，
+并由 `MasterReconciler` 统一运行及 stop/join。与上游仍有这些差异：
 
-- Memory 和 NoF 独立 high watermark/eviction ratio；
-- allocation failure 触发同步/有界 eviction retry；
+- NoF 独立 high/low watermark；
 - group、replica busy 和 incomplete write 的完整候选过滤；
 - Count-Min Sketch promotion admission，以及 soft-pin 两阶段全局 priority；
 - client/segment 故障后的定向清理和容量重算。
 
-因此现有回收内核可保留，但还不能声称与 Mooncake eviction policy 等价。
+因此 Memory 基础闭环已经可用于 production runtime，但还不能声称与完整 Mooncake
+eviction policy 等价。
 
 上游依据：[`mooncake-store.md#AllocationStrategy`](https://github.com/kvcache-ai/Mooncake/blob/5c0724d22e7f04513a3453c8b6642a5a21b80b47/docs/source/design/mooncake-store.md#allocationstrategy)、
 [`master_config.h`](https://github.com/kvcache-ai/Mooncake/blob/5c0724d22e7f04513a3453c8b6642a5a21b80b47/mooncake-store/include/master_config.h#L24-L148)。
@@ -423,7 +425,7 @@ MarkTaskToComplete
   Mount/ReMount/Unmount；
 - 补齐单 key put、query 和管理所需的对象 API；remove/upsert 路由已完成基础内存语义；
 - 补 checksum、group、mixed replica、pin 持久化和两个 pending timeout 语义；
-- 接入 production watermark/eviction controller 与 metrics；
+- 扩展 NoF watermark、外部 metrics exporter、group eviction 和 soft-pin 全局 priority；
 - 用上游 C++ Client 完成 mount -> put -> get metadata -> remove -> remount 的 E2E。
 
 ### M2：动态运维与分层存储

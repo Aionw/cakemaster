@@ -44,12 +44,18 @@ liveness，到期后才 remove；它不等待 allocation 清零，也不执行�
 stale replica 并同步释放容量和 tenant quota。只要至少一个 replica 存活，对象仍然可见；
 最后一个 replica 失效时才退休整个对象。当前不会自动补齐被剪掉的 replica。
 
-每次 RPC 的 maintenance candidate budget 至少等于当前 batch item 数，因此批量写入
-不会固定每批加入 333 个 timeout candidate、却长期只清理默认的 64 个；reclaim 和空
-slot budget 仍使用固定上限。没有请求时，composition root 可从 service 构造
-`MasterReconciler`，默认每 100ms 依次执行 client cleanup、到期 Graceful unmount 和
-有界 object maintenance。RPC service 与 reconciler 共享 `Notify`：新增或提前 deadline
-会重算 timer，因此 Graceful 不受 100ms 周期量化。它使用 `MissedTickBehavior::Skip` 且
+常规 object maintenance 由 composition root 从 service 构造的
+`MasterReconciler` 驱动，不再放在每个 RPC batch 的前置路径；write finish/revoke/remove
+批次只在操作完成后补一个与 batch width 匹配的有界 step，用来及时排空本批产生的候选项，
+读请求不参与维护。reconciler 默认每 100ms 依次执行
+client cleanup、到期 Graceful unmount 和有界 object maintenance；topology、deadline 和
+memory pressure 通知会立即触发，产生物理进展的 step 会主动 yield 并重新调度下一轮，
+不把多个 step 合并成一个不可中断循环。production `ObjectManager` 同时启用 90%/80% Memory 高低水位；每个 step 在同一
+collector gate 内先回收、再按去重后的物理 capacity/used 计算本轮 Memory byte target。
+allocation failure 仍允许请求线程尝试一次有界回收。RPC service 与 reconciler 共享
+deadline/topology `Notify`，controller 另有 memory-pressure `Notify`，因此 Graceful 不受
+100ms 周期量化。
+它使用 `MissedTickBehavior::Skip` 且
 由调用方显式运行、停止并 join；同步
 领域 manager 和单个 handler 不会隐式启动后台任务。
 
@@ -76,7 +82,8 @@ process-local 的内存 backend。它按以下顺序只构造一份状态：
 ```text
 SegmentPool
     └── Arc<ObjectManager>
-          └── ObjectCatalogRpcService + MasterClock + ClientManager + Notify
+          ├── MemoryEvictionController + pressure Notify
+          └── ObjectCatalogRpcService + MasterClock + ClientManager + deadline Notify
                 ├── WrappedMasterServiceServer
                 └── MasterReconciler（从同一 service 派生）
 ```
@@ -101,8 +108,10 @@ cargo run --release -- \
 以 info 级别记录来源、路由、sequence、结果、请求/响应大小和耗时。Unix 同时监听
 Ctrl-C 和 SIGTERM，其他 Tokio 支持的平台监听
 Ctrl-C。当前默认沿用 core 已验证配置：64K expected objects、64K clients、10s client
-TTL、10s object lease、30s pending timeout、1GiB retired-byte ceiling 和 100ms
-reconcile interval。配置及 metadata 都只在内存中，重启不恢复；没有预挂载 segment，
+TTL、10s object lease、30s pending timeout、1GiB retired-byte ceiling、内部固定的 90%/80%
+Memory 水位和 100ms reconcile interval。完整 accounting、
+有界 failure retry 和 diagnostics 语义见 [`memory_eviction.md`](memory_eviction.md)。
+配置及 metadata 都只在内存中，重启不恢复；没有预挂载 segment，
 由 client 的 Mount/ReMount RPC 注册 Memory/CXL 容量。
 
 这个入口只部署本文列出的当前 `WrappedMasterService` 子集，不附带 HA、持久化、TLS、
@@ -117,16 +126,19 @@ backend callback 因此只包含对应的领域 batch 调用。
 
 ## ObjectManager 的职责与行为
 
-`ObjectManager` 是 put/get/exists 的领域协调器，只拥有一个 `ObjectCatalog` 和一个
-`ReplicaAllocator`。owner、per-key transaction、timeout candidate 和 committed version
-全部由 catalog 维护，不在 manager 中复制事务表与 deadline heap。它不决定 watermark
-或淘汰比例。
+`ObjectManager` 是 put/get/exists 的领域协调器，拥有一个 `ObjectCatalog`、一个
+`ReplicaAllocator` 和可选的 production Memory eviction controller。owner、
+per-key transaction、timeout candidate 和 committed version 全部由 catalog 维护，
+不在 manager 中复制事务表与 deadline heap。controller 的阈值来自 composition 配置，
+manager 只负责采样、设定 byte debt 和协调有界 collection。
 
 每个 catalog slot 只有两个正交状态：一个由 `ArcSwapOption` 保存、供 reader 无锁加载的
 immutable committed version，以及一个由 slot-local mutex 保护的 active transaction。
 active transaction 只有 `Claimed` 和 `Staged` 两个 phase；它不改变 committed pointer。
 因此不再用 `Claimed/Pending/Published/Updating/Retiring` 组合状态表达可见性，也没有
-rollback pointer。retired version 属于独立的物理回收队列。
+rollback pointer。retired version 属于独立的物理回收队列。controller 只决定何时设置
+全局 byte debt；second-chance、lease、pin、tenant scope、segment invalidation 和 RAII
+仍由 catalog/replica 层执行。
 
 `start_put` 的顺序为：
 

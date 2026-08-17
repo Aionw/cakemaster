@@ -1,18 +1,16 @@
-//! Real ObjectManager RPC server used by the Mooncake mixed-workload benchmark.
+//! Production-composed RPC server used by the Mooncake 1:1:1 pressure benchmark.
 
-use cakemaster::mooncake::WrappedMasterServiceServer;
+use cakemaster::client::ClientLifecycleConfig;
 use cakemaster::object::reclamation::CollectBudget;
-use cakemaster::object::{ObjectCatalogConfig, ObjectManager};
+use cakemaster::object::{MemoryEvictionConfig, ObjectCatalogConfig};
 use cakemaster::segment::{
-    ClientId, DirectCandidate, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool,
-    SegmentPoolConfig, SegmentSpec, TransportEndpoint, TransportProtocol,
+    ClientId, MemoryRegion, SegmentId, SegmentIdentity, SegmentPoolConfig, SegmentSpec,
+    TransportEndpoint, TransportProtocol,
 };
-use cakemaster::server::{MasterClock, ObjectCatalogRpcService};
+use cakemaster::server::{MasterReconcileConfig, MooncakeServerConfig};
 use std::error::Error;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::{Duration, Instant};
+use std::net::SocketAddr;
+use std::time::Duration;
 use tokio::runtime::Builder;
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:19094";
@@ -22,9 +20,15 @@ const DEFAULT_SEGMENT_BYTES: u64 = 1_150_561_798;
 const DEFAULT_EXPECTED_OBJECTS: usize = 4_000_000;
 const DEFAULT_MAX_ALLOCATIONS: u32 = 2_000_000;
 const DEFAULT_HIGH_WATERMARK: f64 = 0.90;
-const DEFAULT_EVICTION_RATIO: f64 = 0.05;
-const EVICTION_POLL_INTERVAL: Duration = Duration::from_millis(10);
-const IDLE_SAMPLE_INTERVAL: Duration = Duration::from_millis(1);
+const DEFAULT_LOW_WATERMARK: f64 = 0.85;
+const BENCHMARK_RECONCILE_INTERVAL: Duration = Duration::from_millis(10);
+const BENCHMARK_CLIENT_TTL_TICKS: u64 = 60 * 60 * 1_000;
+const BENCHMARK_CLIENTS: [ClientId; 4] = [
+    ClientId::new(0xBEEF, 1),
+    ClientId::new(0xCAFE, 1),
+    ClientId::new(0xCAFE, 2),
+    ClientId::new(0xCAFE, 3),
+];
 
 #[derive(Clone, Copy)]
 struct Arguments {
@@ -33,57 +37,7 @@ struct Arguments {
     expected_objects: usize,
     max_allocations: u32,
     high_watermark: f64,
-    eviction_ratio: f64,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct EvictionStats {
-    reclaim_events: u64,
-    reclaimed_objects: u64,
-    reclaimed_bytes: u64,
-    observed_capacity_drops: u64,
-    maximum_used_ratio: f64,
-}
-
-struct EvictionController {
-    stop: Arc<AtomicBool>,
-    worker: Option<thread::JoinHandle<EvictionStats>>,
-}
-
-impl EvictionController {
-    fn start(
-        manager: Arc<ObjectManager>,
-        candidate: DirectCandidate,
-        high_watermark: f64,
-        eviction_ratio: f64,
-        clock: MasterClock,
-    ) -> Self {
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_stop = stop.clone();
-        let worker = thread::spawn(move || {
-            run_eviction_controller(
-                manager,
-                candidate,
-                high_watermark,
-                eviction_ratio,
-                worker_stop,
-                clock,
-            )
-        });
-        Self {
-            stop,
-            worker: Some(worker),
-        }
-    }
-
-    fn stop(mut self) -> EvictionStats {
-        self.stop.store(true, Ordering::Release);
-        self.worker
-            .take()
-            .expect("eviction worker is present")
-            .join()
-            .expect("eviction worker must not panic")
-    }
+    low_watermark: f64,
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -95,7 +49,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         expected_objects: parse_or(values.next(), DEFAULT_EXPECTED_OBJECTS)?.max(1),
         max_allocations: parse_or(values.next(), DEFAULT_MAX_ALLOCATIONS)?,
         high_watermark: parse_or(values.next(), DEFAULT_HIGH_WATERMARK)?,
-        eviction_ratio: parse_or(values.next(), DEFAULT_EVICTION_RATIO)?,
+        low_watermark: parse_or(values.next(), DEFAULT_LOW_WATERMARK)?,
     };
     validate(arguments)?;
 
@@ -107,10 +61,24 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn run_server(address: &str, arguments: Arguments) -> Result<(), Box<dyn Error>> {
-    let pool = Arc::new(SegmentPool::with_config(SegmentPoolConfig::new(
-        arguments.max_allocations,
-    ))?);
-    let candidate = pool
+    let listen_addr: SocketAddr = address.parse()?;
+    let memory_eviction =
+        MemoryEvictionConfig::new(arguments.high_watermark, arguments.low_watermark)?;
+    let reconcile =
+        MasterReconcileConfig::new(BENCHMARK_RECONCILE_INTERVAL, CollectBudget::default())?;
+    let config = MooncakeServerConfig::default()
+        .with_listen_addr(listen_addr)
+        .with_segment_pool(SegmentPoolConfig::new(arguments.max_allocations))
+        .with_object_catalog(ObjectCatalogConfig::new(arguments.expected_objects))
+        .with_memory_eviction(memory_eviction)
+        .with_client_lifecycle(
+            ClientLifecycleConfig::new(BENCHMARK_CLIENTS.len())
+                .with_ttl(BENCHMARK_CLIENT_TTL_TICKS),
+        )
+        .with_reconcile(reconcile);
+    let composition = config.build()?;
+    let candidate = composition
+        .pool()
         .attach(SegmentSpec::memory(
             SegmentIdentity::new(
                 SegmentId::new(1, 1),
@@ -122,32 +90,24 @@ async fn run_server(address: &str, arguments: Arguments) -> Result<(), Box<dyn E
         ))?
         .direct_candidate()
         .expect("a Memory segment supports direct reservations");
-    let manager = Arc::new(ObjectManager::with_config(
-        pool,
-        ObjectCatalogConfig::new(arguments.expected_objects),
-    )?);
-    let clock = MasterClock::new();
-    let controller = EvictionController::start(
-        manager.clone(),
-        candidate.clone(),
-        arguments.high_watermark,
-        arguments.eviction_ratio,
-        clock.clone(),
-    );
-    let server = WrappedMasterServiceServer::new(ObjectCatalogRpcService::new_with_clock(
-        manager.clone(),
-        clock,
-    ))
-    .into_rpc_server()?;
-    let bound = server.bind(address).await?;
+    for client in BENCHMARK_CLIENTS {
+        composition.service().client_manager().remount(
+            client,
+            Vec::new(),
+            composition.clock().client_now(),
+        )?;
+    }
+    let manager = composition.manager().clone();
+    let bound = composition.bind().await?;
     println!(
-        "object_catalog_rpc_server_ready={} threads={} segment_bytes={} expected_objects={} high_watermark={:.3} eviction_ratio={:.3}",
+        "object_catalog_rpc_server_ready={} threads={} segment_bytes={} expected_objects={} high_watermark={:.3} low_watermark={:.3} reconcile_interval_ms={}",
         bound.local_addr()?,
         arguments.threads,
         arguments.segment_bytes,
         arguments.expected_objects,
         arguments.high_watermark,
-        arguments.eviction_ratio,
+        arguments.low_watermark,
+        BENCHMARK_RECONCILE_INTERVAL.as_millis(),
     );
     bound
         .run_until(async {
@@ -155,77 +115,52 @@ async fn run_server(address: &str, arguments: Arguments) -> Result<(), Box<dyn E
         })
         .await?;
 
-    let eviction = controller.stop();
     let catalog = manager.catalog().stats();
     let space = candidate.stats().space;
+    let eviction = manager
+        .memory_eviction_stats()
+        .expect("the benchmark uses the production memory eviction controller");
+    let final_used_ratio = space.used_bytes as f64 / space.capacity_bytes as f64;
+    let maximum_used_ratio = eviction.maximum_used_ratio_ppm as f64 / 1_000_000.0;
+    let watermark_triggered = eviction.trigger_events != 0;
+    let settled_to_low = space.used_bytes <= eviction.low_watermark_bytes
+        && catalog.reclaim_debt == 0
+        && catalog.retired_bytes == 0;
     println!(
-        "object_catalog_rpc_server_final published_objects={} live_bytes={} retired_bytes={} reclaim_debt={} used_bytes={} used_ratio={:.6} reclaim_events={} controller_reclaimed_objects={} controller_reclaimed_bytes={} observed_capacity_drops={} maximum_used_ratio={:.6}",
+        "object_catalog_rpc_server_final published_objects={} pending_bytes={} live_bytes={} retired_bytes={} reclaim_debt={} requested_reclaim_debt={} allocation_reclaim_debt={} watermark_reclaim_debt={} capacity_bytes={} used_bytes={} used_ratio={:.6} high_watermark_bytes={} low_watermark_bytes={} maximum_used_bytes={} maximum_used_ratio={:.6} watermark_triggered={} settled_to_low={} trigger_events={} controller_steps={} busy_steps={} controller_retired_objects={} controller_retired_bytes={} controller_reclaimed_objects={} controller_reclaimed_bytes={} allocation_failures={} allocation_retries={} allocation_retry_successes={} wakeups={}",
         catalog.published_objects,
+        catalog.pending_bytes,
         catalog.live_bytes,
         catalog.retired_bytes,
         catalog.reclaim_debt,
+        eviction.requested_reclaim_debt_bytes,
+        eviction.allocation_reclaim_debt_bytes,
+        eviction.watermark_reclaim_debt_bytes,
+        space.capacity_bytes,
         space.used_bytes,
-        space.used_bytes as f64 / space.capacity_bytes as f64,
-        eviction.reclaim_events,
+        final_used_ratio,
+        eviction.high_watermark_bytes,
+        eviction.low_watermark_bytes,
+        eviction.maximum_used_bytes,
+        maximum_used_ratio,
+        watermark_triggered,
+        settled_to_low,
+        eviction.trigger_events,
+        eviction.controller_steps,
+        eviction.busy_steps,
+        eviction.retired_objects,
+        eviction.retired_bytes_total,
         eviction.reclaimed_objects,
-        eviction.reclaimed_bytes,
-        eviction.observed_capacity_drops,
-        eviction.maximum_used_ratio,
+        eviction.reclaimed_bytes_total,
+        eviction.allocation_failures,
+        eviction.allocation_retries,
+        eviction.allocation_retry_successes,
+        eviction.wakeups,
     );
-    Ok(())
-}
-
-fn run_eviction_controller(
-    manager: Arc<ObjectManager>,
-    candidate: DirectCandidate,
-    high_watermark: f64,
-    eviction_ratio: f64,
-    stop: Arc<AtomicBool>,
-    clock: MasterClock,
-) -> EvictionStats {
-    let mut stats = EvictionStats::default();
-    let mut next_trigger = Instant::now();
-    let mut previous_used = 0_u64;
-
-    while !stop.load(Ordering::Acquire) {
-        let now = Instant::now();
-        let space = candidate.stats().space;
-        let used_ratio = space.used_bytes as f64 / space.capacity_bytes as f64;
-        stats.maximum_used_ratio = stats.maximum_used_ratio.max(used_ratio);
-        if previous_used > space.used_bytes {
-            stats.observed_capacity_drops += 1;
-        }
-        previous_used = space.used_bytes;
-
-        let catalog = manager.catalog().stats();
-        if now >= next_trigger {
-            if used_ratio > high_watermark && catalog.reclaim_debt == 0 {
-                let target_ratio = eviction_ratio
-                    .max(used_ratio - high_watermark + eviction_ratio)
-                    .min(1.0);
-                let target_bytes = ((catalog.live_bytes as f64) * target_ratio).ceil() as u64;
-                if target_bytes != 0 {
-                    manager.catalog().request_reclaim(target_bytes);
-                    stats.reclaim_events += 1;
-                }
-            }
-            next_trigger = now + EVICTION_POLL_INTERVAL;
-        }
-
-        let catalog = manager.catalog().stats();
-        if catalog.reclaim_debt != 0 || catalog.retired_bytes != 0 {
-            let report = manager.maintenance(clock.now(), CollectBudget::default());
-            stats.reclaimed_objects = stats
-                .reclaimed_objects
-                .saturating_add(report.catalog.reclaimed_objects as u64);
-            stats.reclaimed_bytes = stats
-                .reclaimed_bytes
-                .saturating_add(report.catalog.reclaimed_bytes);
-            continue;
-        }
-        thread::sleep(IDLE_SAMPLE_INTERVAL);
+    if !watermark_triggered {
+        return Err("benchmark did not cross the configured high watermark".into());
     }
-    stats
+    Ok(())
 }
 
 fn parse_or<T>(value: Option<String>, default: T) -> Result<T, T::Err>
@@ -242,11 +177,6 @@ fn validate(arguments: Arguments) -> Result<(), Box<dyn Error>> {
     if arguments.max_allocations < 3 || arguments.max_allocations >= u32::MAX - 1 {
         return Err("max_allocations must be in [3, u32::MAX - 1)".into());
     }
-    if !(0.0..1.0).contains(&arguments.high_watermark) {
-        return Err("high_watermark must be in [0, 1)".into());
-    }
-    if !(0.0..=1.0).contains(&arguments.eviction_ratio) || arguments.eviction_ratio == 0.0 {
-        return Err("eviction_ratio must be in (0, 1]".into());
-    }
+    MemoryEvictionConfig::new(arguments.high_watermark, arguments.low_watermark)?;
     Ok(())
 }

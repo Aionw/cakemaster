@@ -15,6 +15,7 @@ pub mod config;
 mod content;
 pub mod diagnostics;
 pub mod error;
+mod eviction;
 mod identity;
 mod manager;
 pub mod reclamation;
@@ -31,6 +32,10 @@ pub use config::{
     DEFAULT_SOFT_PIN_TTL_TICKS, ObjectCatalogConfig, ObjectPinRequest, SoftPinAction,
 };
 pub use content::{ObjectContent, ObjectKind};
+pub use eviction::{
+    DEFAULT_ALLOCATION_FAILURE_BUDGET, MemoryEvictionConfig, MemoryEvictionConfigError,
+    MemoryEvictionStats,
+};
 pub use identity::{NamespaceId, ObjectIdentity, ObjectKey, ObjectLookup};
 pub use manager::{
     AllocatedReplica, ObjectManager, ObjectManagerMaintenance, ObjectPutPlan, PendingWriteRevoker,

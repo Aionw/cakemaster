@@ -7,6 +7,7 @@
 
 use super::super::error::{AbortError, BeginError, CommitError};
 use super::*;
+use crate::segment::ReplicaClass;
 use scc::hash_map::Entry;
 use std::collections::HashSet;
 
@@ -205,20 +206,32 @@ impl ObjectCatalog {
         control.active = None;
         let committed_bytes = version.record().reserved_bytes();
         let replaced_bytes = base.as_ref().map(|old| old.record().reserved_bytes());
+        let replaced_memory_bytes = base.as_ref().map_or(0, |old| {
+            if old.record().current_direct_replica_class() == Some(ReplicaClass::Memory) {
+                old.record().reserved_bytes()
+            } else {
+                0
+            }
+        });
         self.inner
             .lifecycle
-            .on_commit(committed_bytes, replaced_bytes);
+            .on_commit(committed_bytes, replaced_bytes, replaced_memory_bytes);
         drop(control);
 
         self.inner
             .collector
+            .eviction
             .young
             .push(GcCandidate::new(&slot, &version));
         if let Some(deadline) = version.access().soft_pin_until() {
-            self.inner.collector.soft_pins.push(SoftPinCandidate {
-                candidate: GcCandidate::new(&slot, &version),
-                deadline,
-            });
+            self.inner
+                .collector
+                .eviction
+                .soft_pins
+                .push(SoftPinCandidate {
+                    candidate: GcCandidate::new(&slot, &version),
+                    deadline,
+                });
         }
         if let Some(old) = base {
             old.record().mark_accounting_retiring();
@@ -232,10 +245,7 @@ impl ObjectCatalog {
             });
         }
         if !version.record().replicas.read().all_live() {
-            self.inner
-                .collector
-                .liveness_scan_requested
-                .store(true, Ordering::Release);
+            self.inner.collector.liveness.request();
         }
         Ok(ObjectHandle { version })
     }
@@ -290,10 +300,7 @@ impl ObjectCatalog {
             self.inner.enqueue_empty(&slot, now);
         }
         if base_is_invalid {
-            self.inner
-                .collector
-                .liveness_scan_requested
-                .store(true, Ordering::Release);
+            self.inner.collector.liveness.request();
         }
         Ok(())
     }
@@ -344,12 +351,16 @@ impl ObjectCatalog {
         transaction_id: TransactionId,
         now: CatalogTick,
     ) {
-        self.inner.collector.pending.push(PendingCandidate {
-            slot: Arc::downgrade(slot),
-            pending: Arc::downgrade(pending),
-            transaction_id,
-            deadline: now.saturating_add(self.inner.config.pending_timeout_ticks),
-        });
+        self.inner
+            .collector
+            .pending
+            .candidates
+            .push(PendingCandidate {
+                slot: Arc::downgrade(slot),
+                pending: Arc::downgrade(pending),
+                transaction_id,
+                deadline: now.saturating_add(self.inner.config.pending_timeout_ticks),
+            });
     }
 }
 
@@ -412,7 +423,7 @@ impl WriteClaim {
         ));
         let reserved_bytes = pending.record().reserved_bytes();
 
-        let _stage = catalog.collector.pending_stage_gate.read();
+        let _stage = catalog.collector.pending.stage_gate.read();
         let mut control = slot.control.lock();
         let Some(active) = control.active.as_mut() else {
             return Err(StageError::ClaimLost);
@@ -477,10 +488,7 @@ impl Drop for WriteClaim {
             catalog.enqueue_empty(&slot, self.started_at);
         }
         if base_is_invalid {
-            catalog
-                .collector
-                .liveness_scan_requested
-                .store(true, Ordering::Release);
+            catalog.collector.liveness.request();
         }
     }
 }
