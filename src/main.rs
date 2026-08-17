@@ -4,9 +4,13 @@ use cakemaster::server::{DEFAULT_MOONCAKE_LISTEN_ADDR, MooncakeServerConfig};
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
 use logging::{LoggingConfig, LoggingOverrides};
+use mimalloc::MiMalloc;
 use std::error::Error;
 use std::future::Future;
 use std::io;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
 
 #[derive(Debug, Parser)]
 #[command(version, about)]
