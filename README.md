@@ -83,7 +83,10 @@ cargo run --release -- \
 使用 `ServerConfig::default().with_access_log(true)` 开启。binary 在同一个 composition
 root 中只构建一次 `SegmentPool`、内存态
 `ObjectManager`、`MasterClock` 和 `ObjectCatalogRpcService`，并从 service 派生共享
-`ClientManager`、clock 和 deadline `Notify` 的 `MasterReconciler`。RPC server 与 reconciler
+`ClientManager`、clock、deadline `Notify` 和 memory-pressure `Notify` 的
+`MasterReconciler`。production manager 使用内部固定的 90%/80% 高低水位驱动有界 Memory eviction；
+水位、物理容量/used、live/retired/debt accounting、allocation-failure 有限重试与诊断详见
+[`docs/memory_eviction.md`](docs/memory_eviction.md)。RPC server 与 reconciler
 并发运行；Unix 上 Ctrl-C/SIGTERM、其他平台上 Ctrl-C 会通知两者停止，进程等待监听器、
 所有连接 task 和 reconciler 完整退出后才返回。
 
@@ -111,7 +114,8 @@ cakemaster \
 - `coro_rpc::client::{connection,request}`：客户端连接驱动错误和请求超时；
 - `cakemaster::server::rpc::{business,mapping}`：Mooncake 业务错误摘要及内部错误映射；
 - `cakemaster::client::{lifecycle,manager}`：client generation 状态转换和 cleanup/unmount 重试；
-- `cakemaster::object::manager`、`cakemaster::server::reconciler`：领域 invariant 与后台收敛。
+- `cakemaster::object::{manager,eviction}`、`cakemaster::server::{reconciler,eviction}`：领域
+  invariant、allocation-failure bounded work、后台收敛与 memory watermark/debt 诊断。
 
 例如，保留默认业务日志、打开 RPC 请求完成记录并压低正常连接日志：
 
@@ -340,19 +344,23 @@ Memory/NoF quota admission。
 [`tests/rpc.rs`](tests/rpc.rs)
 和
 [`tests/client_lifecycle_rpc.rs`](tests/client_lifecycle_rpc.rs)。
-线上比例 benchmark 使用每批 333 key、BatchPut/Get/Exists 各 150 QPS、100 万 key
-预填充和 50 万热集：
+线上比例 benchmark 使用三条独立的 BatchPut/Get/Exists 流，三者采用相同 batch 和
+目标 QPS。benchmark server 复用 production `MooncakeServerComposition` 和
+`MasterReconciler`；它的默认 high/low watermark 为 0.90/0.85，并在退出时输出最大/最终
+物理水位、debt、retired/reclaimed、allocation failure/retry 等闭环诊断。下面的缩放
+高压配置先把 1 KiB 对象预填到约 89%，再以每类 300 batch QPS 持续越过 high：
 
 ```bash
 cargo build --release --bin object_catalog_rpc_benchmark_server
-target/release/object_catalog_rpc_benchmark_server
+target/release/object_catalog_rpc_benchmark_server \
+  127.0.0.1:19094 8 115056180 2000000 500000 0.90 0.85
 
 g++ -std=c++20 -O3 -DNDEBUG \
   -I /path/to/Mooncake/extern/yalantinglibs/include \
   -I /path/to/Mooncake/extern/yalantinglibs/include/ylt/thirdparty \
   interop/mooncake_benchmark.cpp -pthread -o /tmp/mooncake_benchmark
 /tmp/mooncake_benchmark mixed-client \
-  127.0.0.1 19094 333 150 30 10 1000000 500000 1024
+  127.0.0.1 19094 333 300 10 3 100000 50000 1024
 ```
 
 同一个 C++ client 对 Rust 和 C++ Mooncake Master 的实测结果、原始范围与完整复现

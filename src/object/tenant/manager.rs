@@ -1,3 +1,4 @@
+use super::super::MemoryEvictionConfig;
 use super::super::catalog::{ObjectCatalog, ObjectRead};
 use super::super::config::ObjectCatalogConfig;
 use super::super::diagnostics::ObjectCatalogStats;
@@ -112,6 +113,25 @@ impl TenantObjectManager {
         tenant_config: TenantConfig,
     ) -> Result<Self, TenantObjectManagerCreateError> {
         let object = ObjectManager::with_config(pool.clone(), object_config)?;
+        Self::from_object_manager(pool, tenant_config, object)
+    }
+
+    pub fn with_eviction_config(
+        pool: Arc<SegmentPool>,
+        object_config: ObjectCatalogConfig,
+        tenant_config: TenantConfig,
+        eviction_config: MemoryEvictionConfig,
+    ) -> Result<Self, TenantObjectManagerCreateError> {
+        let object =
+            ObjectManager::with_eviction_config(pool.clone(), object_config, eviction_config)?;
+        Self::from_object_manager(pool, tenant_config, object)
+    }
+
+    fn from_object_manager(
+        pool: Arc<SegmentPool>,
+        tenant_config: TenantConfig,
+        object: ObjectManager,
+    ) -> Result<Self, TenantObjectManagerCreateError> {
         let catalog = TenantCatalog {
             inner: object.catalog().clone(),
         };
@@ -133,6 +153,10 @@ impl TenantObjectManager {
 
     pub fn pending_write_revoker(&self) -> PendingWriteRevoker {
         self.object.pending_write_revoker()
+    }
+
+    pub(crate) fn memory_eviction_notify(&self) -> Option<Arc<tokio::sync::Notify>> {
+        self.object.memory_eviction_notify()
     }
 
     pub fn resolve_tenant(

@@ -2,12 +2,19 @@
 //! reclamation.
 
 use super::*;
+use crate::segment::ReplicaClass;
 use std::collections::HashSet;
 
 enum ScopedCandidate {
     Stale,
     Unmatched,
-    Match(usize),
+    Matches(Vec<usize>),
+}
+
+#[derive(Clone, Copy, Default)]
+struct RetiredBytes {
+    physical: u64,
+    quota: u64,
 }
 
 impl ObjectCatalog {
@@ -63,14 +70,11 @@ impl ObjectCatalog {
     }
 
     pub fn request_reclaim(&self, bytes: u64) {
-        self.inner.collector.request_reclaim(bytes);
+        self.inner.collector.reclaim.request(bytes);
     }
 
     pub(in crate::object) fn request_liveness_scan(&self) {
-        self.inner
-            .collector
-            .liveness_scan_requested
-            .store(true, Ordering::Release);
+        self.inner.collector.liveness.request();
     }
 
     pub fn collect_step(&self, now: CatalogTick, budget: CollectBudget) -> CollectReport {
@@ -83,47 +87,78 @@ impl ObjectCatalog {
         budget: CollectBudget,
         targets: &[ReclaimTarget],
     ) -> CollectReport {
-        let Some(_collector) = self.inner.collector.gate.try_lock() else {
+        self.collect_step_inner(now, budget, targets, false, || 0, |_| {})
+    }
+
+    pub(in super::super) fn collect_step_with_targets_and_watermark<P, F>(
+        &self,
+        now: CatalogTick,
+        budget: CollectBudget,
+        targets: &[ReclaimTarget],
+        prepare_watermark: P,
+        finish_watermark: F,
+    ) -> CollectReport
+    where
+        P: FnOnce() -> u64,
+        F: FnOnce(CollectReport),
+    {
+        self.collect_step_inner(
+            now,
+            budget,
+            targets,
+            true,
+            prepare_watermark,
+            finish_watermark,
+        )
+    }
+
+    fn collect_step_inner<P, F>(
+        &self,
+        now: CatalogTick,
+        budget: CollectBudget,
+        targets: &[ReclaimTarget],
+        reclaim_first: bool,
+        prepare_watermark: P,
+        finish_watermark: F,
+    ) -> CollectReport
+    where
+        P: FnOnce() -> u64,
+        F: FnOnce(CollectReport),
+    {
+        let Some(_collector) = self.inner.collector.step_gate.try_lock() else {
             return CollectReport {
                 busy: true,
                 ..CollectReport::default()
             };
         };
 
-        if self
-            .inner
-            .collector
-            .liveness_scan_requested
-            .swap(false, Ordering::AcqRel)
-        {
-            self.inner
-                .collector
-                .liveness_young_remaining
-                .fetch_max(self.inner.collector.young.len(), Ordering::Release);
-            self.inner
-                .collector
-                .liveness_protected_remaining
-                .fetch_max(self.inner.collector.protected.len(), Ordering::Release);
+        let mut report = CollectReport::default();
+        let reclaim_attempts = if reclaim_first {
+            self.inner.reclaim(now, budget, &mut report)
+        } else {
+            0
+        };
+        let watermark_reclaim_bytes = prepare_watermark();
+        let mut scoped_targets = Vec::with_capacity(targets.len() + 1);
+        scoped_targets.extend_from_slice(targets);
+        if watermark_reclaim_bytes != 0 {
+            scoped_targets.push(ReclaimTarget {
+                filter: ReclaimFilter::Class(ReplicaClass::Memory),
+                bytes: watermark_reclaim_bytes,
+            });
         }
 
-        let mut report = CollectReport::default();
+        self.inner
+            .collector
+            .liveness
+            .begin_if_requested(&self.inner.collector.eviction);
+
         self.inner.expire_soft_pins(now, budget, &mut report);
         let liveness_scanned = self
             .inner
             .retire_invalidated_published(now, budget, &mut report);
         self.inner.expire_pending(now, budget, &mut report);
-        let liveness_incomplete = self
-            .inner
-            .collector
-            .liveness_young_remaining
-            .load(Ordering::Acquire)
-            != 0
-            || self
-                .inner
-                .collector
-                .liveness_protected_remaining
-                .load(Ordering::Acquire)
-                != 0;
+        let liveness_incomplete = self.inner.collector.liveness.is_incomplete();
         if !liveness_incomplete {
             let eviction_budget = CollectBudget::new(
                 budget.max_candidates.saturating_sub(liveness_scanned),
@@ -132,7 +167,7 @@ impl ObjectCatalog {
             );
             let scoped_scanned =
                 self.inner
-                    .evict_scoped(now, eviction_budget, targets, &mut report);
+                    .evict_scoped(now, eviction_budget, &scoped_targets, &mut report);
             let global_budget = CollectBudget::new(
                 eviction_budget
                     .max_candidates
@@ -142,8 +177,18 @@ impl ObjectCatalog {
             );
             self.inner.evict(now, global_budget, &mut report);
         }
-        self.inner.reclaim(now, budget, &mut report);
+        let remaining_reclaims = budget.max_reclaims.saturating_sub(reclaim_attempts);
+        self.inner.reclaim(
+            now,
+            CollectBudget::new(
+                budget.max_candidates,
+                remaining_reclaims,
+                budget.max_empty_slots,
+            ),
+            &mut report,
+        );
         self.inner.clean_empty_slots(now, budget, &mut report);
+        finish_watermark(report);
         report
     }
 }
@@ -155,9 +200,14 @@ impl CatalogInner {
         budget: CollectBudget,
         report: &mut CollectReport,
     ) {
-        let candidates = self.collector.soft_pins.len().min(budget.max_candidates);
+        let candidates = self
+            .collector
+            .eviction
+            .soft_pins
+            .len()
+            .min(budget.max_candidates);
         for _ in 0..candidates {
-            let Some(candidate) = self.collector.soft_pins.pop() else {
+            let Some(candidate) = self.collector.eviction.soft_pins.pop() else {
                 break;
             };
             report.scanned_soft_pins += 1;
@@ -171,7 +221,7 @@ impl CatalogInner {
                 continue;
             }
             if candidate.deadline > now {
-                self.collector.soft_pins.push(candidate);
+                self.collector.eviction.soft_pins.push(candidate);
                 continue;
             }
             if version.access().expire_soft_pin(candidate.deadline, now) {
@@ -188,12 +238,12 @@ impl CatalogInner {
     ) -> usize {
         let generations = [
             (
-                &self.collector.young,
-                &self.collector.liveness_young_remaining,
+                &self.collector.eviction.young,
+                &self.collector.liveness.young_remaining,
             ),
             (
-                &self.collector.protected,
-                &self.collector.liveness_protected_remaining,
+                &self.collector.eviction.protected,
+                &self.collector.liveness.protected_remaining,
             ),
         ];
         let mut resources = ReplicaReclaimBatch::default();
@@ -250,7 +300,7 @@ impl CatalogInner {
                         let stale_bytes = stale.reserved_bytes();
                         version.record().release_pruned_accounting(&stale);
                         self.lifecycle.on_prune_published(stale_bytes);
-                        self.collector.on_reclaim(stale_bytes);
+                        self.collector.reclaim.on_reclaim(stale_bytes);
                         drop(control);
                         resources.extend(stale);
                         report.pruned_objects += 1;
@@ -279,8 +329,9 @@ impl CatalogInner {
 
     pub(super) fn retire_aborted_pending(&self, pending: Arc<ObjectVersion>, now: CatalogTick) {
         let bytes = pending.record().reserved_bytes();
+        let memory = pending.record().current_direct_replica_class() == Some(ReplicaClass::Memory);
         pending.record().abort_accounting();
-        self.lifecycle.on_abort_pending(bytes);
+        self.lifecycle.on_abort_pending(bytes, memory);
         self.collector.retired.push(RetiredObject {
             version: pending,
             reserved_bytes: bytes,
@@ -321,9 +372,7 @@ impl CatalogInner {
             self.enqueue_empty(slot, now);
         }
         if base_is_invalid {
-            self.collector
-                .liveness_scan_requested
-                .store(true, Ordering::Release);
+            self.collector.liveness.request();
         }
         true
     }
@@ -359,11 +408,11 @@ impl CatalogInner {
         if owners.is_empty() {
             return 0;
         }
-        let _collector = self.collector.gate.lock();
+        let _collector = self.collector.step_gate.lock();
         let candidates = {
-            let _stages = self.collector.pending_stage_gate.write();
-            let mut candidates = Vec::with_capacity(self.collector.pending.len());
-            while let Some(pending) = self.collector.pending.pop() {
+            let _stages = self.collector.pending.stage_gate.write();
+            let mut candidates = Vec::with_capacity(self.collector.pending.candidates.len());
+            while let Some(pending) = self.collector.pending.candidates.pop() {
                 candidates.push(pending);
             }
             candidates
@@ -374,7 +423,7 @@ impl CatalogInner {
                 continue;
             };
             if !owners.contains(&owner) {
-                self.collector.pending.push(candidate);
+                self.collector.pending.candidates.push(candidate);
                 continue;
             }
             if self.abort_pending(&slot, candidate.transaction_id, &pending, now) {
@@ -385,9 +434,14 @@ impl CatalogInner {
     }
 
     fn expire_pending(&self, now: CatalogTick, budget: CollectBudget, report: &mut CollectReport) {
-        let candidates = self.collector.pending.len().min(budget.max_candidates);
+        let candidates = self
+            .collector
+            .pending
+            .candidates
+            .len()
+            .min(budget.max_candidates);
         for _ in 0..candidates {
-            let Some(candidate) = self.collector.pending.pop() else {
+            let Some(candidate) = self.collector.pending.candidates.pop() else {
                 break;
             };
             let Some(pending) = candidate.pending.upgrade() else {
@@ -398,7 +452,7 @@ impl CatalogInner {
             }
             let all_live = pending.record().replicas.read().all_live();
             if all_live && candidate.deadline > now {
-                self.collector.pending.push(candidate);
+                self.collector.pending.candidates.push(candidate);
                 continue;
             }
             let Some(slot) = candidate.slot.upgrade() else {
@@ -424,8 +478,9 @@ impl CatalogInner {
         enqueue_empty: bool,
     ) {
         let bytes = version.record().reserved_bytes();
+        let memory = version.record().current_direct_replica_class() == Some(ReplicaClass::Memory);
         version.record().mark_accounting_retiring();
-        self.lifecycle.on_retire_published(bytes);
+        self.lifecycle.on_retire_published(bytes, memory);
         self.collector.retired.push(RetiredObject {
             version,
             reserved_bytes: bytes,
@@ -438,10 +493,14 @@ impl CatalogInner {
 
     fn evict(&self, now: CatalogTick, budget: CollectBudget, report: &mut CollectReport) {
         let generations = [
-            (&self.collector.young, self.collector.young.len(), false),
             (
-                &self.collector.protected,
-                self.collector.protected.len(),
+                &self.collector.eviction.young,
+                self.collector.eviction.young.len(),
+                false,
+            ),
+            (
+                &self.collector.eviction.protected,
+                self.collector.eviction.protected.len(),
                 true,
             ),
         ];
@@ -479,10 +538,14 @@ impl CatalogInner {
             return 0;
         }
         let generations = [
-            (&self.collector.young, self.collector.young.len(), false),
             (
-                &self.collector.protected,
-                self.collector.protected.len(),
+                &self.collector.eviction.young,
+                self.collector.eviction.young.len(),
+                false,
+            ),
+            (
+                &self.collector.eviction.protected,
+                self.collector.eviction.protected.len(),
                 true,
             ),
         ];
@@ -498,13 +561,21 @@ impl CatalogInner {
                 };
                 scanned += 1;
                 match self.classify_scoped_candidate(&candidate, &debts) {
-                    ScopedCandidate::Match(index) => {
+                    ScopedCandidate::Matches(indices) => {
                         let retired = self.evict_candidate(candidate, from_protected, now, report);
-                        if retired > 0 {
-                            debts[index].1 = debts[index].1.saturating_sub(retired);
+                        if retired.physical > 0 {
+                            for index in indices {
+                                let amount = match debts[index].0 {
+                                    ReclaimFilter::Scope { .. } => retired.quota,
+                                    ReclaimFilter::Any | ReclaimFilter::Class(_) => {
+                                        retired.physical
+                                    }
+                                };
+                                debts[index].1 = debts[index].1.saturating_sub(amount);
+                            }
                             report.scoped_retired_objects += 1;
                             report.scoped_retired_bytes =
-                                report.scoped_retired_bytes.saturating_add(retired);
+                                report.scoped_retired_bytes.saturating_add(retired.physical);
                         }
                     }
                     ScopedCandidate::Unmatched => {
@@ -533,28 +604,37 @@ impl CatalogInner {
             return ScopedCandidate::Stale;
         }
         let record = version.record();
-        debts
+        let matches: Vec<_> = debts
             .iter()
-            .position(|(filter, debt)| {
-                *debt > 0
-                    && match filter {
+            .enumerate()
+            .filter_map(|(index, (filter, debt))| {
+                (*debt > 0
+                    && match *filter {
                         ReclaimFilter::Any => true,
+                        ReclaimFilter::Class(replica_class) => {
+                            record.current_direct_replica_class() == Some(replica_class)
+                        }
                         ReclaimFilter::Scope {
                             namespace,
                             replica_class,
                         } => {
                             record.is_accounted()
-                                && record.identity.namespace() == *namespace
-                                && record.current_direct_replica_class() == Some(*replica_class)
+                                && record.identity.namespace() == namespace
+                                && record.current_direct_replica_class() == Some(replica_class)
                         }
-                    }
+                    })
+                .then_some(index)
             })
-            .map_or(ScopedCandidate::Unmatched, ScopedCandidate::Match)
+            .collect();
+        if matches.is_empty() {
+            ScopedCandidate::Unmatched
+        } else {
+            ScopedCandidate::Matches(matches)
+        }
     }
 
     fn reclaim_target_is_covered(&self) -> bool {
-        self.collector.reclaim_debt.load(Ordering::Relaxed)
-            <= self.lifecycle.retired_bytes.load(Ordering::Relaxed)
+        self.collector.reclaim.requested() <= self.lifecycle.retired_bytes.load(Ordering::Relaxed)
     }
 
     fn evict_candidate(
@@ -563,36 +643,36 @@ impl CatalogInner {
         from_protected: bool,
         now: CatalogTick,
         report: &mut CollectReport,
-    ) -> u64 {
+    ) -> RetiredBytes {
         report.scanned_candidates += 1;
         let Some(slot) = candidate.slot.upgrade() else {
-            return 0;
+            return RetiredBytes::default();
         };
         let Some(version) = candidate.version.upgrade() else {
-            return 0;
+            return RetiredBytes::default();
         };
         if !committed_points_to(&slot, &version) {
-            return 0;
+            return RetiredBytes::default();
         }
         if version.access().hard_pinned()
             || (version.access().is_soft_pinned(now)
                 && !self.config.allow_evict_soft_pinned_objects)
         {
             if from_protected {
-                self.collector.protected.push(candidate);
+                self.collector.eviction.protected.push(candidate);
             } else {
-                self.collector.young.push(candidate);
+                self.collector.eviction.young.push(candidate);
             }
-            return 0;
+            return RetiredBytes::default();
         }
 
         let control = slot.control.lock();
         if control.active.is_some() || !committed_points_to(&slot, &version) {
             drop(control);
             if committed_points_to(&slot, &version) {
-                self.collector.protected.push(candidate);
+                self.collector.eviction.protected.push(candidate);
             }
-            return 0;
+            return RetiredBytes::default();
         }
         if version.access().hard_pinned()
             || (version.access().is_soft_pinned(now)
@@ -600,21 +680,21 @@ impl CatalogInner {
         {
             drop(control);
             if from_protected {
-                self.collector.protected.push(candidate);
+                self.collector.eviction.protected.push(candidate);
             } else {
-                self.collector.young.push(candidate);
+                self.collector.eviction.young.push(candidate);
             }
-            return 0;
+            return RetiredBytes::default();
         }
         if version.access().take_recent() {
             drop(control);
-            self.collector.protected.push(candidate);
-            return 0;
+            self.collector.eviction.protected.push(candidate);
+            return RetiredBytes::default();
         }
         if version.access().is_leased(now) {
             drop(control);
-            self.collector.protected.push(candidate);
-            return 0;
+            self.collector.eviction.protected.push(candidate);
+            return RetiredBytes::default();
         }
 
         slot.clear_committed();
@@ -624,8 +704,8 @@ impl CatalogInner {
         if version.access().take_recent() || version.access().is_leased(now) {
             slot.publish_committed(version.clone());
             drop(control);
-            self.collector.protected.push(candidate);
-            return 0;
+            self.collector.eviction.protected.push(candidate);
+            return RetiredBytes::default();
         }
         let bytes = version.record().reserved_bytes();
         let quota_bytes = version
@@ -636,16 +716,26 @@ impl CatalogInner {
         self.retire_published(slot, version, now, true);
         report.retired_objects += 1;
         report.retired_bytes = report.retired_bytes.saturating_add(bytes);
-        quota_bytes
+        RetiredBytes {
+            physical: bytes,
+            quota: quota_bytes,
+        }
     }
 
-    fn reclaim(&self, now: CatalogTick, budget: CollectBudget, report: &mut CollectReport) {
+    fn reclaim(
+        &self,
+        now: CatalogTick,
+        budget: CollectBudget,
+        report: &mut CollectReport,
+    ) -> usize {
         let retired_objects = self.collector.retired.len().min(budget.max_reclaims);
         let mut resources = ReplicaReclaimBatch::with_capacity(retired_objects);
+        let mut attempts = 0;
         for _ in 0..retired_objects {
             let Some(retired) = self.collector.retired.pop() else {
                 break;
             };
+            attempts += 1;
             if retired.reclaim_after > now {
                 self.collector.retired.push(retired);
                 continue;
@@ -667,14 +757,21 @@ impl CatalogInner {
                 }
             };
             let mut record = version.record;
+            let reclaimed_memory =
+                record.current_direct_replica_class() == Some(ReplicaClass::Memory);
             record.release_accounting();
             resources.extend(record.replicas.take_exclusive());
-            self.lifecycle.on_reclaim(reserved_bytes);
-            self.collector.on_reclaim(reserved_bytes);
+            self.lifecycle.on_reclaim(reserved_bytes, reclaimed_memory);
+            self.collector.reclaim.on_reclaim(reserved_bytes);
             report.reclaimed_objects += 1;
             report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(reserved_bytes);
+            if reclaimed_memory {
+                report.reclaimed_memory_bytes =
+                    report.reclaimed_memory_bytes.saturating_add(reserved_bytes);
+            }
         }
         resources.release();
+        attempts
     }
 
     fn clean_empty_slots(

@@ -7,7 +7,7 @@ use super::{
 use crate::client::{ClientLifecycleConfig, ClientLifecycleConfigError, ClientManager};
 use crate::mooncake::WrappedMasterServiceServer;
 use crate::object::error::ObjectCatalogConfigError;
-use crate::object::{ObjectCatalogConfig, ObjectManager};
+use crate::object::{MemoryEvictionConfig, ObjectCatalogConfig, ObjectManager};
 use crate::segment::error::PoolConfigError;
 use crate::segment::{SegmentPool, SegmentPoolConfig};
 use coro_rpc::{BoundRpcServer, RegisterError, ServerConfig};
@@ -32,6 +32,7 @@ pub struct MooncakeServerConfig {
     listen_addr: SocketAddr,
     segment_pool: SegmentPoolConfig,
     object_catalog: ObjectCatalogConfig,
+    memory_eviction: MemoryEvictionConfig,
     client_lifecycle: ClientLifecycleConfig,
     reconcile: MasterReconcileConfig,
     view_version: i64,
@@ -51,6 +52,11 @@ impl MooncakeServerConfig {
 
     pub const fn with_object_catalog(mut self, object_catalog: ObjectCatalogConfig) -> Self {
         self.object_catalog = object_catalog;
+        self
+    }
+
+    pub const fn with_memory_eviction(mut self, memory_eviction: MemoryEvictionConfig) -> Self {
+        self.memory_eviction = memory_eviction;
         self
     }
 
@@ -86,6 +92,10 @@ impl MooncakeServerConfig {
         self.object_catalog
     }
 
+    pub const fn memory_eviction(self) -> MemoryEvictionConfig {
+        self.memory_eviction
+    }
+
     pub const fn client_lifecycle(self) -> ClientLifecycleConfig {
         self.client_lifecycle
     }
@@ -114,6 +124,7 @@ impl Default for MooncakeServerConfig {
             listen_addr: DEFAULT_MOONCAKE_LISTEN_ADDR,
             segment_pool: SegmentPoolConfig::default(),
             object_catalog: ObjectCatalogConfig::default(),
+            memory_eviction: MemoryEvictionConfig::default(),
             client_lifecycle: ClientLifecycleConfig::default(),
             reconcile: MasterReconcileConfig::default(),
             view_version: DEFAULT_MASTER_VIEW_VERSION,
@@ -158,9 +169,10 @@ pub struct MooncakeServerComposition {
 impl MooncakeServerComposition {
     fn new(config: MooncakeServerConfig) -> Result<Self, MooncakeServerBuildError> {
         let pool = Arc::new(SegmentPool::with_config(config.segment_pool())?);
-        let manager = Arc::new(ObjectManager::with_config(
+        let manager = Arc::new(ObjectManager::with_eviction_config(
             pool.clone(),
             config.object_catalog(),
+            config.memory_eviction(),
         )?);
         let clock = MasterClock::new();
         let service = ObjectCatalogRpcService::new_with_client_config(

@@ -14,6 +14,7 @@ use super::reservation::Reservation;
 use super::spec::{
     ReplicaClass, SegmentConfiguration, SegmentKind, SegmentResourceId, SegmentSpec,
 };
+use super::stats::ReplicaClassSpaceStats;
 use super::stats::SegmentStats;
 use parking_lot::RwLock;
 use std::collections::HashSet;
@@ -339,6 +340,14 @@ impl SegmentPool {
             .iter()
             .map(|replica_class| summarize_capacity(catalog.snapshot(*replica_class)))
             .collect()
+    }
+
+    /// Returns aggregate physical space for all mounted segments in a class.
+    ///
+    /// Unlike [`Self::capacity_for`], this includes quiesced segments so a
+    /// placement-state transition cannot create a false memory-pressure spike.
+    pub fn space_for(&self, replica_class: ReplicaClass) -> ReplicaClassSpaceStats {
+        self.catalog.read().space_for(replica_class)
     }
 
     /// Cheap change token for callers that cache accepting capacities.

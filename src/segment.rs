@@ -31,4 +31,5 @@ pub use reservation::Reservation;
 pub use spec::{
     CxlArenaId, CxlArenaSpec, ReplicaClass, SegmentKind, SegmentResourceId, SegmentSpec,
 };
+pub use stats::ReplicaClassSpaceStats;
 pub use transport::{TransportEndpoint, TransportProtocol};

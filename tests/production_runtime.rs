@@ -95,6 +95,11 @@ fn production_composition_shares_managers_clock_and_reconciler_state() {
             .shares_state_with(composition.reconciler().client_manager())
     );
     assert_eq!(composition.reconciler().config(), config.reconcile());
+    assert_eq!(
+        composition.config().memory_eviction(),
+        cakemaster::object::MemoryEvictionConfig::default()
+    );
+    assert!(composition.manager().memory_eviction_stats().is_some());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
