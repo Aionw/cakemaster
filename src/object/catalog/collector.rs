@@ -1,8 +1,5 @@
-//! Incremental collection separates object retirement, resource reclamation,
-//! and slot cleanup. Expiration, removal, and eviction first detach a node and
-//! update lifecycle accounting. Reclaim releases replica resources only after
-//! external handles drop; empty stable slots are removed independently after a
-//! grace period.
+//! Incremental transaction expiration, version retirement, and resource
+//! reclamation.
 
 use super::*;
 use std::collections::HashSet;
@@ -28,48 +25,40 @@ impl ObjectCatalog {
             .inner
             .lookup_slot(lookup)
             .ok_or(RemoveError::NotFound)?;
-        let node = loop {
-            let node = slot.current.load_full().ok_or(RemoveError::NotFound)?;
-            let write = node.mutation.lock();
-            if !slot_points_to(&slot, &node) {
-                drop(write);
-                continue;
-            }
-            match node.mutation.state() {
-                ObjectState::Published => {}
-                ObjectState::Claimed | ObjectState::Pending | ObjectState::Updating => {
-                    return Err(RemoveError::NotReady);
-                }
-                ObjectState::Retiring => return Err(RemoveError::NotFound),
-            }
-            if node
-                .mutation
-                .transition(ObjectState::Published, ObjectState::Retiring)
-                .is_err()
-            {
-                drop(write);
-                continue;
-            }
-
-            let lease_until = node.access.lease_until();
-            if !force && lease_until > now {
-                node.mutation.store(ObjectState::Published);
+        let control = slot.control.lock();
+        if control.active.is_some() {
+            return Err(RemoveError::NotReady);
+        }
+        let version = slot.load_committed().ok_or(RemoveError::NotFound)?;
+        if !committed_points_to(&slot, &version) {
+            return Err(RemoveError::NotFound);
+        }
+        if !force {
+            let lease_until = version.access().lease_until();
+            if lease_until > now {
                 return Err(RemoveError::Leased {
                     expires_at: lease_until,
                 });
             }
-            if !force && node.access.hard_pinned() {
-                node.mutation.store(ObjectState::Published);
+            if version.access().hard_pinned() {
                 return Err(RemoveError::HardPinned);
             }
-            if !clear_slot(&slot, &node) {
-                node.mutation.store(ObjectState::Published);
-                return Err(RemoveError::NotFound);
+        }
+        slot.clear_committed();
+        if !force {
+            // Detach before the final lease sample. A reader refreshes the
+            // lease before validating this pointer, so a reader that can
+            // still return this version is reflected in this load.
+            let lease_until = version.access().lease_until();
+            if lease_until > now {
+                slot.publish_committed(version);
+                return Err(RemoveError::Leased {
+                    expires_at: lease_until,
+                });
             }
-            drop(write);
-            break node;
-        };
-        self.inner.retire_published(slot, node, now);
+        }
+        drop(control);
+        self.inner.retire_published(slot, version, now, true);
         Ok(())
     }
 
@@ -77,8 +66,6 @@ impl ObjectCatalog {
         self.inner.collector.request_reclaim(bytes);
     }
 
-    /// Requests one bounded liveness sweep after segment membership changes.
-    /// Repeated requests extend the current sweep to cover the full queue.
     pub(in crate::object) fn request_liveness_scan(&self) {
         self.inner
             .collector
@@ -119,10 +106,6 @@ impl ObjectCatalog {
                 .fetch_max(self.inner.collector.protected.len(), Ordering::Release);
         }
 
-        // Pending expiration has its own queue allowance. Liveness, scoped
-        // eviction, and global eviction share the eviction allowance. Normal
-        // eviction stays paused while a liveness sweep is incomplete so it
-        // cannot move an unscanned candidate between generations.
         let mut report = CollectReport::default();
         self.inner.expire_soft_pins(now, budget, &mut report);
         let liveness_scanned = self
@@ -166,7 +149,7 @@ impl ObjectCatalog {
 }
 
 impl CatalogInner {
-    pub(super) fn expire_soft_pins(
+    fn expire_soft_pins(
         &self,
         now: CatalogTick,
         budget: CollectBudget,
@@ -181,28 +164,23 @@ impl CatalogInner {
             let Some(slot) = candidate.candidate.slot.upgrade() else {
                 continue;
             };
-            let Some(node) = candidate.candidate.node.upgrade() else {
+            let Some(version) = candidate.candidate.version.upgrade() else {
                 continue;
             };
-            if !slot_points_to(&slot, &node)
-                || !matches!(
-                    node.mutation.state(),
-                    ObjectState::Pending | ObjectState::Published | ObjectState::Updating
-                )
-            {
+            if !committed_points_to(&slot, &version) {
                 continue;
             }
             if candidate.deadline > now {
                 self.collector.soft_pins.push(candidate);
                 continue;
             }
-            if node.access.expire_soft_pin(candidate.deadline, now) {
+            if version.access().expire_soft_pin(candidate.deadline, now) {
                 report.expired_soft_pins += 1;
             }
         }
     }
 
-    pub(super) fn retire_invalidated_published(
+    fn retire_invalidated_published(
         &self,
         now: CatalogTick,
         budget: CollectBudget,
@@ -218,9 +196,6 @@ impl CatalogInner {
                 &self.collector.liveness_protected_remaining,
             ),
         ];
-        // Budgets may intentionally be unbounded (`usize::MAX`) for drain-style
-        // collection. Grow this cold-path batch from the replicas we actually
-        // prune instead of treating the budget as an allocation size.
         let mut resources = ReplicaReclaimBatch::default();
         let mut remaining_budget = budget.max_candidates;
         let mut scanned = 0;
@@ -238,37 +213,34 @@ impl CatalogInner {
                 let Some(slot) = candidate.slot.upgrade() else {
                     continue;
                 };
-                let Some(node) = candidate.node.upgrade() else {
+                let Some(version) = candidate.version.upgrade() else {
                     continue;
                 };
-                if node.mutation.state() != ObjectState::Published
-                    || !slot_points_to(&slot, &node)
-                    || node.record.get().is_none()
-                {
+                if !committed_points_to(&slot, &version) {
                     continue;
                 }
-                let write = node.mutation.lock();
-                if node.mutation.state() != ObjectState::Published || !slot_points_to(&slot, &node)
-                {
+
+                let control = slot.control.lock();
+                if !committed_points_to(&slot, &version) {
                     continue;
                 }
-                let record = node.record();
-                match record.replicas.prune_invalidated() {
+                match version.record().replicas.prune_invalidated() {
                     ReplicaPrune::AllLive => {
-                        drop(write);
+                        drop(control);
+                        queue.push(candidate);
+                    }
+                    ReplicaPrune::AllStale if control.active.is_some() => {
+                        // The candidate transaction may still publish a healthy
+                        // replacement. Its commit or abort will make this base
+                        // collectable without destroying the transaction.
+                        drop(control);
                         queue.push(candidate);
                     }
                     ReplicaPrune::AllStale => {
-                        node.mutation.store(ObjectState::Retiring);
-                        if !clear_slot(&slot, &node) {
-                            node.mutation.store(ObjectState::Published);
-                            drop(write);
-                            queue.push(candidate);
-                            continue;
-                        }
-                        let bytes = record.reserved_bytes();
-                        drop(write);
-                        self.retire_published(slot, node, now);
+                        let bytes = version.record().reserved_bytes();
+                        slot.clear_committed();
+                        drop(control);
+                        self.retire_published(slot, version, now, true);
                         report.invalidated_published += 1;
                         report.retired_objects += 1;
                         report.retired_bytes = report.retired_bytes.saturating_add(bytes);
@@ -276,10 +248,10 @@ impl CatalogInner {
                     ReplicaPrune::Mixed { stale } => {
                         let stale_count = stale.len();
                         let stale_bytes = stale.reserved_bytes();
-                        node.release_pruned_accounting(&stale);
+                        version.record().release_pruned_accounting(&stale);
                         self.lifecycle.on_prune_published(stale_bytes);
                         self.collector.on_reclaim(stale_bytes);
-                        drop(write);
+                        drop(control);
                         resources.extend(stale);
                         report.pruned_objects += 1;
                         report.pruned_replicas += stale_count;
@@ -305,102 +277,80 @@ impl CatalogInner {
         });
     }
 
-    pub(super) fn retire_pending(
-        &self,
-        slot: Arc<ObjectSlot>,
-        node: Arc<CatalogNode>,
-        now: CatalogTick,
-    ) {
-        let record = node
-            .record
-            .get()
-            .expect("only staged objects can be retired");
-        let bytes = record.reserved_bytes();
-        node.abort_accounting();
-        self.lifecycle.on_retire_pending(bytes);
+    pub(super) fn retire_aborted_pending(&self, pending: Arc<ObjectVersion>, now: CatalogTick) {
+        let bytes = pending.record().reserved_bytes();
+        pending.record().abort_accounting();
+        self.lifecycle.on_abort_pending(bytes);
         self.collector.retired.push(RetiredObject {
-            node,
+            version: pending,
             reserved_bytes: bytes,
-            retry_at: now,
+            reclaim_after: now,
         });
-        self.enqueue_empty(&slot, now);
     }
 
-    fn resolve_pending_candidate(
+    fn abort_pending(
         &self,
-        pending: &PendingCandidate,
-    ) -> Option<(Arc<ObjectSlot>, Arc<CatalogNode>)> {
-        let slot = pending.candidate.slot.upgrade()?;
-        let node = pending.candidate.node.upgrade()?;
-        if !matches!(
-            node.mutation.state(),
-            ObjectState::Pending | ObjectState::Updating
-        ) || node.write_id() != pending.write_id
-            || !slot_points_to(&slot, &node)
-            || node.record.get().is_none()
-        {
-            return None;
-        }
-        Some((slot, node))
-    }
-
-    fn try_revoke_pending(
-        &self,
-        slot: Arc<ObjectSlot>,
-        node: Arc<CatalogNode>,
-        write_id: WriteId,
+        slot: &Arc<ObjectSlot>,
+        id: TransactionId,
+        expected: &Arc<ObjectVersion>,
         now: CatalogTick,
     ) -> bool {
-        let _write = node.mutation.lock();
-        // Recheck under the transaction gate. An in-place upsert may have
-        // committed and a newer one may have reused this node after the
-        // candidate was resolved but before this lock was acquired.
-        if node.write_id() != write_id || !slot_points_to(&slot, &node) {
+        let mut control = slot.control.lock();
+        let Some(active) = control.active.as_ref() else {
+            return false;
+        };
+        if active.id != id {
             return false;
         }
-        if node.mutation.state() == ObjectState::Updating {
-            self.rollback_in_place_update(&slot, &node);
-            return true;
-        }
-        if node
-            .mutation
-            .transition(ObjectState::Pending, ObjectState::Retiring)
-            .is_err()
-        {
+        let TransactionPhase::Staged(pending) = &active.phase else {
+            return false;
+        };
+        if !Arc::ptr_eq(pending, expected) {
             return false;
         }
-        self.retire_revoked_pending(slot, node.clone(), now)
-    }
-
-    /// Finishes a revoke after the pending node entered `Retiring`. A normal
-    /// put clears the slot; a replacement upsert restores its old generation
-    /// before the new allocation is queued for reclamation.
-    pub(super) fn retire_revoked_pending(
-        &self,
-        slot: Arc<ObjectSlot>,
-        node: Arc<CatalogNode>,
-        now: CatalogTick,
-    ) -> bool {
-        if node.mutation.has_replacement() {
-            let Some(previous) = restore_previous(&slot, &node) else {
-                return false;
-            };
+        let pending = pending.clone();
+        let base_is_invalid = active
+            .base
+            .as_ref()
+            .is_some_and(|base| !base.record().replicas.read().has_live());
+        control.active = None;
+        let enqueue_empty = !slot.has_committed();
+        drop(control);
+        self.retire_aborted_pending(pending, now);
+        if enqueue_empty {
+            self.enqueue_empty(slot, now);
+        }
+        if base_is_invalid {
             self.collector
-                .young
-                .push(GcCandidate::new(&slot, &previous));
-            self.retire_rolled_back_pending(node.clone(), now);
-        } else {
-            if !clear_slot(&slot, &node) {
-                return false;
-            }
-            self.retire_pending(slot, node.clone(), now);
+                .liveness_scan_requested
+                .store(true, Ordering::Release);
         }
         true
     }
 
-    /// Removes pending candidates for a set of already-fenced sessions in one
-    /// pass. Producers enqueue before their final fence check, so a racing
-    /// stage is either present in this snapshot or revokes itself.
+    fn pending_snapshot(
+        &self,
+        candidate: &PendingCandidate,
+    ) -> Option<(Arc<ObjectSlot>, Arc<ObjectVersion>, WriteOwner)> {
+        let pending = candidate.pending.upgrade()?;
+        if pending.is_committed() {
+            return None;
+        }
+        let slot = candidate.slot.upgrade()?;
+        let control = slot.control.lock();
+        let active = control.active.as_ref()?;
+        if active.id != candidate.transaction_id {
+            return None;
+        }
+        let TransactionPhase::Staged(active_pending) = &active.phase else {
+            return None;
+        };
+        if !Arc::ptr_eq(active_pending, &pending) {
+            return None;
+        }
+        Some((slot.clone(), pending, active.owner))
+    }
+
     pub(super) fn revoke_pending_owners(
         &self,
         owners: &HashSet<WriteOwner>,
@@ -409,7 +359,6 @@ impl CatalogInner {
         if owners.is_empty() {
             return 0;
         }
-
         let _collector = self.collector.gate.lock();
         let candidates = {
             let _stages = self.collector.pending_stage_gate.write();
@@ -420,107 +369,74 @@ impl CatalogInner {
             candidates
         };
         let mut revoked = 0;
-        for pending in candidates {
-            let Some((slot, node)) = self.resolve_pending_candidate(&pending) else {
+        for candidate in candidates {
+            let Some((slot, pending, owner)) = self.pending_snapshot(&candidate) else {
                 continue;
             };
-            if !owners.contains(&node.owner()) {
-                self.collector.pending.push(pending);
+            if !owners.contains(&owner) {
+                self.collector.pending.push(candidate);
                 continue;
             }
-            if self.try_revoke_pending(slot, node, pending.write_id, now) {
+            if self.abort_pending(&slot, candidate.transaction_id, &pending, now) {
                 revoked += 1;
             }
         }
         revoked
     }
 
-    fn retire_published(&self, slot: Arc<ObjectSlot>, node: Arc<CatalogNode>, now: CatalogTick) {
-        let record = node
-            .record
-            .get()
-            .expect("only published objects can be retired");
-        let bytes = record.reserved_bytes();
-        node.mark_accounting_retiring();
-        self.lifecycle.on_retire_published(bytes);
-        self.collector.retired.push(RetiredObject {
-            node,
-            reserved_bytes: bytes,
-            retry_at: now,
-        });
-        self.enqueue_empty(&slot, now);
-    }
-
-    /// Retires the previous generation of a committed upsert. The slot is
-    /// already occupied by the replacement, so no empty-slot candidate is
-    /// created.
-    pub(super) fn retire_replaced(&self, node: Arc<CatalogNode>) {
-        let record = node
-            .record
-            .get()
-            .expect("only published objects can be replaced");
-        let bytes = record.reserved_bytes();
-        node.mutation.store(ObjectState::Retiring);
-        node.mark_accounting_retiring();
-        self.lifecycle.on_retire_published(bytes);
-        self.collector.retired.push(RetiredObject {
-            node,
-            reserved_bytes: bytes,
-            retry_at: CatalogTick::ZERO,
-        });
-    }
-
-    /// Retires a failed replacement while restoring its predecessor in the
-    /// same slot.
-    pub(super) fn retire_rolled_back_pending(&self, node: Arc<CatalogNode>, now: CatalogTick) {
-        let bytes = node.record().reserved_bytes();
-        node.abort_accounting();
-        self.lifecycle.on_retire_pending(bytes);
-        self.collector.retired.push(RetiredObject {
-            node,
-            reserved_bytes: bytes,
-            retry_at: now,
-        });
-    }
-
-    pub(super) fn expire_pending(
-        &self,
-        now: CatalogTick,
-        budget: CollectBudget,
-        report: &mut CollectReport,
-    ) {
+    fn expire_pending(&self, now: CatalogTick, budget: CollectBudget, report: &mut CollectReport) {
         let candidates = self.collector.pending.len().min(budget.max_candidates);
         for _ in 0..candidates {
-            let Some(pending) = self.collector.pending.pop() else {
+            let Some(candidate) = self.collector.pending.pop() else {
                 break;
             };
-            let Some((slot, node)) = self.resolve_pending_candidate(&pending) else {
+            let Some(pending) = candidate.pending.upgrade() else {
                 continue;
             };
-            if !node.record().replicas.read().all_live() {
-                if self.try_revoke_pending(slot, node, pending.write_id, now) {
+            if pending.is_committed() {
+                continue;
+            }
+            let all_live = pending.record().replicas.read().all_live();
+            if all_live && candidate.deadline > now {
+                self.collector.pending.push(candidate);
+                continue;
+            }
+            let Some(slot) = candidate.slot.upgrade() else {
+                continue;
+            };
+            if !all_live {
+                if self.abort_pending(&slot, candidate.transaction_id, &pending, now) {
                     report.invalidated_pending += 1;
                 }
                 continue;
             }
-            if pending.deadline > now {
-                self.collector.pending.push(pending);
-                continue;
-            }
-            if self.try_revoke_pending(slot, node, pending.write_id, now) {
+            if self.abort_pending(&slot, candidate.transaction_id, &pending, now) {
                 report.expired_pending += 1;
             }
         }
     }
 
-    pub(super) fn evict(
+    fn retire_published(
         &self,
+        slot: Arc<ObjectSlot>,
+        version: Arc<ObjectVersion>,
         now: CatalogTick,
-        budget: CollectBudget,
-        report: &mut CollectReport,
+        enqueue_empty: bool,
     ) {
-        // Snapshot both generation sizes before scanning. An object promoted
-        // from young to protected must not be reconsidered in the same pause.
+        let bytes = version.record().reserved_bytes();
+        version.record().mark_accounting_retiring();
+        self.lifecycle.on_retire_published(bytes);
+        self.collector.retired.push(RetiredObject {
+            version,
+            reserved_bytes: bytes,
+            reclaim_after: now,
+        });
+        if enqueue_empty {
+            self.enqueue_empty(&slot, now);
+        }
+    }
+
+    fn evict(&self, now: CatalogTick, budget: CollectBudget, report: &mut CollectReport) {
         let generations = [
             (&self.collector.young, self.collector.young.len(), false),
             (
@@ -544,7 +460,7 @@ impl CatalogInner {
         }
     }
 
-    pub(super) fn evict_scoped(
+    fn evict_scoped(
         &self,
         now: CatalogTick,
         budget: CollectBudget,
@@ -554,8 +470,6 @@ impl CatalogInner {
         if targets.is_empty() || budget.max_candidates == 0 {
             return 0;
         }
-        // Scope-filtered debt uses tenant-accounting bytes (logical bytes
-        // across replicas); the common retirement report uses reserved bytes.
         let mut debts: Vec<_> = targets
             .iter()
             .filter(|target| target.bytes > 0)
@@ -564,9 +478,6 @@ impl CatalogInner {
         if debts.is_empty() {
             return 0;
         }
-
-        // All scopes share the existing generation queues. A candidate is
-        // scanned once and matched against the small active-debt set.
         let generations = [
             (&self.collector.young, self.collector.young.len(), false),
             (
@@ -615,15 +526,13 @@ impl CatalogInner {
         let Some(slot) = candidate.slot.upgrade() else {
             return ScopedCandidate::Stale;
         };
-        let Some(node) = candidate.node.upgrade() else {
+        let Some(version) = candidate.version.upgrade() else {
             return ScopedCandidate::Stale;
         };
-        if node.mutation.state() != ObjectState::Published || !slot_points_to(&slot, &node) {
+        if !committed_points_to(&slot, &version) {
             return ScopedCandidate::Stale;
         }
-        let Some(record) = node.record.get() else {
-            return ScopedCandidate::Stale;
-        };
+        let record = version.record();
         debts
             .iter()
             .position(|(filter, debt)| {
@@ -659,19 +568,15 @@ impl CatalogInner {
         let Some(slot) = candidate.slot.upgrade() else {
             return 0;
         };
-        let Some(node) = candidate.node.upgrade() else {
+        let Some(version) = candidate.version.upgrade() else {
             return 0;
         };
-        if node.mutation.state() != ObjectState::Published || !slot_points_to(&slot, &node) {
+        if !committed_points_to(&slot, &version) {
             return 0;
         }
-
-        let write = node.mutation.lock();
-        if node.mutation.state() != ObjectState::Published || !slot_points_to(&slot, &node) {
-            return 0;
-        }
-        if node.access.hard_pinned()
-            || (node.access.is_soft_pinned(now) && !self.config.allow_evict_soft_pinned_objects)
+        if version.access().hard_pinned()
+            || (version.access().is_soft_pinned(now)
+                && !self.config.allow_evict_soft_pinned_objects)
         {
             if from_protected {
                 self.collector.protected.push(candidate);
@@ -680,97 +585,99 @@ impl CatalogInner {
             }
             return 0;
         }
-        if node.access.take_recent() {
-            self.collector.protected.push(candidate);
-            return 0;
-        }
-        if node
-            .mutation
-            .transition(ObjectState::Published, ObjectState::Retiring)
-            .is_err()
-        {
-            return 0;
-        }
 
-        if node.access.is_leased(now) {
-            node.mutation.store(ObjectState::Published);
-            self.collector.protected.push(candidate);
+        let control = slot.control.lock();
+        if control.active.is_some() || !committed_points_to(&slot, &version) {
+            drop(control);
+            if committed_points_to(&slot, &version) {
+                self.collector.protected.push(candidate);
+            }
             return 0;
         }
-        if clear_slot(&slot, &node) {
-            let bytes = node
-                .record
-                .get()
-                .expect("published objects always have records")
-                .reserved_bytes();
-            let quota_bytes = node
-                .record
-                .get()
-                .and_then(ObjectRecord::tenant_accounting)
-                .map_or(bytes, |(_, _, quota_bytes)| quota_bytes);
-            drop(write);
-            self.retire_published(slot, node, now);
-            report.retired_objects += 1;
-            report.retired_bytes = report.retired_bytes.saturating_add(bytes);
-            quota_bytes
-        } else {
-            node.mutation.store(ObjectState::Published);
-            drop(write);
+        if version.access().hard_pinned()
+            || (version.access().is_soft_pinned(now)
+                && !self.config.allow_evict_soft_pinned_objects)
+        {
+            drop(control);
             if from_protected {
                 self.collector.protected.push(candidate);
             } else {
                 self.collector.young.push(candidate);
             }
-            0
+            return 0;
         }
+        if version.access().take_recent() {
+            drop(control);
+            self.collector.protected.push(candidate);
+            return 0;
+        }
+        if version.access().is_leased(now) {
+            drop(control);
+            self.collector.protected.push(candidate);
+            return 0;
+        }
+
+        slot.clear_committed();
+        // Close the race with a reader that refreshed its access state after
+        // the fast checks but before the pointer was detached. Readers that
+        // observe the detached pointer retry instead of returning `version`.
+        if version.access().take_recent() || version.access().is_leased(now) {
+            slot.publish_committed(version.clone());
+            drop(control);
+            self.collector.protected.push(candidate);
+            return 0;
+        }
+        let bytes = version.record().reserved_bytes();
+        let quota_bytes = version
+            .record()
+            .tenant_accounting()
+            .map_or(bytes, |(_, _, quota_bytes)| quota_bytes);
+        drop(control);
+        self.retire_published(slot, version, now, true);
+        report.retired_objects += 1;
+        report.retired_bytes = report.retired_bytes.saturating_add(bytes);
+        quota_bytes
     }
 
-    pub(super) fn reclaim(
-        &self,
-        now: CatalogTick,
-        budget: CollectBudget,
-        report: &mut CollectReport,
-    ) {
+    fn reclaim(&self, now: CatalogTick, budget: CollectBudget, report: &mut CollectReport) {
         let retired_objects = self.collector.retired.len().min(budget.max_reclaims);
         let mut resources = ReplicaReclaimBatch::with_capacity(retired_objects);
         for _ in 0..retired_objects {
             let Some(retired) = self.collector.retired.pop() else {
                 break;
             };
-            if retired.retry_at > now {
+            if retired.reclaim_after > now {
                 self.collector.retired.push(retired);
                 continue;
             }
-
-            match Arc::try_unwrap(retired.node) {
-                Ok(mut node) => {
-                    node.release_accounting();
-                    let record = node
-                        .record
-                        .take()
-                        .expect("retired objects always have records");
-                    resources.extend(record.replicas.into_inner());
-                    self.lifecycle.on_reclaim(retired.reserved_bytes);
-                    self.collector.on_reclaim(retired.reserved_bytes);
-                    report.reclaimed_objects += 1;
-                    report.reclaimed_bytes = report
-                        .reclaimed_bytes
-                        .saturating_add(retired.reserved_bytes);
+            let RetiredObject {
+                version,
+                reserved_bytes,
+                reclaim_after,
+            } = retired;
+            let version = match Arc::try_unwrap(version) {
+                Ok(version) => version,
+                Err(version) => {
+                    self.collector.retired.push(RetiredObject {
+                        version,
+                        reserved_bytes,
+                        reclaim_after,
+                    });
+                    continue;
                 }
-                Err(node) => self.collector.retired.push(RetiredObject {
-                    node,
-                    reserved_bytes: retired.reserved_bytes,
-                    retry_at: now.saturating_add(1),
-                }),
-            }
+            };
+            let mut record = version.record;
+            record.release_accounting();
+            resources.extend(record.replicas.take_exclusive());
+            self.lifecycle.on_reclaim(reserved_bytes);
+            self.collector.on_reclaim(reserved_bytes);
+            report.reclaimed_objects += 1;
+            report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(reserved_bytes);
         }
         resources.release();
     }
 
-    // SLOT_CLOSING is a handshake with claim_put. Removal succeeds only while
-    // the same slot remains indexed and empty; a concurrent claimant can
-    // reopen it, or detect its removal and retry against the current entry.
-    pub(super) fn clean_empty_slots(
+    fn clean_empty_slots(
         &self,
         now: CatalogTick,
         budget: CollectBudget,
@@ -788,12 +695,8 @@ impl CatalogInner {
             let Some(slot) = candidate.slot.upgrade() else {
                 continue;
             };
-            if slot.current.load().is_some()
-                || slot
-                    .state
-                    .compare_exchange(SLOT_OPEN, SLOT_CLOSING, Ordering::AcqRel, Ordering::Acquire)
-                    .is_err()
-            {
+            let control = slot.control.lock();
+            if slot.has_committed() || control.active.is_some() {
                 continue;
             }
             let removed =
@@ -801,14 +704,12 @@ impl CatalogInner {
                     .entries
                     .remove_if_sync(&candidate.identity.as_lookup(), |indexed| {
                         Arc::ptr_eq(indexed, &slot)
-                            && slot.state.load(Ordering::Acquire) == SLOT_CLOSING
-                            && slot.current.load().is_none()
+                            && !slot.has_committed()
+                            && control.active.is_none()
                     });
             if removed.is_some() {
                 self.index.on_slot_removed();
                 report.removed_empty_slots += 1;
-            } else {
-                slot.state.store(SLOT_OPEN, Ordering::Release);
             }
         }
     }

@@ -1,85 +1,27 @@
 use super::config::{
-    ObjectCatalogConfig, ObjectPinRequest, ResolvedObjectPinRequest, ResolvedSoftPinRequest,
-    SoftPinAction,
+    ObjectCatalogConfig, ObjectPinRequest, ResolvedObjectPinRequest, SoftPinAction,
 };
 use super::content::ObjectContent;
 use super::diagnostics::ObjectCatalogStats;
-use super::error::{
-    LookupError, ObjectCatalogConfigError, PublishError, PutError, RemoveError, RevokeError,
-    StageError,
-};
+use super::error::{LookupError, ObjectCatalogConfigError, RemoveError, StageError};
 use super::identity::{NamespaceId, ObjectIdentity, ObjectLookup};
 use super::reclamation::{CatalogTick, CollectBudget, CollectReport, ReclaimFilter, ReclaimTarget};
 use super::replica::{ReplicaLease, ReplicaPartition, ReplicaReclaimBatch, ReplicaSet};
 use super::tenant::{QuotaReservationGuard, TenantQuotaCharge};
-use super::write::{ObjectCommit, WriteAdmission, WriteId, WriteOwner};
+use super::write::{ObjectCommit, TransactionId, VersionId, WriteAdmission, WriteMode, WriteOwner};
 use arc_swap::ArcSwapOption;
 use crossbeam_queue::SegQueue;
 use parking_lot::{Mutex, RwLock, RwLockReadGuard};
 use scc::HashMap;
-use scc::hash_map::Entry;
 use std::fmt;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 mod collector;
 mod read;
+mod version;
 mod write;
-
-const SLOT_OPEN: u8 = 0;
-const SLOT_CLOSING: u8 = 1;
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[repr(u8)]
-enum ObjectState {
-    /// The key is reserved, but its immutable record is not installed yet.
-    Claimed,
-    /// The record and reservations exist but are not readable yet.
-    Pending,
-    /// The current slot generation is readable and lease-protected.
-    Published,
-    /// A published generation is hidden while an upsert can still roll back.
-    Updating,
-    /// The node is detached or being detached before deferred reclamation.
-    Retiring,
-}
-
-impl ObjectState {
-    fn from_raw(value: u8) -> Self {
-        match value {
-            value if value == Self::Claimed as u8 => Self::Claimed,
-            value if value == Self::Pending as u8 => Self::Pending,
-            value if value == Self::Published as u8 => Self::Published,
-            value if value == Self::Updating as u8 => Self::Updating,
-            value if value == Self::Retiring as u8 => Self::Retiring,
-            _ => unreachable!("object lifecycle only stores valid states"),
-        }
-    }
-}
-
-struct ObjectLifecycle(AtomicU8);
-
-impl ObjectLifecycle {
-    const fn new(state: ObjectState) -> Self {
-        Self(AtomicU8::new(state as u8))
-    }
-
-    fn state(&self) -> ObjectState {
-        ObjectState::from_raw(self.0.load(Ordering::Acquire))
-    }
-
-    fn transition(&self, from: ObjectState, to: ObjectState) -> Result<(), ObjectState> {
-        self.0
-            .compare_exchange(from as u8, to as u8, Ordering::AcqRel, Ordering::Acquire)
-            .map(|_| ())
-            .map_err(ObjectState::from_raw)
-    }
-
-    fn store(&self, state: ObjectState) {
-        self.0.store(state as u8, Ordering::Release);
-    }
-}
 
 #[derive(Clone)]
 pub struct ObjectCatalog {
@@ -124,17 +66,39 @@ struct CollectorState {
 
 struct ObjectSlot {
     identity: Arc<ObjectIdentity>,
-    state: AtomicU8,
-    generation: AtomicU64,
-    current: ArcSwapOption<CatalogNode>,
+    committed: OnceLock<ArcSwapOption<ObjectVersion>>,
+    control: Mutex<SlotControl>,
 }
 
-/// Stable across claim, stage, and publish. The record is initialized once;
-/// published replica pruning mutates only its lock-protected replica set and
-/// matching byte counter without replacing this Arc.
-struct CatalogNode {
-    record: OnceLock<ObjectRecord>,
-    mutation: MutationControl,
+struct SlotControl {
+    next_transaction_id: u64,
+    next_version_id: u64,
+    active: Option<ActiveTransaction>,
+}
+
+struct ActiveTransaction {
+    id: TransactionId,
+    owner: WriteOwner,
+    base: Option<Arc<ObjectVersion>>,
+    pins: ResolvedObjectPinRequest,
+    phase: TransactionPhase,
+}
+
+enum TransactionPhase {
+    Claimed,
+    Staged(Arc<ObjectVersion>),
+}
+
+struct ObjectVersion {
+    origin: TransactionId,
+    owner: WriteOwner,
+    record: ObjectRecord,
+    committed: OnceLock<CommittedVersion>,
+}
+
+struct CommittedVersion {
+    id: VersionId,
+    commit: ObjectCommit,
     access: AccessControl,
 }
 
@@ -145,7 +109,6 @@ struct ObjectRecord {
     accounting: Option<TenantQuotaCharge>,
 }
 
-/// The replica set and its physical byte total change as one pruning unit.
 struct ReplicaStorage {
     set: RwLock<ReplicaSet>,
     reserved_bytes: AtomicU64,
@@ -157,33 +120,6 @@ enum ReplicaPrune {
     Mixed { stale: ReplicaSet },
 }
 
-/// State that changes as an object moves through a write transaction.
-struct MutationControl {
-    lifecycle: ObjectLifecycle,
-    /// Serializes lifecycle mutations and replica pruning for this node.
-    /// Ordinary lookups still use the atomic lifecycle and access controls.
-    gate: Mutex<()>,
-    /// Keeps the externally inspectable write identity and its rollback plan
-    /// in one consistent snapshot.
-    metadata: RwLock<WriteMetadata>,
-    commit: OnceLock<ObjectCommit>,
-}
-
-struct WriteMetadata {
-    id: WriteId,
-    owner: WriteOwner,
-    rollback: WriteRollback,
-    pending_soft_pin: Option<ResolvedSoftPinRequest>,
-}
-
-/// Only one rollback strategy can belong to a write generation.
-enum WriteRollback {
-    None,
-    InPlace { previous_owner: WriteOwner },
-    Replacement { previous: Arc<CatalogNode> },
-}
-
-/// Read-side signals consumed by lease enforcement and second-chance eviction.
 struct AccessControl {
     lease_until: AtomicU64,
     recent: AtomicBool,
@@ -194,12 +130,13 @@ struct AccessControl {
 #[derive(Clone)]
 struct GcCandidate {
     slot: Weak<ObjectSlot>,
-    node: Weak<CatalogNode>,
+    version: Weak<ObjectVersion>,
 }
 
 struct PendingCandidate {
-    candidate: GcCandidate,
-    write_id: WriteId,
+    slot: Weak<ObjectSlot>,
+    pending: Weak<ObjectVersion>,
+    transaction_id: TransactionId,
     deadline: CatalogTick,
 }
 
@@ -215,32 +152,32 @@ struct EmptySlotCandidate {
 }
 
 struct RetiredObject {
-    node: Arc<CatalogNode>,
+    version: Arc<ObjectVersion>,
     reserved_bytes: u64,
-    retry_at: CatalogTick,
+    reclaim_after: CatalogTick,
 }
 
-pub struct PutClaim {
+pub struct WriteClaim {
     catalog: Weak<CatalogInner>,
     slot: Weak<ObjectSlot>,
-    node: Option<Arc<CatalogNode>>,
     identity: Arc<ObjectIdentity>,
-    id: WriteId,
+    id: TransactionId,
     admission: WriteAdmission,
     started_at: CatalogTick,
+    armed: bool,
 }
 
 #[derive(Clone)]
-pub struct PutTicket {
+pub struct WriteTransaction {
     catalog: Weak<CatalogInner>,
     slot: Weak<ObjectSlot>,
-    node: Arc<CatalogNode>,
-    id: WriteId,
+    pending: Arc<ObjectVersion>,
+    id: TransactionId,
 }
 
 #[derive(Clone)]
 pub struct ObjectHandle {
-    node: Arc<CatalogNode>,
+    version: Arc<ObjectVersion>,
 }
 
 pub struct ReplicaSetView<'a> {
@@ -257,14 +194,9 @@ pub struct ObjectRead {
     lease_expires_at: CatalogTick,
 }
 
-pub(super) enum ObjectWriteState {
-    Pending(PutTicket),
-    Published(ObjectHandle),
-}
-
-pub(super) enum UpsertClaim {
-    Reuse(PutTicket),
-    Write(PutClaim),
+pub(super) enum WriteResolution {
+    Active(WriteTransaction),
+    Committed(ObjectHandle),
 }
 
 impl ObjectCatalog {
@@ -341,7 +273,7 @@ impl ObjectCatalog {
     pub(in crate::object) fn identities(&self, namespace: NamespaceId) -> Vec<ObjectIdentity> {
         let mut identities = Vec::new();
         self.inner.index.entries.iter_sync(|identity, slot| {
-            if identity.namespace() == namespace && slot.current.load().is_some() {
+            if identity.namespace() == namespace && slot.has_committed() {
                 identities.push(identity.clone());
             }
             true
@@ -386,14 +318,23 @@ impl CatalogIndex {
     }
 }
 
-impl CatalogInner {
-    /// Restores an allocation-reusing update while the caller holds the
-    /// node's write gate.
-    fn rollback_in_place_update(&self, slot: &Arc<ObjectSlot>, node: &Arc<CatalogNode>) {
-        debug_assert_eq!(node.mutation.state(), ObjectState::Updating);
-        node.mutation.rollback_in_place_update();
-        node.mutation.store(ObjectState::Published);
-        self.collector.young.push(GcCandidate::new(slot, node));
+impl SlotControl {
+    fn allocate_transaction_id(&mut self) -> TransactionId {
+        let id = TransactionId::new(self.next_transaction_id);
+        self.next_transaction_id = self
+            .next_transaction_id
+            .checked_add(1)
+            .expect("per-slot transaction identifier space is exhausted");
+        id
+    }
+
+    fn allocate_version_id(&mut self) -> VersionId {
+        let id = VersionId::new(self.next_version_id);
+        self.next_version_id = self
+            .next_version_id
+            .checked_add(1)
+            .expect("per-slot version identifier space is exhausted");
+        id
     }
 }
 
@@ -413,14 +354,21 @@ impl LifecycleCounters {
             .fetch_add(reserved_bytes, Ordering::Relaxed);
     }
 
-    fn on_publish(&self, reserved_bytes: u64) {
+    fn on_commit(&self, committed_bytes: u64, replaced_bytes: Option<u64>) {
         self.pending_objects.fetch_sub(1, Ordering::Relaxed);
-        self.published_objects.fetch_add(1, Ordering::Relaxed);
-        atomic_saturating_sub(&self.pending_bytes, reserved_bytes);
-        self.live_bytes.fetch_add(reserved_bytes, Ordering::Relaxed);
+        atomic_saturating_sub(&self.pending_bytes, committed_bytes);
+        self.live_bytes
+            .fetch_add(committed_bytes, Ordering::Relaxed);
+        if let Some(replaced_bytes) = replaced_bytes {
+            atomic_saturating_sub(&self.live_bytes, replaced_bytes);
+            self.retired_bytes
+                .fetch_add(replaced_bytes, Ordering::Relaxed);
+        } else {
+            self.published_objects.fetch_add(1, Ordering::Relaxed);
+        }
     }
 
-    fn on_retire_pending(&self, reserved_bytes: u64) {
+    fn on_abort_pending(&self, reserved_bytes: u64) {
         self.pending_objects.fetch_sub(1, Ordering::Relaxed);
         atomic_saturating_sub(&self.pending_bytes, reserved_bytes);
         self.retired_bytes
@@ -453,480 +401,52 @@ impl CollectorState {
     }
 }
 
-impl ObjectSlot {
-    fn next_write_id(&self) -> WriteId {
-        WriteId::new(self.generation.fetch_add(1, Ordering::Relaxed) + 1)
-    }
-}
-
-impl CatalogNode {
-    fn claimed(id: WriteId, owner: WriteOwner, pins: ResolvedObjectPinRequest) -> Self {
-        Self::claimed_replacement(id, owner, None, pins)
-    }
-
-    fn claimed_replacement(
-        id: WriteId,
-        owner: WriteOwner,
-        previous: Option<Arc<CatalogNode>>,
-        pins: ResolvedObjectPinRequest,
-    ) -> Self {
-        let previous_soft_pin = previous
-            .as_ref()
-            .map_or(0, |node| node.access.soft_pin_until.load(Ordering::Acquire));
-        let hard_pinned = previous.as_ref().map_or(pins.with_hard_pin, |node| {
-            node.access.hard_pinned || pins.with_hard_pin
-        });
-        Self {
-            record: OnceLock::new(),
-            mutation: MutationControl {
-                lifecycle: ObjectLifecycle::new(ObjectState::Claimed),
-                gate: Mutex::new(()),
-                metadata: RwLock::new(WriteMetadata {
-                    id,
-                    owner,
-                    rollback: previous.map_or(WriteRollback::None, |previous| {
-                        WriteRollback::Replacement { previous }
-                    }),
-                    pending_soft_pin: Some(pins.soft_pin),
-                }),
-                commit: OnceLock::new(),
-            },
-            access: AccessControl {
-                lease_until: AtomicU64::new(0),
-                recent: AtomicBool::new(false),
-                soft_pin_until: AtomicU64::new(previous_soft_pin),
-                hard_pinned,
-            },
-        }
-    }
-
-    fn record(&self) -> &ObjectRecord {
-        self.record
-            .get()
-            .expect("staged objects always have immutable records")
-    }
-
-    fn owner(&self) -> WriteOwner {
-        self.mutation.owner()
-    }
-
-    fn write_id(&self) -> WriteId {
-        self.mutation.write_id()
-    }
-
-    fn commit_accounting(&self) {
-        if let Some((charge, class, bytes)) = self.record().tenant_accounting() {
-            charge.commit(class, bytes);
-        }
-    }
-
-    fn abort_accounting(&self) {
-        if let Some((charge, class, bytes)) = self.record().tenant_accounting() {
-            charge.abort(class, bytes);
-        }
-    }
-
-    fn mark_accounting_retiring(&self) {
-        if let Some((charge, class, bytes)) = self.record().tenant_accounting() {
-            charge.mark_retiring(class, bytes);
-        }
-    }
-
-    fn release_accounting(&self) {
-        let Some(record) = self.record.get() else {
-            return;
-        };
-        if let Some((charge, class, bytes)) = record.tenant_accounting() {
-            charge.release(class, bytes);
-        }
-    }
-
-    fn release_pruned_accounting(&self, stale: &ReplicaSet) {
-        let record = self.record();
-        let Some(charge) = record.accounting.as_ref() else {
-            return;
-        };
-        let Some(replica_class) = ObjectRecord::direct_replica_class(stale) else {
-            return;
-        };
-        let replica_count = u64::try_from(stale.len())
-            .expect("replica count was representable when the object was staged");
-        let bytes = record
-            .content
-            .logical_bytes()
-            .checked_mul(replica_count)
-            .expect("tenant replica charge was representable when the object was staged");
-        charge.release_committed_partial(replica_class, bytes);
-    }
-}
-
-impl Drop for CatalogNode {
-    fn drop(&mut self) {
-        self.release_accounting();
-    }
-}
-
-impl ObjectRecord {
-    fn tenant_accounting(&self) -> Option<(&TenantQuotaCharge, crate::segment::ReplicaClass, u64)> {
-        let replicas = self.replicas.read();
-        let charge = self.accounting.as_ref()?;
-        let replica_class = Self::direct_replica_class(&replicas)?;
-        let replica_count = u64::try_from(replicas.len()).ok()?;
-        let bytes = self.content.logical_bytes().checked_mul(replica_count)?;
-        Some((charge, replica_class, bytes))
-    }
-
-    fn direct_replica_class(replicas: &ReplicaSet) -> Option<crate::segment::ReplicaClass> {
-        Some(replicas.replicas().first()?.direct()?.replica_class())
-    }
-
-    fn current_direct_replica_class(&self) -> Option<crate::segment::ReplicaClass> {
-        Self::direct_replica_class(&self.replicas.read())
-    }
-
-    fn is_accounted(&self) -> bool {
-        self.accounting.is_some()
-    }
-
-    fn reserved_bytes(&self) -> u64 {
-        self.replicas.reserved_bytes()
-    }
-}
-
-impl ReplicaStorage {
-    fn new(replicas: ReplicaSet) -> Self {
-        let reserved_bytes = replicas.reserved_bytes();
-        Self {
-            set: RwLock::new(replicas),
-            reserved_bytes: AtomicU64::new(reserved_bytes),
-        }
-    }
-
-    fn read(&self) -> RwLockReadGuard<'_, ReplicaSet> {
-        self.set.read()
-    }
-
-    fn reserved_bytes(&self) -> u64 {
-        self.reserved_bytes.load(Ordering::Relaxed)
-    }
-
-    /// Removes stale replicas and updates the physical byte total before the
-    /// pruned set becomes visible to readers.
-    fn prune_invalidated(&self) -> ReplicaPrune {
-        let mut replicas = self.set.write();
-        if replicas.all_live() {
-            return ReplicaPrune::AllLive;
-        }
-        match std::mem::take(&mut *replicas).partition_by_liveness() {
-            ReplicaPartition::AllLive(current) => {
-                *replicas = current;
-                ReplicaPrune::AllLive
-            }
-            ReplicaPartition::AllStale(current) => {
-                *replicas = current;
-                ReplicaPrune::AllStale
-            }
-            ReplicaPartition::Mixed { live, stale } => {
-                atomic_saturating_sub(&self.reserved_bytes, stale.reserved_bytes());
-                *replicas = live;
-                ReplicaPrune::Mixed { stale }
-            }
-        }
-    }
-
-    fn into_inner(self) -> ReplicaSet {
-        self.set.into_inner()
-    }
-}
-
-impl<'a> ReplicaSetView<'a> {
-    fn new(guard: RwLockReadGuard<'a, ReplicaSet>) -> Self {
-        Self { guard }
-    }
-}
-
-impl Deref for ReplicaSetView<'_> {
-    type Target = [ReplicaLease];
-
-    fn deref(&self) -> &Self::Target {
-        self.guard.replicas()
-    }
-}
-
-impl fmt::Debug for ReplicaSetView<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_list().entries(self.iter()).finish()
-    }
-}
-
-impl<'a> LiveReplicaView<'a> {
-    fn new(guard: RwLockReadGuard<'a, ReplicaSet>) -> Self {
-        Self { guard }
-    }
-
-    pub fn iter(&self) -> impl Iterator<Item = &ReplicaLease> {
-        self.guard.live_iter()
-    }
-
-    pub fn len(&self) -> usize {
-        self.iter().count()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.first().is_none()
-    }
-
-    pub fn first(&self) -> Option<&ReplicaLease> {
-        self.iter().next()
-    }
-}
-
-impl fmt::Debug for LiveReplicaView<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_list().entries(self.iter()).finish()
-    }
-}
-
-impl MutationControl {
-    fn state(&self) -> ObjectState {
-        self.lifecycle.state()
-    }
-
-    fn transition(&self, from: ObjectState, to: ObjectState) -> Result<(), ObjectState> {
-        self.lifecycle.transition(from, to)
-    }
-
-    fn store(&self, state: ObjectState) {
-        self.lifecycle.store(state);
-    }
-
-    fn lock(&self) -> parking_lot::MutexGuard<'_, ()> {
-        self.gate.lock()
-    }
-
-    fn write_id(&self) -> WriteId {
-        self.metadata.read().id
-    }
-
-    fn owner(&self) -> WriteOwner {
-        self.metadata.read().owner
-    }
-
-    /// Installs all externally inspectable write identity under one lock.
-    /// The caller holds `gate` and has already hidden the published node.
-    fn begin_in_place_update(
-        &self,
-        id: WriteId,
-        owner: WriteOwner,
-        soft_pin: ResolvedSoftPinRequest,
-    ) {
-        let mut metadata = self.metadata.write();
-        debug_assert!(matches!(&metadata.rollback, WriteRollback::None));
-        let previous_owner = metadata.owner;
-        metadata.id = id;
-        metadata.owner = owner;
-        metadata.rollback = WriteRollback::InPlace { previous_owner };
-        metadata.pending_soft_pin = Some(soft_pin);
-    }
-
-    fn commit_in_place_update(&self) -> ResolvedSoftPinRequest {
-        let mut metadata = self.metadata.write();
-        let rollback = std::mem::replace(&mut metadata.rollback, WriteRollback::None);
-        assert!(matches!(rollback, WriteRollback::InPlace { .. }));
-        metadata
-            .pending_soft_pin
-            .take()
-            .expect("an in-place update retains its soft-pin action")
-    }
-
-    fn rollback_in_place_update(&self) {
-        let mut metadata = self.metadata.write();
-        let rollback = std::mem::replace(&mut metadata.rollback, WriteRollback::None);
-        let WriteRollback::InPlace { previous_owner } = rollback else {
-            unreachable!("updating an in-place object retains its previous owner");
-        };
-        metadata.owner = previous_owner;
-        metadata.pending_soft_pin = None;
-    }
-
-    fn has_replacement(&self) -> bool {
-        matches!(
-            &self.metadata.read().rollback,
-            WriteRollback::Replacement { .. }
-        )
-    }
-
-    fn replacement(&self) -> Option<Arc<CatalogNode>> {
-        match &self.metadata.read().rollback {
-            WriteRollback::Replacement { previous } => Some(previous.clone()),
-            WriteRollback::None | WriteRollback::InPlace { .. } => None,
-        }
-    }
-
-    fn take_replacement(&self) -> Option<Arc<CatalogNode>> {
-        let rollback = std::mem::replace(&mut self.metadata.write().rollback, WriteRollback::None);
-        match rollback {
-            WriteRollback::Replacement { previous } => Some(previous),
-            WriteRollback::None => None,
-            WriteRollback::InPlace { .. } => {
-                unreachable!("an in-place update cannot publish a replacement")
-            }
-        }
-    }
-
-    fn commit(&self) -> Option<ObjectCommit> {
-        self.commit.get().copied()
-    }
-
-    fn set_commit(&self, commit: ObjectCommit) -> Result<(), ObjectCommit> {
-        self.commit.set(commit)
-    }
-
-    fn take_pending_soft_pin(&self) -> ResolvedSoftPinRequest {
-        self.metadata
-            .write()
-            .pending_soft_pin
-            .take()
-            .expect("a pending generation retains its soft-pin action")
-    }
-}
-
-impl AccessControl {
-    fn acquire_lease(
-        &self,
-        now: CatalogTick,
-        lease_ttl_ticks: u64,
-        lease_refresh_ticks: u64,
-    ) -> CatalogTick {
-        let refresh_at = now.saturating_add(lease_refresh_ticks).get();
-        let desired = now.saturating_add(lease_ttl_ticks).get();
-        let mut current = self.lease_until.load(Ordering::Relaxed);
-        while current < refresh_at {
-            match self.lease_until.compare_exchange_weak(
-                current,
-                desired,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => return CatalogTick::new(desired),
-                Err(observed) => current = observed,
-            }
-        }
-        CatalogTick::new(current)
-    }
-
-    fn record_access(
-        &self,
-        now: CatalogTick,
-        lease_ttl_ticks: u64,
-        lease_refresh_ticks: u64,
-    ) -> CatalogTick {
-        let lease_until = self.acquire_lease(now, lease_ttl_ticks, lease_refresh_ticks);
-        self.recent.store(true, Ordering::Relaxed);
-        lease_until
-    }
-
-    fn take_recent(&self) -> bool {
-        self.recent.swap(false, Ordering::Relaxed)
-    }
-
-    fn lease_until(&self) -> CatalogTick {
-        CatalogTick::new(self.lease_until.load(Ordering::Acquire))
-    }
-
-    fn is_leased(&self, now: CatalogTick) -> bool {
-        self.lease_until() > now
-    }
-
-    fn hard_pinned(&self) -> bool {
-        self.hard_pinned
-    }
-
-    fn soft_pin_until(&self) -> Option<CatalogTick> {
-        match self.soft_pin_until.load(Ordering::Acquire) {
-            0 => None,
-            deadline => Some(CatalogTick::new(deadline)),
-        }
-    }
-
-    fn is_soft_pinned(&self, now: CatalogTick) -> bool {
-        self.soft_pin_until().is_some_and(|deadline| deadline > now)
-    }
-
-    fn expire_soft_pin(&self, expected: CatalogTick, now: CatalogTick) -> bool {
-        expected <= now
-            && self
-                .soft_pin_until
-                .compare_exchange(expected.get(), 0, Ordering::AcqRel, Ordering::Acquire)
-                .is_ok()
-    }
-
-    fn apply_soft_pin(
-        &self,
-        request: ResolvedSoftPinRequest,
-        now: CatalogTick,
-    ) -> Option<CatalogTick> {
-        match request.action {
-            SoftPinAction::Preserve => {
-                if let Some(deadline) = self.soft_pin_until() {
-                    let _ = self.expire_soft_pin(deadline, now);
-                }
-            }
-            SoftPinAction::Enable if request.ttl_ticks != 0 => {
-                self.soft_pin_until.store(
-                    now.saturating_add(request.ttl_ticks).get(),
-                    Ordering::Release,
-                );
-            }
-            SoftPinAction::Enable | SoftPinAction::Disable => {
-                self.soft_pin_until.store(0, Ordering::Release);
-            }
-        }
-        self.soft_pin_until()
-    }
-}
-
 impl GcCandidate {
-    fn new(slot: &Arc<ObjectSlot>, node: &Arc<CatalogNode>) -> Self {
+    fn new(slot: &Arc<ObjectSlot>, version: &Arc<ObjectVersion>) -> Self {
         Self {
             slot: Arc::downgrade(slot),
-            node: Arc::downgrade(node),
+            version: Arc::downgrade(version),
         }
     }
 }
 
-fn slot_points_to(slot: &ObjectSlot, expected: &Arc<CatalogNode>) -> bool {
-    slot.current
-        .load()
+fn committed_points_to(slot: &ObjectSlot, expected: &Arc<ObjectVersion>) -> bool {
+    slot.committed
+        .get()
+        .and_then(ArcSwapOption::load_full)
         .as_ref()
         .is_some_and(|current| Arc::ptr_eq(current, expected))
 }
 
-fn clear_slot(slot: &ObjectSlot, expected: &Arc<CatalogNode>) -> bool {
-    let previous = slot.current.compare_and_swap(expected, None);
-    previous
-        .as_ref()
-        .is_some_and(|current| Arc::ptr_eq(current, expected))
-}
-
-fn restore_previous(slot: &ObjectSlot, replacement: &Arc<CatalogNode>) -> Option<Arc<CatalogNode>> {
-    let previous_node = replacement.mutation.replacement()?;
-    let observed = slot
-        .current
-        .compare_and_swap(replacement, Some(previous_node.clone()));
-    if !observed
-        .as_ref()
-        .is_some_and(|observed| Arc::ptr_eq(observed, replacement))
-    {
-        return None;
+impl ObjectSlot {
+    fn load_committed(&self) -> Option<Arc<ObjectVersion>> {
+        self.committed.get().and_then(ArcSwapOption::load_full)
     }
-    let restored = replacement
-        .mutation
-        .take_replacement()
-        .expect("a restored replacement retains its previous generation");
-    debug_assert!(Arc::ptr_eq(&restored, &previous_node));
-    previous_node.mutation.store(ObjectState::Published);
-    Some(previous_node)
+
+    fn has_committed(&self) -> bool {
+        self.committed
+            .get()
+            .is_some_and(|committed| committed.load().is_some())
+    }
+
+    fn publish_committed(&self, version: Arc<ObjectVersion>) {
+        if let Some(committed) = self.committed.get() {
+            committed.store(Some(version));
+        } else {
+            assert!(
+                self.committed
+                    .set(ArcSwapOption::from(Some(version)))
+                    .is_ok(),
+                "slot control serializes initial publication"
+            );
+        }
+    }
+
+    fn clear_committed(&self) {
+        if let Some(committed) = self.committed.get() {
+            committed.store(None);
+        }
+    }
 }
 
 fn atomic_saturating_sub(value: &AtomicU64, amount: u64) {

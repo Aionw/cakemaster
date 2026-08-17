@@ -3,7 +3,8 @@
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     DirectReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
-    ObjectIdentity, ReplicaId, ReplicaLease, ReplicaSet, WriteAdmission,
+    ObjectIdentity, ObjectPinRequest, ReplicaId, ReplicaLease, ReplicaSet, WriteAdmission,
+    WriteMode,
 };
 use cakemaster::segment::{
     ClientId, DirectCandidate, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool,
@@ -257,9 +258,11 @@ fn run_worker(
             let identity = keys.next().expect("one key exists for every put");
             let succeeded = match pool.reserve(&candidate, OBJECT_BYTES) {
                 Ok(reservation) => {
-                    match catalog.claim_put(
+                    match catalog.begin_write(
                         identity,
                         WriteAdmission::unmanaged(OWNER),
+                        WriteMode::Insert,
+                        ObjectPinRequest::default(),
                         CatalogTick::ZERO,
                     ) {
                         Ok(claim) => match claim.stage(
@@ -269,7 +272,11 @@ fn run_worker(
                                 reservation,
                             ))),
                         ) {
-                            Ok(ticket) => match catalog.publish(&ticket, ObjectCommit::default()) {
+                            Ok(ticket) => match catalog.commit(
+                                &ticket,
+                                ObjectCommit::default(),
+                                CatalogTick::ZERO,
+                            ) {
                                 Ok(handle) => {
                                     black_box(handle.identity());
                                     true
@@ -436,9 +443,11 @@ fn preload_objects(
             .reserve(candidate, OBJECT_BYTES)
             .expect("prefill must fit below the high watermark");
         let ticket = catalog
-            .claim_put(
+            .begin_write(
                 identity,
                 WriteAdmission::unmanaged(OWNER),
+                WriteMode::Insert,
+                ObjectPinRequest::default(),
                 CatalogTick::ZERO,
             )
             .expect("prefill keys are unique")
@@ -452,7 +461,7 @@ fn preload_objects(
             .expect("prefill replica must be valid");
         drop(
             catalog
-                .publish(&ticket, ObjectCommit::default())
+                .commit(&ticket, ObjectCommit::default(), CatalogTick::ZERO)
                 .expect("prefill publish must succeed"),
         );
     }

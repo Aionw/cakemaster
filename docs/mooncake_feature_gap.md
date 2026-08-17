@@ -50,7 +50,7 @@ Mooncake Store。
 
 | 能力 | 当前实现 | 边界 |
 | --- | --- | --- |
-| Object metadata | `ObjectCatalog` 和 `ObjectManager` 已有 claim、pending、publish、revoke、原子 upsert、remove、get/exists、lease、soft/hard pin、pending timeout、按 client session 主动回滚、有界回收，以及 segment 失效后的 replica 级剪枝 | 没有 replica 自动修复/补齐和完整上游 API；checksum、group、upsert 抢占/busy-refcnt 等语义未接入；pin 尚无持久化恢复 |
+| Object metadata | `ObjectCatalog` 和 `ObjectManager` 已有 per-key transaction、无锁 committed version 读取、commit/abort、原子 upsert、remove、get/exists、lease、soft/hard pin、transaction timeout、按 client session 主动撤销、有界回收，以及 segment 失效后的 replica 级剪枝 | 没有 replica 自动修复/补齐和完整上游 API；checksum、group、upsert 抢占/busy-refcnt 等语义未接入；pin 尚无持久化恢复 |
 | Segment/placement | `ClientManager` 已把 `Ping`、Memory/CXL `MountSegment`/`ReMountSegment`、立即/Graceful unmount、session TTL fencing 和批量 cleanup 接到 `SegmentPool`；production runtime 显式运行并 join 兼有 100ms 周期维护和 Graceful deadline 唤醒的 `MasterReconciler` | 没有 NoF lifecycle RPC、探活和真实 I/O |
 | Placement | 支持 preferred segment、free-capacity 排序、replica failure domain 和 RAII 回滚 | 不是上游可配置的五种策略；不支持 mixed Memory+NoF 和 host-local placement |
 | Tenant | `TenantObjectManager` 已有 namespace 隔离、Memory/NoF 分账、quota admission、RAII accounting 和定向回收 | 没有上游 policy connector、HTTP admin、持久化和启动恢复 |
@@ -111,9 +111,10 @@ literal/type hash。C++ yalantinglibs 生成的 metadata 和代表性请求字�
 - 上游 `ReplicaID` 是全局递增的 `uint64_t`；当前领域 `ReplicaId` 是每个对象内从 1
   开始的 `u32` ordinal，wire 虽扩宽成 u64，唯一性和 ID 空间仍不对等。
 
-Upsert 已支持缺失 key 插入、同尺寸 allocation 复用、变尺寸 generation 替换，以及
-end/revoke/timeout/session-fence 回滚；尚未实现上游对既有 PROCESSING writer 的立即抢占和
-replica busy refcnt 检查。Remove 已支持 single/batch/regex/all、lease、hard pin 与 force；
+Upsert 已支持缺失 key 插入、所有尺寸的 fresh-allocation version 替换，以及
+end 原子切换和 revoke/timeout/session-fence 保留旧 committed version；尚未实现上游对既有
+PROCESSING writer 的立即抢占和 replica busy refcnt 检查。Remove 已支持
+single/batch/regex/all、lease、hard pin 与 force；
 force 同时绕过 lease/hard pin。replication task 尚未建模。
 
 上游依据：[`rpc_service.h`](https://github.com/kvcache-ai/Mooncake/blob/5c0724d22e7f04513a3453c8b6642a5a21b80b47/mooncake-store/include/rpc_service.h)、

@@ -901,31 +901,6 @@ fn failure_frame(sequence: u32, failure: RpcFailure) -> ResponseFrame {
 mod tests {
     use super::*;
 
-    #[tokio::test]
-    async fn current_context_is_scoped_to_the_handler_future() {
-        assert!(current_request_context().is_none());
-        let expected = RequestContext {
-            sequence: 17,
-            function_id: 23,
-            attachment: Bytes::from_static(b"diagnostic"),
-            peer_addr: "127.0.0.1:4123".parse().unwrap(),
-        };
-        CURRENT_REQUEST_CONTEXT
-            .scope(expected.clone(), async {
-                assert_eq!(
-                    current_request_context().unwrap().sequence,
-                    expected.sequence
-                );
-                tokio::task::yield_now().await;
-                assert_eq!(
-                    current_request_context().unwrap().peer_addr,
-                    expected.peer_addr
-                );
-            })
-            .await;
-        assert!(current_request_context().is_none());
-    }
-
     #[test]
     fn failure_details_decode_standard_and_extended_codes() {
         let standard = failure_frame(

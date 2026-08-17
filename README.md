@@ -316,7 +316,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 `ExistKey`、`GetReplicaList` 以及 `BatchExistKey`、`BatchGetReplicaList`、
 `BatchPutStart`、`BatchPutEnd`、`BatchPutRevoke`、六个 Upsert 路由和四个 Remove 路由接到
 真实 `ObjectManager`。RPC 层只负责 wire 校验、plan 转换和错误码映射；同步、线程安全的
-ObjectManager 负责 owner、pending/published/upsert 生命周期、lease、soft/hard pin 和 reservation 协调。
+ObjectManager 负责 owner、per-key transaction/committed version、lease、soft/hard pin 和 reservation 协调。
 
 client bootstrap 路由也已对齐固定的 Mooncake `5c0724d` 基线：`ServiceReady` 返回其
 严格版本校验所需的 `2.0.0`，`GetStorageConfig` 返回 `fsdir=""`、

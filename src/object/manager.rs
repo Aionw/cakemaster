@@ -1,18 +1,18 @@
 use super::catalog::{
-    ObjectCatalog, ObjectHandle, ObjectRead, ObjectWriteState, PutClaim, PutTicket, UpsertClaim,
+    ObjectCatalog, ObjectHandle, ObjectRead, WriteClaim, WriteResolution, WriteTransaction,
 };
 use super::config::ObjectCatalogConfig;
 use super::config::{ObjectPinRequest, ResolvedObjectPinRequest};
 use super::content::ObjectContent;
 use super::error::{
-    LookupError, ObjectCatalogConfigError, ObjectManagerError, ObjectRemoveError, PublishError,
-    RevokeError,
+    AbortError, CommitError, LookupError, ObjectCatalogConfigError, ObjectManagerError,
+    ObjectRemoveError,
 };
 use super::identity::{NamespaceId, ObjectIdentity, ObjectLookup};
 use super::reclamation::{CatalogTick, CollectBudget, CollectReport, ReclaimTarget};
 use super::replica::{ReplicaId, ReplicaLease, ReplicaSet};
 use super::tenant::QuotaReservationGuard;
-use super::write::{ObjectCommit, WriteAdmission, WriteOwner};
+use super::write::{ObjectCommit, WriteAdmission, WriteMode, WriteOwner};
 use crate::segment::placement::{PlacementRequest, ReplicaAllocator};
 use crate::segment::{ReplicaClass, ReservationDescriptor, SegmentPool};
 use regex::Regex;
@@ -121,14 +121,9 @@ impl StartedPut {
 /// adjust RAII accounting after placement without changing core error types.
 pub(super) struct PreparedPut {
     content: ObjectContent,
-    claim: PutClaim,
+    claim: WriteClaim,
     replicas: ReplicaSet,
     started: StartedPut,
-}
-
-pub(super) enum PreparedUpsert {
-    Reused(StartedPut),
-    Write(PreparedPut),
 }
 
 impl PreparedPut {
@@ -208,10 +203,8 @@ impl ObjectManager {
         plan: ObjectPutPlan,
         now: CatalogTick,
     ) -> Result<StartedPut, ObjectManagerError> {
-        match self.prepare_upsert(identity, admission, plan, now)? {
-            PreparedUpsert::Reused(started) => Ok(started),
-            PreparedUpsert::Write(prepared) => self.finalize_start_put(prepared, None),
-        }
+        let prepared = self.prepare_upsert(identity, admission, plan, now)?;
+        self.finalize_start_put(prepared, None)
     }
 
     #[inline]
@@ -223,9 +216,9 @@ impl ObjectManager {
         now: CatalogTick,
     ) -> Result<PreparedPut, ObjectManagerError> {
         let pins = self.validate_plan(&plan)?;
-        let claim = self
-            .catalog
-            .claim_put_with_pins(identity, admission, pins, now)?;
+        let claim =
+            self.catalog
+                .begin_write_resolved(identity, admission, WriteMode::Insert, pins, now)?;
         self.prepare_claimed_put(claim, plan)
     }
 
@@ -235,46 +228,17 @@ impl ObjectManager {
         admission: WriteAdmission,
         plan: ObjectPutPlan,
         now: CatalogTick,
-    ) -> Result<PreparedUpsert, ObjectManagerError> {
+    ) -> Result<PreparedPut, ObjectManagerError> {
         let pins = self.validate_plan(&plan)?;
-        match self
-            .catalog
-            .claim_upsert(identity, admission, plan.content(), pins, now)?
-        {
-            UpsertClaim::Reuse(ticket) => {
-                let started = {
-                    let replicas = ticket.replicas();
-                    if replicas.is_empty() || replicas.iter().any(|replica| !replica.is_live()) {
-                        Err(ObjectManagerError::NoAvailableReplicas)
-                    } else {
-                        replicas
-                            .first()
-                            .and_then(ReplicaLease::direct)
-                            .map(|replica| replica.replica_class())
-                            .ok_or(ObjectManagerError::Internal)
-                            .and_then(|replica_class| started_put(replica_class, replicas.iter()))
-                    }
-                };
-                let started = match started {
-                    Ok(started) => started,
-                    Err(error) => {
-                        // The catalog is already hidden in the upserting state. Restore the
-                        // published generation if its reusable descriptors cannot be returned.
-                        let _ = self.catalog.revoke(&ticket, now);
-                        return Err(error);
-                    }
-                };
-                Ok(PreparedUpsert::Reused(started))
-            }
-            UpsertClaim::Write(claim) => self
-                .prepare_claimed_put(claim, plan)
-                .map(PreparedUpsert::Write),
-        }
+        let claim =
+            self.catalog
+                .begin_write_resolved(identity, admission, WriteMode::Upsert, pins, now)?;
+        self.prepare_claimed_put(claim, plan)
     }
 
     fn prepare_claimed_put(
         &self,
-        claim: PutClaim,
+        claim: WriteClaim,
         plan: ObjectPutPlan,
     ) -> Result<PreparedPut, ObjectManagerError> {
         let reservations = self.allocator.reserve(plan.placement())?;
@@ -348,28 +312,25 @@ impl ObjectManager {
         selector: ReplicaSelector,
         now: CatalogTick,
     ) -> Result<(), ObjectManagerError> {
-        let write = match self.catalog.inspect_write(lookup) {
+        let write = match self.catalog.resolve_write(lookup) {
             Ok(write) => write,
             Err(LookupError::NotFound) => return Err(ObjectManagerError::NotFound),
             Err(LookupError::NotReady) => return Err(ObjectManagerError::InvalidWrite),
         };
         let ticket = match write {
-            ObjectWriteState::Pending(ticket) => ticket,
-            ObjectWriteState::Published(object) => {
+            WriteResolution::Active(transaction) => transaction,
+            WriteResolution::Committed(object) => {
                 return validate_published(&object, owner, selector);
             }
         };
         validate_pending(&ticket, owner, selector)?;
-        match self
-            .catalog
-            .publish_at(&ticket, ObjectCommit::new(None), now)
-        {
+        match self.catalog.commit(&ticket, ObjectCommit::new(None), now) {
             Ok(_) => Ok(()),
-            Err(PublishError::ObjectGone | PublishError::NotPending) => {
+            Err(CommitError::TransactionGone | CommitError::NotStaged) => {
                 Err(ObjectManagerError::NotFound)
             }
-            Err(PublishError::ReplicasInvalidated) => Err(ObjectManagerError::NoAvailableReplicas),
-            Err(error @ (PublishError::ForeignCatalog | PublishError::CommitConflict)) => {
+            Err(CommitError::ReplicasInvalidated) => Err(ObjectManagerError::NoAvailableReplicas),
+            Err(error @ (CommitError::ForeignCatalog | CommitError::CommitConflict)) => {
                 log::error!(
                     target: "cakemaster::object::manager",
                     namespace = lookup.namespace().get(),
@@ -398,25 +359,25 @@ impl ObjectManager {
         selector: ReplicaSelector,
         now: CatalogTick,
     ) -> Result<(), ObjectManagerError> {
-        let write = match self.catalog.inspect_write(lookup) {
+        let write = match self.catalog.resolve_write(lookup) {
             Ok(write) => write,
             Err(LookupError::NotFound | LookupError::NotReady) => {
                 return Err(ObjectManagerError::NotFound);
             }
         };
         let ticket = match write {
-            ObjectWriteState::Pending(ticket) => ticket,
-            ObjectWriteState::Published(object) => {
+            WriteResolution::Active(transaction) => transaction,
+            WriteResolution::Committed(object) => {
                 validate_published(&object, owner, selector)?;
                 return Err(ObjectManagerError::InvalidWrite);
             }
         };
         validate_pending(&ticket, owner, selector)?;
-        match self.catalog.revoke(&ticket, now) {
+        match self.catalog.abort(&ticket, now) {
             Ok(()) => Ok(()),
-            Err(RevokeError::ObjectGone) => Err(ObjectManagerError::NotFound),
-            Err(RevokeError::AlreadyPublished) => Err(ObjectManagerError::InvalidWrite),
-            Err(error @ RevokeError::ForeignCatalog) => {
+            Err(AbortError::TransactionGone) => Err(ObjectManagerError::NotFound),
+            Err(AbortError::AlreadyCommitted) => Err(ObjectManagerError::InvalidWrite),
+            Err(error @ AbortError::ForeignCatalog) => {
                 log::error!(
                     target: "cakemaster::object::manager",
                     namespace = lookup.namespace().get(),
@@ -553,7 +514,7 @@ fn started_put<'a>(
 }
 
 fn validate_pending(
-    ticket: &PutTicket,
+    ticket: &WriteTransaction,
     owner: WriteOwner,
     selector: ReplicaSelector,
 ) -> Result<(), ObjectManagerError> {

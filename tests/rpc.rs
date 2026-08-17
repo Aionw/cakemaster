@@ -454,7 +454,7 @@ async fn upsert_and_remove_routes_drive_transactional_catalog_semantics() {
         .unwrap()
         .unwrap();
 
-    let reused = client
+    let replacement = client
         .upsert_start(
             writer.clone(),
             "upsert-key".to_owned(),
@@ -465,16 +465,26 @@ async fn upsert_and_remove_routes_drive_transactional_catalog_semantics() {
         .await
         .unwrap()
         .unwrap();
-    let DescriptorVariant::Memory(reused) = &reused[0].descriptor_variant else {
+    let DescriptorVariant::Memory(replacement) = &replacement[0].descriptor_variant else {
         panic!("expected memory descriptor");
     };
-    assert_eq!(reused.buffer_descriptor.buffer_address, original_address);
+    assert_ne!(
+        replacement.buffer_descriptor.buffer_address,
+        original_address
+    );
+    let visible_during_upsert = client
+        .get_replica_list("upsert-key".to_owned(), "ignored".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    let DescriptorVariant::Memory(visible_during_upsert) =
+        &visible_during_upsert.replicas[0].descriptor_variant
+    else {
+        panic!("expected memory descriptor");
+    };
     assert_eq!(
-        client
-            .get_replica_list("upsert-key".to_owned(), "ignored".to_owned())
-            .await
-            .unwrap(),
-        Err(ErrorCode::ReplicaIsNotReady)
+        visible_during_upsert.buffer_descriptor.buffer_address,
+        original_address
     );
     client
         .upsert_revoke(

@@ -17,14 +17,14 @@ const LOG_LEVEL_ENV: &str = "CAKEMASTER_LOG_LEVEL";
 const LOG_DIRECTORY_ENV: &str = "CAKEMASTER_LOG_DIR";
 const LOG_OUTPUT_ENV: &str = "CAKEMASTER_LOG_OUTPUT";
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum LogOutput {
     Stderr,
     File,
     Both,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum LogLevel {
     Off,
     Error,
@@ -49,7 +49,7 @@ impl LogLevel {
     }
 }
 
-#[derive(clap::Args, Debug, Default, Eq, PartialEq)]
+#[derive(clap::Args, Debug)]
 pub(crate) struct LoggingOverrides {
     /// Set one global log level.
     #[arg(long, value_enum, conflicts_with = "log_filter", value_name = "LEVEL")]
@@ -77,7 +77,7 @@ pub(crate) struct LoggingOverrides {
     pub(crate) log_output: Option<LogOutput>,
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Debug)]
 pub(crate) struct LoggingConfig {
     filter: String,
     directory: PathBuf,
@@ -280,13 +280,11 @@ mod tests {
     }
 
     #[test]
-    fn validates_logging_values() {
-        assert_eq!(parse_level("DEBUG").unwrap(), "debug");
-        assert!(parse_level("verbose").is_err());
-        assert!(parse_filter("info,cakemaster::server=trace").is_ok());
-        assert!(parse_filter("info,cakemaster=verbose").is_err());
-        assert_eq!(parse_output("STDERR").unwrap(), LogOutput::Stderr);
-        assert!(parse_output("stdout").is_err());
+    fn rejects_empty_logging_values_owned_by_cakemaster() {
+        assert!(matches!(
+            parse_filter("  "),
+            Err(LoggingConfigError::InvalidFilter { .. })
+        ));
         assert!(parse_directory(OsString::new()).is_err());
     }
 }

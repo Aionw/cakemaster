@@ -4,7 +4,8 @@ use cakemaster::client::{CleanupReason, ClientLifecycleConfig, ClientManager, Cl
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     DirectReplica, NamespaceId, ObjectCatalogConfig, ObjectCommit, ObjectContent, ObjectIdentity,
-    ObjectManager, ReplicaId, ReplicaLease, ReplicaSet, WriteAdmission,
+    ObjectManager, ObjectPinRequest, ReplicaId, ReplicaLease, ReplicaSet, WriteAdmission,
+    WriteMode,
 };
 use cakemaster::segment::{
     ClientId, CxlArenaId, CxlArenaSpec, SegmentId, SegmentIdentity, SegmentPool, SegmentPoolConfig,
@@ -339,7 +340,13 @@ fn run_worker(
             let write = (|| {
                 let claim = manager
                     .catalog()
-                    .claim_put(identity, admission.clone(), now)
+                    .begin_write(
+                        identity,
+                        admission.clone(),
+                        WriteMode::Insert,
+                        ObjectPinRequest::default(),
+                        now,
+                    )
                     .ok()?;
                 let reservation = manager
                     .pool()
@@ -356,7 +363,7 @@ fn run_worker(
                     .ok()?;
                 manager
                     .catalog()
-                    .publish(&ticket, ObjectCommit::default())
+                    .commit(&ticket, ObjectCommit::default(), now)
                     .ok()?;
                 Some(())
             })();
@@ -436,7 +443,13 @@ fn preload_exiting_pending(
                 .unwrap();
             manager
                 .catalog()
-                .claim_put(identity, write_admission.clone(), CatalogTick::ZERO)
+                .begin_write(
+                    identity,
+                    write_admission.clone(),
+                    WriteMode::Insert,
+                    ObjectPinRequest::default(),
+                    CatalogTick::ZERO,
+                )
                 .unwrap()
                 .stage(
                     ObjectContent::new(OBJECT_BYTES),
@@ -459,9 +472,11 @@ fn publish_on(
     let reservation = manager.pool().reserve_on(segment, OBJECT_BYTES).unwrap();
     let ticket = manager
         .catalog()
-        .claim_put(
+        .begin_write(
             identity,
             WriteAdmission::unmanaged(owner),
+            WriteMode::Insert,
+            ObjectPinRequest::default(),
             CatalogTick::ZERO,
         )
         .unwrap()
@@ -476,7 +491,7 @@ fn publish_on(
     drop(
         manager
             .catalog()
-            .publish(&ticket, ObjectCommit::default())
+            .commit(&ticket, ObjectCommit::default(), CatalogTick::ZERO)
             .unwrap(),
     );
 }
