@@ -240,6 +240,7 @@ impl MasterReconciler {
             || report.graceful_unmount.stale_or_cancelled != 0
             || report.graceful_unmount.retried != 0
             || report.object_collection.expired_writes != 0
+            || catalog.expired_soft_pins != 0
             || catalog.invalidated_pending != 0
             || catalog.invalidated_published != 0
             || catalog.pruned_objects != 0
@@ -254,6 +255,7 @@ impl MasterReconciler {
                 graceful_unmount_completed = report.graceful_unmount.completed,
                 graceful_unmount_retried = report.graceful_unmount.retried,
                 expired_writes = report.object_collection.expired_writes,
+                expired_soft_pins = catalog.expired_soft_pins,
                 invalidated_pending = catalog.invalidated_pending,
                 invalidated_published = catalog.invalidated_published,
                 pruned_objects = catalog.pruned_objects,

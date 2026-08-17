@@ -317,6 +317,24 @@ impl TenantObjectManager {
         Ok(())
     }
 
+    pub fn finish_put_at(
+        &self,
+        tenant: &ResolvedTenant,
+        key: &str,
+        owner: WriteOwner,
+        selector: ReplicaSelector,
+        now: CatalogTick,
+    ) -> Result<(), TenantObjectError> {
+        self.registry.validate(tenant)?;
+        self.object.finish_put_lookup_at(
+            ObjectLookup::new(tenant.namespace, key),
+            owner,
+            selector,
+            now,
+        )?;
+        Ok(())
+    }
+
     pub fn revoke_put(
         &self,
         tenant: &ResolvedTenant,
@@ -448,6 +466,23 @@ impl TenantObjectManager {
     {
         self.map_validated_keys(tenant, keys, |lookup| {
             self.object.finish_put_lookup(lookup, owner, selector)
+        })
+    }
+
+    pub fn finish_put_batch_at<'a, I>(
+        &self,
+        tenant: &ResolvedTenant,
+        keys: I,
+        owner: WriteOwner,
+        selector: ReplicaSelector,
+        now: CatalogTick,
+    ) -> Result<Vec<Result<(), ObjectManagerError>>, TenantObjectError>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        self.map_validated_keys(tenant, keys, |lookup| {
+            self.object
+                .finish_put_lookup_at(lookup, owner, selector, now)
         })
     }
 

@@ -418,7 +418,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let results = self
             .backend
             .execute_batch(&tenant_id, keys.len(), now, |backend, tenant| {
-                backend.finish_put_batch(tenant, &keys, owner, selector)
+                backend.finish_put_batch(tenant, &keys, owner, selector, now)
             });
         debug_assert_eq!(valid.len(), results.len());
         for ((index, _), result) in valid.into_iter().zip(results) {
@@ -531,7 +531,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
             1,
             now,
             |backend, tenant| {
-                backend.finish_put_batch(tenant, &[object_meta.key.as_str()], owner, selector)
+                backend.finish_put_batch(tenant, &[object_meta.key.as_str()], owner, selector, now)
             },
         ));
         Ok(observe_result(labels, result))
@@ -662,7 +662,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let results = self
             .backend
             .execute_batch(&tenant_id, keys.len(), now, |backend, tenant| {
-                backend.finish_put_batch(tenant, &keys, owner, ReplicaSelector::All)
+                backend.finish_put_batch(tenant, &keys, owner, ReplicaSelector::All, now)
             });
         debug_assert_eq!(valid.len(), results.len());
         for ((index, _), result) in valid.into_iter().zip(results) {

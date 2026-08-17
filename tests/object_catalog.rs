@@ -3,9 +3,10 @@ use cakemaster::object::error::{
 };
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
-    DirectReplica, LocalSsdReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit,
-    ObjectContent, ObjectIdentity, ObjectLookup, ReplicaId, ReplicaLease, ReplicaSet,
-    WriteAdmission, WriteOwner,
+    DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS, DEFAULT_MAX_SOFT_PIN_TTL_TICKS,
+    DEFAULT_SOFT_PIN_TTL_TICKS, DirectReplica, LocalSsdReplica, NamespaceId, ObjectCatalog,
+    ObjectCatalogConfig, ObjectCommit, ObjectContent, ObjectIdentity, ObjectLookup, ReplicaId,
+    ReplicaLease, ReplicaSet, WriteAdmission, WriteOwner,
 };
 use cakemaster::segment::placement::{
     AllocationSpec, PlacementRequest, ReplicaAllocator, ReplicaPolicy,
@@ -58,6 +59,30 @@ fn rejects_inconsistent_lease_configuration_with_context() {
         Some(ObjectCatalogConfigError::LeaseRefreshExceedsTtl {
             lease_ttl_ticks: 10,
             lease_refresh_ticks: 11,
+        })
+    );
+}
+
+#[test]
+fn soft_pin_configuration_matches_upstream_defaults_and_validates_bounds() {
+    let config = ObjectCatalogConfig::new(16);
+    assert_eq!(
+        config.default_soft_pin_ttl_ticks(),
+        DEFAULT_SOFT_PIN_TTL_TICKS
+    );
+    assert_eq!(
+        config.max_soft_pin_ttl_ticks(),
+        DEFAULT_MAX_SOFT_PIN_TTL_TICKS
+    );
+    assert_eq!(
+        config.allow_evict_soft_pinned_objects(),
+        DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS
+    );
+    assert_eq!(
+        ObjectCatalog::with_config(config.with_soft_pin_ttl(101, 100)).err(),
+        Some(ObjectCatalogConfigError::DefaultSoftPinTtlExceedsMaximum {
+            default_soft_pin_ttl_ticks: 101,
+            max_soft_pin_ttl_ticks: 100,
         })
     );
 }

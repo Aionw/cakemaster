@@ -3,8 +3,8 @@ use cakemaster::mooncake::{Uuid, WrappedMasterService};
 use cakemaster::object::error::LookupError;
 use cakemaster::object::reclamation::CollectBudget;
 use cakemaster::object::{
-    NamespaceId, ObjectContent, ObjectIdentity, ObjectManager, ObjectPutPlan, ReplicaSelector,
-    TenantConfig, TenantId, TenantObjectManager,
+    NamespaceId, ObjectContent, ObjectIdentity, ObjectManager, ObjectPinRequest, ObjectPutPlan,
+    ReplicaSelector, SoftPinAction, TenantConfig, TenantId, TenantObjectManager,
 };
 use cakemaster::segment::placement::{AllocationSpec, PlacementRequest, ReplicaPolicy};
 use cakemaster::segment::{
@@ -196,6 +196,53 @@ async fn object_collection_budget_bounds_each_reconcile_step() {
     );
     assert_eq!(manager.catalog().stats().published_objects, 0);
     assert!(pool.is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn reconciler_expires_soft_pins_with_the_collection_budget() {
+    let (_pool, manager, service) = single_service(1_000, 16);
+    let clients = service.client_manager().clone();
+    clients
+        .remount(
+            CLIENT,
+            vec![segment(CLIENT, 1)],
+            service.clock().client_now(),
+        )
+        .unwrap();
+    let object = identity("reconciled-soft-pin");
+    manager
+        .start_put(
+            object.clone(),
+            clients.write_admission(CLIENT).unwrap(),
+            plan(4096).with_pins(ObjectPinRequest::new(SoftPinAction::Enable, Some(5), false)),
+            service.clock().now(),
+        )
+        .unwrap();
+    manager
+        .finish_put_at(
+            &object,
+            clients.write_owner(CLIENT).unwrap(),
+            ReplicaSelector::All,
+            service.clock().now(),
+        )
+        .unwrap();
+
+    tokio::time::advance(Duration::from_millis(6)).await;
+    let report = service
+        .reconciler(
+            MasterReconcileConfig::new(Duration::from_millis(100), CollectBudget::new(1, 0, 0))
+                .unwrap(),
+        )
+        .reconcile_once();
+    assert_eq!(report.object_collection.catalog.scanned_soft_pins, 1);
+    assert_eq!(report.object_collection.catalog.expired_soft_pins, 1);
+    assert!(
+        !manager
+            .get(object.as_lookup(), service.clock().now())
+            .unwrap()
+            .object()
+            .is_soft_pinned(service.clock().now())
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -316,7 +316,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 `ExistKey`、`GetReplicaList` 以及 `BatchExistKey`、`BatchGetReplicaList`、
 `BatchPutStart`、`BatchPutEnd`、`BatchPutRevoke`、六个 Upsert 路由和四个 Remove 路由接到
 真实 `ObjectManager`。RPC 层只负责 wire 校验、plan 转换和错误码映射；同步、线程安全的
-ObjectManager 负责 owner、pending/published/upsert 生命周期、lease 和 reservation 协调。
+ObjectManager 负责 owner、pending/published/upsert 生命周期、lease、soft/hard pin 和 reservation 协调。
 
 client bootstrap 路由也已对齐固定的 Mooncake `5c0724d` 基线：`ServiceReady` 返回其
 严格版本校验所需的 `2.0.0`，`GetStorageConfig` 返回 `fsdir=""`、
@@ -331,7 +331,8 @@ RPC server 和 `MasterReconciler` 的统一 shutdown/join。workspace 的主 bin
 
 当前明确不支持 checksum：PutEnd 携带 checksum 返回 `INVALID_PARAMS`，Get/BatchGet
 固定返回 `None`。Memory-only replica 使用与 C++ 一致的 best-effort 语义，NoF-only
-使用 all-or-nothing；混合 Memory+NoF、group、pin 和 Disk 仍需领域模型支持，不在 RPC
+使用 all-or-nothing；`ReplicateConfig` 的 soft-pin action/TTL 和 hard pin 已接入事务、
+淘汰与强制删除生命周期。混合 Memory+NoF、group 和 Disk 仍需领域模型支持，不在 RPC
 handler 中静默降级。multi-tenant 构造会解析 tenant、隔离 namespace 并执行
 Memory/NoF quota admission。
 

@@ -1,9 +1,12 @@
 //! Mooncake wire request validation and domain normalization.
 
 use crate::mooncake::{
-    ErrorCode, ObjectDataType, ReplicaType, ReplicateConfig, Segment, SoftPinAction, Uuid,
+    ErrorCode, ObjectDataType, ReplicaType, ReplicateConfig, Segment,
+    SoftPinAction as WireSoftPinAction, Uuid,
 };
-use crate::object::{ObjectContent, ObjectKind, ObjectPutPlan, ReplicaSelector};
+use crate::object::{
+    ObjectContent, ObjectKind, ObjectPinRequest, ObjectPutPlan, ReplicaSelector, SoftPinAction,
+};
 use crate::segment::placement::{
     AllocationSpec, FulfillmentPolicy, PlacementConstraints, PlacementRequest, ReplicaPolicy,
 };
@@ -19,6 +22,7 @@ pub(super) struct PutPlanTemplate {
     fulfillment: FulfillmentPolicy,
     constraints: PlacementConstraints,
     object_kind: ObjectKind,
+    pins: ObjectPinRequest,
 }
 
 impl PutPlanTemplate {
@@ -34,6 +38,7 @@ impl PutPlanTemplate {
             ObjectContent::new(logical_bytes).with_kind(self.object_kind),
             placement,
         )
+        .with_pins(self.pins)
     }
 }
 
@@ -41,10 +46,7 @@ impl TryFrom<&ReplicateConfig> for PutPlanTemplate {
     type Error = ErrorCode;
 
     fn try_from(config: &ReplicateConfig) -> Result<Self, Self::Error> {
-        if config.soft_pin_action == SoftPinAction::Enable
-            || config.soft_pin_ttl_ms.is_some()
-            || config.with_hard_pin
-            || config.prefer_alloc_in_same_node
+        if config.prefer_alloc_in_same_node
             || !config.host_id.is_empty()
             || config.group_ids.is_some()
         {
@@ -83,6 +85,14 @@ impl TryFrom<&ReplicateConfig> for PutPlanTemplate {
         if raw_count > u64::from(u32::MAX) {
             return Err(ErrorCode::InvalidParams);
         }
+        let soft_pin_action = match config.soft_pin_action {
+            WireSoftPinAction::Preserve => SoftPinAction::Preserve,
+            WireSoftPinAction::Enable => SoftPinAction::Enable,
+            WireSoftPinAction::Disable => SoftPinAction::Disable,
+        };
+        if soft_pin_action != SoftPinAction::Enable && config.soft_pin_ttl_ms.is_some() {
+            return Err(ErrorCode::InvalidParams);
+        }
 
         Ok(Self {
             replica_class,
@@ -91,6 +101,11 @@ impl TryFrom<&ReplicateConfig> for PutPlanTemplate {
             constraints: PlacementConstraints::default()
                 .with_preferred_names(normalize_names(preferred)),
             object_kind: object_kind(config.data_type),
+            pins: ObjectPinRequest::new(
+                soft_pin_action,
+                config.soft_pin_ttl_ms,
+                config.with_hard_pin,
+            ),
         })
     }
 }
@@ -171,7 +186,7 @@ mod tests {
         ReplicateConfig {
             replica_num,
             nof_replica_num,
-            soft_pin_action: SoftPinAction::Preserve,
+            soft_pin_action: WireSoftPinAction::Preserve,
             soft_pin_ttl_ms: None,
             with_hard_pin: false,
             preferred_segments: Vec::new(),
@@ -212,14 +227,11 @@ mod tests {
         assert!(PutPlanTemplate::try_from(&config(0, 0)).is_err());
         assert!(PutPlanTemplate::try_from(&config(1, 1)).is_err());
         let mut pinned = config(1, 0);
-        pinned.soft_pin_action = SoftPinAction::Enable;
-        assert_eq!(
-            PutPlanTemplate::try_from(&pinned).err(),
-            Some(ErrorCode::InvalidParams)
-        );
+        pinned.soft_pin_action = WireSoftPinAction::Enable;
+        assert!(PutPlanTemplate::try_from(&pinned).is_ok());
 
         let mut disabled = config(1, 0);
-        disabled.soft_pin_action = SoftPinAction::Disable;
+        disabled.soft_pin_action = WireSoftPinAction::Disable;
         assert!(PutPlanTemplate::try_from(&disabled).is_ok());
 
         let mut ttl_without_enable = config(1, 0);

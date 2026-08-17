@@ -109,6 +109,9 @@ pub(super) fn map_remove_error(error: ObjectRemoveError) -> ErrorCode {
         ObjectRemoveError::NotFound => ErrorCode::ObjectNotFound,
         ObjectRemoveError::NotReady => ErrorCode::ReplicaIsNotReady,
         ObjectRemoveError::Leased { .. } => ErrorCode::ObjectHasLease,
+        // The upstream wire has no dedicated hard-pin removal error. Reuse
+        // its existing "protected object" response for non-force removal.
+        ObjectRemoveError::HardPinned => ErrorCode::ObjectHasLease,
     }
 }
 

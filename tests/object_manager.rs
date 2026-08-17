@@ -2,7 +2,7 @@ use cakemaster::object::error::{LookupError, ObjectManagerError, ObjectRemoveErr
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     NamespaceId, ObjectCatalogConfig, ObjectContent, ObjectIdentity, ObjectKind, ObjectManager,
-    ObjectPutPlan, ReplicaSelector, WriteAdmission, WriteOwner,
+    ObjectPinRequest, ObjectPutPlan, ReplicaSelector, SoftPinAction, WriteAdmission, WriteOwner,
 };
 use cakemaster::segment::placement::{
     AllocationSpec, FulfillmentPolicy, PlacementRequest, ReplicaPolicy,
@@ -1013,4 +1013,418 @@ fn concurrent_start_for_one_key_has_one_winner() {
             .filter(|result| result.is_err())
             .all(|result| { result.as_ref().unwrap_err() == &ObjectManagerError::AlreadyExists })
     );
+}
+
+#[test]
+fn pin_requests_validate_and_commit_at_finish_time() {
+    let manager = ObjectManager::with_config(
+        pool(true, false),
+        ObjectCatalogConfig::new(16).with_soft_pin_ttl(50, 100),
+    )
+    .unwrap();
+    let invalid_ttl = plan(
+        1024,
+        1,
+        ReplicaClass::Memory,
+        FulfillmentPolicy::AllOrNothing,
+    )
+    .with_pins(ObjectPinRequest::new(
+        SoftPinAction::Preserve,
+        Some(10),
+        false,
+    ));
+    assert_eq!(
+        manager.start_put(
+            identity("ttl-requires-enable"),
+            admission(OWNER),
+            invalid_ttl,
+            CatalogTick::ZERO,
+        ),
+        Err(ObjectManagerError::InvalidPlan)
+    );
+
+    let over_limit = plan(
+        1024,
+        1,
+        ReplicaClass::Memory,
+        FulfillmentPolicy::AllOrNothing,
+    )
+    .with_pins(ObjectPinRequest::new(
+        SoftPinAction::Enable,
+        Some(101),
+        false,
+    ));
+    assert_eq!(
+        manager.start_put(
+            identity("ttl-over-limit"),
+            admission(OWNER),
+            over_limit,
+            CatalogTick::ZERO,
+        ),
+        Err(ObjectManagerError::InvalidPlan)
+    );
+
+    let object = identity("default-ttl");
+    manager
+        .start_put(
+            object.clone(),
+            admission(OWNER),
+            plan(
+                1024,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            )
+            .with_pins(ObjectPinRequest::new(SoftPinAction::Enable, None, false)),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    manager
+        .finish_put_at(
+            &object,
+            owner(OWNER),
+            ReplicaSelector::All,
+            CatalogTick::new(10),
+        )
+        .unwrap();
+    let read = manager
+        .get(object.as_lookup(), CatalogTick::new(10))
+        .unwrap();
+    assert_eq!(
+        read.object().soft_pin_expires_at(),
+        Some(CatalogTick::new(60))
+    );
+    assert!(read.object().is_soft_pinned(CatalogTick::new(59)));
+    assert!(!read.object().is_soft_pinned(CatalogTick::new(60)));
+
+    let zero = identity("zero-ttl");
+    manager
+        .start_put(
+            zero.clone(),
+            admission(OWNER),
+            plan(
+                1024,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            )
+            .with_pins(ObjectPinRequest::new(SoftPinAction::Enable, Some(0), false)),
+            CatalogTick::new(20),
+        )
+        .unwrap();
+    manager
+        .finish_put_at(
+            &zero,
+            owner(OWNER),
+            ReplicaSelector::All,
+            CatalogTick::new(21),
+        )
+        .unwrap();
+    assert_eq!(
+        manager
+            .get(zero.as_lookup(), CatalogTick::new(21))
+            .unwrap()
+            .object()
+            .soft_pin_expires_at(),
+        None
+    );
+}
+
+#[test]
+fn upsert_pin_changes_commit_atomically_and_rollback_preserves_metadata() {
+    let manager = ObjectManager::with_config(
+        pool(true, false),
+        ObjectCatalogConfig::new(16)
+            .with_lease(1, 0)
+            .with_pending_timeout(5)
+            .with_soft_pin_ttl(100, 1_000),
+    )
+    .unwrap();
+    let object = identity("pin-upsert");
+    let make_plan = |bytes, action, ttl, hard| {
+        plan(
+            bytes,
+            1,
+            ReplicaClass::Memory,
+            FulfillmentPolicy::AllOrNothing,
+        )
+        .with_pins(ObjectPinRequest::new(action, ttl, hard))
+    };
+
+    manager
+        .start_put(
+            object.clone(),
+            admission(OWNER),
+            make_plan(4096, SoftPinAction::Enable, Some(100), false),
+            CatalogTick::new(1),
+        )
+        .unwrap();
+    manager
+        .finish_put_at(
+            &object,
+            owner(OWNER),
+            ReplicaSelector::All,
+            CatalogTick::new(10),
+        )
+        .unwrap();
+
+    // Same-size upsert preserves hard-pin state even when the request asks to
+    // enable it, and PRESERVE keeps the original committed deadline.
+    manager
+        .start_upsert(
+            object.clone(),
+            admission(OWNER),
+            make_plan(4096, SoftPinAction::Preserve, None, true),
+            CatalogTick::new(20),
+        )
+        .unwrap();
+    manager
+        .finish_put_at(
+            &object,
+            owner(OWNER),
+            ReplicaSelector::All,
+            CatalogTick::new(20),
+        )
+        .unwrap();
+    let read = manager
+        .get(object.as_lookup(), CatalogTick::new(20))
+        .unwrap();
+    assert_eq!(
+        read.object().soft_pin_expires_at(),
+        Some(CatalogTick::new(110))
+    );
+    assert!(!read.object().is_hard_pinned());
+    drop(read);
+
+    // Revoke and timeout both discard the pending soft-pin change.
+    manager
+        .start_upsert(
+            object.clone(),
+            admission(OWNER),
+            make_plan(4096, SoftPinAction::Disable, None, false),
+            CatalogTick::new(30),
+        )
+        .unwrap();
+    manager
+        .revoke_put(
+            &object,
+            owner(OWNER),
+            ReplicaSelector::All,
+            CatalogTick::new(31),
+        )
+        .unwrap();
+    assert_eq!(
+        manager
+            .get(object.as_lookup(), CatalogTick::new(31))
+            .unwrap()
+            .object()
+            .soft_pin_expires_at(),
+        Some(CatalogTick::new(110))
+    );
+    manager
+        .start_upsert(
+            object.clone(),
+            admission(OWNER),
+            make_plan(4096, SoftPinAction::Disable, None, false),
+            CatalogTick::new(40),
+        )
+        .unwrap();
+    let maintenance = manager.maintenance(CatalogTick::new(46), CollectBudget::new(8, 0, 0));
+    assert_eq!(maintenance.expired_writes, 1);
+    assert_eq!(
+        manager
+            .get(object.as_lookup(), CatalogTick::new(46))
+            .unwrap()
+            .object()
+            .soft_pin_expires_at(),
+        Some(CatalogTick::new(110))
+    );
+
+    manager
+        .start_upsert(
+            object.clone(),
+            admission(OWNER),
+            make_plan(4096, SoftPinAction::Disable, None, false),
+            CatalogTick::new(47),
+        )
+        .unwrap();
+    manager
+        .finish_put_at(
+            &object,
+            owner(OWNER),
+            ReplicaSelector::All,
+            CatalogTick::new(48),
+        )
+        .unwrap();
+    assert_eq!(
+        manager
+            .get(object.as_lookup(), CatalogTick::new(48))
+            .unwrap()
+            .object()
+            .soft_pin_expires_at(),
+        None
+    );
+    manager
+        .start_upsert(
+            object.clone(),
+            admission(OWNER),
+            make_plan(4096, SoftPinAction::Enable, Some(100), false),
+            CatalogTick::new(49),
+        )
+        .unwrap();
+    manager
+        .finish_put_at(
+            &object,
+            owner(OWNER),
+            ReplicaSelector::All,
+            CatalogTick::new(50),
+        )
+        .unwrap();
+
+    // A size-changing upsert may add a hard pin and carries the committed
+    // soft deadline into the replacement generation.
+    manager
+        .start_upsert(
+            object.clone(),
+            admission(OWNER),
+            make_plan(8192, SoftPinAction::Preserve, None, true),
+            CatalogTick::new(60),
+        )
+        .unwrap();
+    manager
+        .finish_put_at(
+            &object,
+            owner(OWNER),
+            ReplicaSelector::All,
+            CatalogTick::new(70),
+        )
+        .unwrap();
+    let read = manager
+        .get(object.as_lookup(), CatalogTick::new(70))
+        .unwrap();
+    assert!(read.object().is_hard_pinned());
+    assert_eq!(
+        read.object().soft_pin_expires_at(),
+        Some(CatalogTick::new(150))
+    );
+    drop(read);
+
+    assert_eq!(
+        manager.remove(object.as_lookup(), CatalogTick::new(200), false),
+        Err(ObjectRemoveError::HardPinned)
+    );
+    manager
+        .remove(object.as_lookup(), CatalogTick::new(200), true)
+        .unwrap();
+}
+
+#[test]
+fn eviction_obeys_hard_and_soft_pin_policy_and_expiry_scan_is_bounded() {
+    let protected = ObjectManager::with_config(
+        pool(true, false),
+        ObjectCatalogConfig::new(16)
+            .with_lease(1, 0)
+            .with_soft_pin_ttl(100, 100)
+            .with_soft_pin_eviction(false),
+    )
+    .unwrap();
+    for index in 0..3 {
+        let object = identity(&format!("soft-{index}"));
+        protected
+            .start_put(
+                object.clone(),
+                admission(OWNER),
+                plan(
+                    1024,
+                    1,
+                    ReplicaClass::Memory,
+                    FulfillmentPolicy::AllOrNothing,
+                )
+                .with_pins(ObjectPinRequest::new(
+                    SoftPinAction::Enable,
+                    Some(100),
+                    false,
+                )),
+                CatalogTick::ZERO,
+            )
+            .unwrap();
+        protected
+            .finish_put_at(
+                &object,
+                owner(OWNER),
+                ReplicaSelector::All,
+                CatalogTick::ZERO,
+            )
+            .unwrap();
+    }
+    protected.catalog().request_reclaim(1024);
+    let active = protected.maintenance(CatalogTick::new(10), CollectBudget::new(8, 8, 0));
+    assert_eq!(active.catalog.retired_objects, 0);
+
+    let first_expiry = protected.maintenance(CatalogTick::new(101), CollectBudget::new(1, 8, 0));
+    assert_eq!(first_expiry.catalog.scanned_soft_pins, 1);
+    assert_eq!(first_expiry.catalog.expired_soft_pins, 1);
+    assert!(protected.catalog().stats().soft_pin_candidates <= 2);
+
+    let permissive = ObjectManager::with_config(
+        pool(true, false),
+        ObjectCatalogConfig::new(8)
+            .with_lease(1, 0)
+            .with_soft_pin_ttl(100, 100)
+            .with_soft_pin_eviction(true),
+    )
+    .unwrap();
+    let soft = identity("evict-active-soft-pin");
+    permissive
+        .start_put(
+            soft.clone(),
+            admission(OWNER),
+            plan(
+                1024,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            )
+            .with_pins(ObjectPinRequest::new(
+                SoftPinAction::Enable,
+                Some(100),
+                false,
+            )),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    permissive
+        .finish_put_at(&soft, owner(OWNER), ReplicaSelector::All, CatalogTick::ZERO)
+        .unwrap();
+    permissive.catalog().request_reclaim(1024);
+    let evicted = permissive.maintenance(CatalogTick::new(10), CollectBudget::new(8, 8, 0));
+    assert_eq!(evicted.catalog.retired_objects, 1);
+
+    let hard_manager = ObjectManager::with_config(
+        pool(true, false),
+        ObjectCatalogConfig::new(8).with_lease(1, 0),
+    )
+    .unwrap();
+    let hard = identity("never-evict-hard-pin");
+    hard_manager
+        .start_put(
+            hard.clone(),
+            admission(OWNER),
+            plan(
+                1024,
+                1,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            )
+            .with_pins(ObjectPinRequest::new(SoftPinAction::Preserve, None, true)),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    hard_manager
+        .finish_put_at(&hard, owner(OWNER), ReplicaSelector::All, CatalogTick::ZERO)
+        .unwrap();
+    hard_manager.catalog().request_reclaim(1024);
+    let skipped = hard_manager.maintenance(CatalogTick::new(1_000), CollectBudget::new(8, 8, 0));
+    assert_eq!(skipped.catalog.retired_objects, 0);
+    assert!(hard_manager.exists(hard.as_lookup(), CatalogTick::new(1_000)));
 }

@@ -58,6 +58,10 @@ impl ObjectCatalog {
                     expires_at: lease_until,
                 });
             }
+            if !force && node.access.hard_pinned() {
+                node.mutation.store(ObjectState::Published);
+                return Err(RemoveError::HardPinned);
+            }
             if !clear_slot(&slot, &node) {
                 node.mutation.store(ObjectState::Published);
                 return Err(RemoveError::NotFound);
@@ -120,6 +124,7 @@ impl ObjectCatalog {
         // eviction stays paused while a liveness sweep is incomplete so it
         // cannot move an unscanned candidate between generations.
         let mut report = CollectReport::default();
+        self.inner.expire_soft_pins(now, budget, &mut report);
         let liveness_scanned = self
             .inner
             .retire_invalidated_published(now, budget, &mut report);
@@ -161,6 +166,42 @@ impl ObjectCatalog {
 }
 
 impl CatalogInner {
+    pub(super) fn expire_soft_pins(
+        &self,
+        now: CatalogTick,
+        budget: CollectBudget,
+        report: &mut CollectReport,
+    ) {
+        let candidates = self.collector.soft_pins.len().min(budget.max_candidates);
+        for _ in 0..candidates {
+            let Some(candidate) = self.collector.soft_pins.pop() else {
+                break;
+            };
+            report.scanned_soft_pins += 1;
+            let Some(slot) = candidate.candidate.slot.upgrade() else {
+                continue;
+            };
+            let Some(node) = candidate.candidate.node.upgrade() else {
+                continue;
+            };
+            if !slot_points_to(&slot, &node)
+                || !matches!(
+                    node.mutation.state(),
+                    ObjectState::Pending | ObjectState::Published | ObjectState::Updating
+                )
+            {
+                continue;
+            }
+            if candidate.deadline > now {
+                self.collector.soft_pins.push(candidate);
+                continue;
+            }
+            if node.access.expire_soft_pin(candidate.deadline, now) {
+                report.expired_soft_pins += 1;
+            }
+        }
+    }
+
     pub(super) fn retire_invalidated_published(
         &self,
         now: CatalogTick,
@@ -627,6 +668,16 @@ impl CatalogInner {
 
         let write = node.mutation.lock();
         if node.mutation.state() != ObjectState::Published || !slot_points_to(&slot, &node) {
+            return 0;
+        }
+        if node.access.hard_pinned()
+            || (node.access.is_soft_pinned(now) && !self.config.allow_evict_soft_pinned_objects)
+        {
+            if from_protected {
+                self.collector.protected.push(candidate);
+            } else {
+                self.collector.young.push(candidate);
+            }
             return 0;
         }
         if node.access.take_recent() {

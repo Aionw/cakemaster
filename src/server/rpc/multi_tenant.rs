@@ -80,15 +80,17 @@ impl ObjectBatchBackend for TenantObjectManager {
         keys: &[&str],
         owner: WriteOwner,
         selector: ReplicaSelector,
+        now: CatalogTick,
     ) -> Vec<ExpectedVoid> {
         map_tenant_batch(
             keys.len(),
-            TenantObjectManager::finish_put_batch(
+            TenantObjectManager::finish_put_batch_at(
                 self,
                 tenant,
                 keys.iter().copied(),
                 owner,
                 selector,
+                now,
             ),
             |result| result.map_err(map_manager_error),
         )
