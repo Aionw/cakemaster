@@ -14,15 +14,14 @@ pub struct ObjectCatalogStats {
     pub pending_bytes: u64,
     pub live_bytes: u64,
     pub retired_bytes: u64,
-    // Reclaim pressure from independent producers.
-    /// Largest outstanding global reclaim request after coalescing sources.
+    /// Retired bytes backed by Memory/CXL reservations.
+    pub retired_memory_bytes: u64,
+    // Explicit global reclaim pressure. Watermark and allocation-failure
+    // pressure are controller-owned, class-scoped, and exposed separately.
     pub reclaim_debt: u64,
-    /// Explicit/admin reclaim debt, excluding the production watermark target.
-    pub requested_reclaim_debt: u64,
-    /// Physical bytes still required by the production watermark controller.
-    pub watermark_reclaim_debt: u64,
     // Bounded collector queue diagnostics.
     pub pending_candidates: usize,
+    pub soft_pin_candidates: usize,
     pub liveness_scan_remaining: usize,
     pub young_candidates: usize,
     pub protected_candidates: usize,

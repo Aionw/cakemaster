@@ -1,19 +1,22 @@
 use super::catalog::{
-    ObjectCatalog, ObjectHandle, ObjectRead, ObjectWriteState, PutClaim, PutTicket, UpsertClaim,
+    ObjectCatalog, ObjectHandle, ObjectRead, WriteClaim, WriteResolution, WriteTransaction,
 };
 use super::config::ObjectCatalogConfig;
+use super::config::{ObjectPinRequest, ResolvedObjectPinRequest};
 use super::content::ObjectContent;
 use super::error::{
-    LookupError, ObjectCatalogConfigError, ObjectManagerError, ObjectRemoveError, PublishError,
-    RevokeError,
+    AbortError, CommitError, LookupError, ObjectCatalogConfigError, ObjectManagerError,
+    ObjectRemoveError,
 };
 use super::eviction::{MemoryEvictionConfig, MemoryEvictionController, MemoryEvictionStats};
 use super::identity::{NamespaceId, ObjectIdentity, ObjectLookup};
 use super::reclamation::{CatalogTick, CollectBudget, CollectReport, ReclaimTarget};
 use super::replica::{ReplicaId, ReplicaLease, ReplicaSet};
 use super::tenant::QuotaReservationGuard;
-use super::write::{ObjectCommit, WriteAdmission, WriteOwner};
-use crate::segment::placement::{PlacementRequest, ReplicaAllocator};
+use super::write::{ObjectCommit, WriteAdmission, WriteMode, WriteOwner};
+use crate::segment::placement::{
+    FulfillmentPolicy, PlacementError, PlacementRequest, ReplicaAllocator,
+};
 use crate::segment::{ReplicaClass, ReservationDescriptor, SegmentPool};
 use regex::Regex;
 use std::sync::Arc;
@@ -49,11 +52,16 @@ impl PendingWriteRevoker {
 pub struct ObjectPutPlan {
     content: ObjectContent,
     placement: PlacementRequest,
+    pins: ObjectPinRequest,
 }
 
 impl ObjectPutPlan {
     pub const fn new(content: ObjectContent, placement: PlacementRequest) -> Self {
-        Self { content, placement }
+        Self {
+            content,
+            placement,
+            pins: ObjectPinRequest::new(super::config::SoftPinAction::Preserve, None, false),
+        }
     }
 
     pub const fn content(&self) -> ObjectContent {
@@ -62,6 +70,15 @@ impl ObjectPutPlan {
 
     pub const fn placement(&self) -> &PlacementRequest {
         &self.placement
+    }
+
+    pub const fn with_pins(mut self, pins: ObjectPinRequest) -> Self {
+        self.pins = pins;
+        self
+    }
+
+    pub const fn pins(&self) -> ObjectPinRequest {
+        self.pins
     }
 }
 
@@ -108,14 +125,24 @@ impl StartedPut {
 /// adjust RAII accounting after placement without changing core error types.
 pub(super) struct PreparedPut {
     content: ObjectContent,
-    claim: PutClaim,
+    claim: WriteClaim,
     replicas: ReplicaSet,
     started: StartedPut,
 }
 
-pub(super) enum PreparedUpsert {
-    Reused(StartedPut),
-    Write(PreparedPut),
+struct AllocationShortfall {
+    reclaim_bytes: u64,
+    allocation_bytes: u64,
+}
+
+enum PrepareClaimedPutError {
+    Allocation(AllocationShortfall),
+    Manager(ObjectManagerError),
+}
+
+struct AllocationEviction {
+    made_progress: bool,
+    generation: u64,
 }
 
 impl PreparedPut {
@@ -227,10 +254,8 @@ impl ObjectManager {
         plan: ObjectPutPlan,
         now: CatalogTick,
     ) -> Result<StartedPut, ObjectManagerError> {
-        match self.prepare_upsert(identity, admission, plan, now)? {
-            PreparedUpsert::Reused(started) => Ok(started),
-            PreparedUpsert::Write(prepared) => self.finalize_start_put(prepared, None),
-        }
+        let prepared = self.prepare_upsert(identity, admission, plan, now)?;
+        self.finalize_start_put(prepared, None)
     }
 
     #[inline]
@@ -241,36 +266,8 @@ impl ObjectManager {
         plan: ObjectPutPlan,
         now: CatalogTick,
     ) -> Result<PreparedPut, ObjectManagerError> {
-        self.validate_plan(&plan)?;
-        let retry_limit = self.allocation_retry_limit(plan.placement().replica_class());
-        let mut retries = 0;
-        loop {
-            let claim = self
-                .catalog
-                .claim_put(identity.clone(), admission.clone(), now)?;
-            match self.prepare_claimed_put(claim, plan.clone()) {
-                Ok(prepared) => {
-                    if retries != 0 {
-                        self.record_allocation_retry_success();
-                    }
-                    return Ok(prepared);
-                }
-                Err(ObjectManagerError::NoAvailableReplicas) => {
-                    let made_progress = plan.placement().replica_class() == ReplicaClass::Memory
-                        && self.evict_after_allocation_failure(
-                            allocation_failure_reclaim_bytes(&plan),
-                            plan.placement().allocation().bytes(),
-                            now,
-                        );
-                    if retries >= retry_limit || !made_progress {
-                        return Err(ObjectManagerError::NoAvailableReplicas);
-                    }
-                    retries += 1;
-                    self.record_allocation_retry();
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        let pins = self.validate_plan(&plan)?;
+        self.prepare_write(identity, admission, plan, WriteMode::Insert, pins, now)
     }
 
     pub(super) fn prepare_upsert(
@@ -279,88 +276,98 @@ impl ObjectManager {
         admission: WriteAdmission,
         plan: ObjectPutPlan,
         now: CatalogTick,
-    ) -> Result<PreparedUpsert, ObjectManagerError> {
-        self.validate_plan(&plan)?;
+    ) -> Result<PreparedPut, ObjectManagerError> {
+        let pins = self.validate_plan(&plan)?;
+        self.prepare_write(identity, admission, plan, WriteMode::Upsert, pins, now)
+    }
+
+    fn prepare_write(
+        &self,
+        identity: ObjectIdentity,
+        admission: WriteAdmission,
+        plan: ObjectPutPlan,
+        mode: WriteMode,
+        pins: ResolvedObjectPinRequest,
+        now: CatalogTick,
+    ) -> Result<PreparedPut, ObjectManagerError> {
         let retry_limit = self.allocation_retry_limit(plan.placement().replica_class());
         let mut retries = 0;
+        let mut allocation_generation = None;
         loop {
-            match self.catalog.claim_upsert(
+            let claim = match self.catalog.begin_write_resolved(
                 identity.clone(),
                 admission.clone(),
-                plan.content(),
+                mode,
+                pins,
                 now,
-            )? {
-                UpsertClaim::Reuse(ticket) => {
-                    let started = {
-                        let replicas = ticket.replicas();
-                        if replicas.is_empty() || replicas.iter().any(|replica| !replica.is_live())
-                        {
-                            Err(ObjectManagerError::NoAvailableReplicas)
-                        } else {
-                            replicas
-                                .first()
-                                .and_then(ReplicaLease::direct)
-                                .map(|replica| replica.replica_class())
-                                .ok_or(ObjectManagerError::Internal)
-                                .and_then(|replica_class| {
-                                    started_put(replica_class, replicas.iter())
-                                })
-                        }
-                    };
-                    let started = match started {
-                        Ok(started) => started,
-                        Err(error) => {
-                            // The catalog is already hidden in the upserting state. Restore the
-                            // published generation if its reusable descriptors cannot be returned.
-                            let _ = self.catalog.revoke(&ticket, now);
-                            return Err(error);
-                        }
-                    };
+            ) {
+                Ok(claim) => claim,
+                Err(error) => {
+                    self.clear_allocation_reclaim(allocation_generation);
+                    return Err(error.into());
+                }
+            };
+            match self.prepare_claimed_put(claim, plan.clone()) {
+                Ok(prepared) => {
+                    self.clear_allocation_reclaim(allocation_generation);
                     if retries != 0 {
                         self.record_allocation_retry_success();
                     }
-                    return Ok(PreparedUpsert::Reused(started));
+                    return Ok(prepared);
                 }
-                UpsertClaim::Write(claim) => match self.prepare_claimed_put(claim, plan.clone()) {
-                    Ok(prepared) => {
-                        if retries != 0 {
-                            self.record_allocation_retry_success();
-                        }
-                        return Ok(PreparedUpsert::Write(prepared));
+                Err(PrepareClaimedPutError::Allocation(shortfall)) => {
+                    let eviction = (plan.placement().replica_class() == ReplicaClass::Memory)
+                        .then(|| self.evict_after_allocation_failure(shortfall, now))
+                        .flatten();
+                    let made_progress = eviction
+                        .as_ref()
+                        .is_some_and(|eviction| eviction.made_progress);
+                    if let Some(eviction) = eviction {
+                        allocation_generation = Some(eviction.generation);
                     }
-                    Err(ObjectManagerError::NoAvailableReplicas) => {
-                        let made_progress = plan.placement().replica_class()
-                            == ReplicaClass::Memory
-                            && self.evict_after_allocation_failure(
-                                allocation_failure_reclaim_bytes(&plan),
-                                plan.placement().allocation().bytes(),
-                                now,
-                            );
-                        if retries >= retry_limit || !made_progress {
-                            return Err(ObjectManagerError::NoAvailableReplicas);
-                        }
-                        retries += 1;
-                        self.record_allocation_retry();
+                    if retries >= retry_limit || !made_progress {
+                        return Err(ObjectManagerError::NoAvailableReplicas);
                     }
-                    Err(error) => return Err(error),
-                },
+                    retries += 1;
+                    self.record_allocation_retry();
+                }
+                Err(PrepareClaimedPutError::Manager(error)) => {
+                    self.clear_allocation_reclaim(allocation_generation);
+                    return Err(error);
+                }
             }
         }
     }
 
     fn prepare_claimed_put(
         &self,
-        claim: PutClaim,
+        claim: WriteClaim,
         plan: ObjectPutPlan,
-    ) -> Result<PreparedPut, ObjectManagerError> {
-        let reservations = self.allocator.reserve(plan.placement())?;
+    ) -> Result<PreparedPut, PrepareClaimedPutError> {
+        let reservations = match self.allocator.reserve(plan.placement()) {
+            Ok(reservations) => reservations,
+            Err(PlacementError::InsufficientReplicas {
+                requested,
+                allocated,
+            }) => {
+                return Err(PrepareClaimedPutError::Allocation(allocation_shortfall(
+                    &plan, requested, allocated,
+                )));
+            }
+            Err(error) => return Err(PrepareClaimedPutError::Manager(error.into())),
+        };
         let replicas = ReplicaSet::from_reservations(reservations);
         if replicas.is_empty() {
-            return Err(ObjectManagerError::NoAvailableReplicas);
+            return Err(PrepareClaimedPutError::Allocation(allocation_shortfall(
+                &plan,
+                plan.placement().replicas().count(),
+                0,
+            )));
         }
 
         let replica_class = plan.placement().replica_class();
-        let started = started_put(replica_class, replicas.replicas().iter())?;
+        let started = started_put(replica_class, replicas.replicas().iter())
+            .map_err(PrepareClaimedPutError::Manager)?;
         Ok(PreparedPut {
             content: plan.content(),
             claim,
@@ -394,7 +401,18 @@ impl ObjectManager {
         owner: WriteOwner,
         selector: ReplicaSelector,
     ) -> Result<(), ObjectManagerError> {
-        self.finish_put_lookup(identity.as_lookup(), owner, selector)
+        self.finish_put_at(identity, owner, selector, CatalogTick::ZERO)
+    }
+
+    /// Finishes a write using the supplied catalog time for commit-time pin changes.
+    pub fn finish_put_at(
+        &self,
+        identity: &ObjectIdentity,
+        owner: WriteOwner,
+        selector: ReplicaSelector,
+        now: CatalogTick,
+    ) -> Result<(), ObjectManagerError> {
+        self.finish_put_lookup_at(identity.as_lookup(), owner, selector, now)
     }
 
     pub(super) fn finish_put_lookup(
@@ -403,25 +421,35 @@ impl ObjectManager {
         owner: WriteOwner,
         selector: ReplicaSelector,
     ) -> Result<(), ObjectManagerError> {
-        let write = match self.catalog.inspect_write(lookup) {
+        self.finish_put_lookup_at(lookup, owner, selector, CatalogTick::ZERO)
+    }
+
+    pub(super) fn finish_put_lookup_at(
+        &self,
+        lookup: ObjectLookup<'_>,
+        owner: WriteOwner,
+        selector: ReplicaSelector,
+        now: CatalogTick,
+    ) -> Result<(), ObjectManagerError> {
+        let write = match self.catalog.resolve_write(lookup) {
             Ok(write) => write,
             Err(LookupError::NotFound) => return Err(ObjectManagerError::NotFound),
             Err(LookupError::NotReady) => return Err(ObjectManagerError::InvalidWrite),
         };
         let ticket = match write {
-            ObjectWriteState::Pending(ticket) => ticket,
-            ObjectWriteState::Published(object) => {
+            WriteResolution::Active(transaction) => transaction,
+            WriteResolution::Committed(object) => {
                 return validate_published(&object, owner, selector);
             }
         };
         validate_pending(&ticket, owner, selector)?;
-        match self.catalog.publish(&ticket, ObjectCommit::new(None)) {
+        match self.catalog.commit(&ticket, ObjectCommit::new(None), now) {
             Ok(_) => Ok(()),
-            Err(PublishError::ObjectGone | PublishError::NotPending) => {
+            Err(CommitError::TransactionGone | CommitError::NotStaged) => {
                 Err(ObjectManagerError::NotFound)
             }
-            Err(PublishError::ReplicasInvalidated) => Err(ObjectManagerError::NoAvailableReplicas),
-            Err(error @ (PublishError::ForeignCatalog | PublishError::CommitConflict)) => {
+            Err(CommitError::ReplicasInvalidated) => Err(ObjectManagerError::NoAvailableReplicas),
+            Err(error @ (CommitError::ForeignCatalog | CommitError::CommitConflict)) => {
                 log::error!(
                     target: "cakemaster::object::manager",
                     namespace = lookup.namespace().get(),
@@ -450,25 +478,25 @@ impl ObjectManager {
         selector: ReplicaSelector,
         now: CatalogTick,
     ) -> Result<(), ObjectManagerError> {
-        let write = match self.catalog.inspect_write(lookup) {
+        let write = match self.catalog.resolve_write(lookup) {
             Ok(write) => write,
             Err(LookupError::NotFound | LookupError::NotReady) => {
                 return Err(ObjectManagerError::NotFound);
             }
         };
         let ticket = match write {
-            ObjectWriteState::Pending(ticket) => ticket,
-            ObjectWriteState::Published(object) => {
+            WriteResolution::Active(transaction) => transaction,
+            WriteResolution::Committed(object) => {
                 validate_published(&object, owner, selector)?;
                 return Err(ObjectManagerError::InvalidWrite);
             }
         };
         validate_pending(&ticket, owner, selector)?;
-        match self.catalog.revoke(&ticket, now) {
+        match self.catalog.abort(&ticket, now) {
             Ok(()) => Ok(()),
-            Err(RevokeError::ObjectGone) => Err(ObjectManagerError::NotFound),
-            Err(RevokeError::AlreadyPublished) => Err(ObjectManagerError::InvalidWrite),
-            Err(error @ RevokeError::ForeignCatalog) => {
+            Err(AbortError::TransactionGone) => Err(ObjectManagerError::NotFound),
+            Err(AbortError::AlreadyCommitted) => Err(ObjectManagerError::InvalidWrite),
+            Err(error @ AbortError::ForeignCatalog) => {
                 log::error!(
                     target: "cakemaster::object::manager",
                     namespace = lookup.namespace().get(),
@@ -550,29 +578,33 @@ impl ObjectManager {
         {
             self.catalog.request_liveness_scan();
         }
-        let watermark_reclaim = self.memory_eviction.as_ref().map(|eviction| {
-            eviction.prepare_step(
-                self.pool().space_for(ReplicaClass::Memory),
-                self.catalog.stats(),
-            )
-        });
-        let catalog = self.catalog.collect_step_with_targets_and_watermark(
-            now,
-            budget,
-            targets,
-            watermark_reclaim,
-        );
-        if let Some(eviction) = &self.memory_eviction {
-            let active = eviction.finish_step(
-                self.pool().space_for(ReplicaClass::Memory),
-                self.catalog.stats(),
-                catalog,
-            );
-            if !active && self.catalog.stats().watermark_reclaim_debt != 0 {
-                self.catalog.try_clear_watermark_reclaim();
+        let catalog = match &self.memory_eviction {
+            Some(eviction) => {
+                let report = self.catalog.collect_step_with_targets_and_watermark(
+                    now,
+                    budget,
+                    targets,
+                    || {
+                        eviction.prepare_step(
+                            self.pool().space_for(ReplicaClass::Memory),
+                            self.catalog.stats(),
+                        )
+                    },
+                    |report| {
+                        eviction.finish_step(
+                            self.pool().space_for(ReplicaClass::Memory),
+                            self.catalog.stats(),
+                            report,
+                        );
+                    },
+                );
+                if report.busy {
+                    eviction.record_busy_step();
+                }
+                report
             }
-            eviction.refresh_catalog(self.catalog.stats());
-        }
+            None => self.catalog.collect_step_with_targets(now, budget, targets),
+        };
         ObjectManagerMaintenance {
             expired_writes: catalog.expired_pending,
             catalog,
@@ -580,7 +612,10 @@ impl ObjectManager {
         }
     }
 
-    fn validate_plan(&self, plan: &ObjectPutPlan) -> Result<(), ObjectManagerError> {
+    fn validate_plan(
+        &self,
+        plan: &ObjectPutPlan,
+    ) -> Result<ResolvedObjectPinRequest, ObjectManagerError> {
         if plan.content().logical_bytes() == 0
             || plan.placement().allocation().bytes() != plan.content().logical_bytes()
             || plan.placement().replicas().count() == 0
@@ -591,7 +626,9 @@ impl ObjectManager {
         {
             return Err(ObjectManagerError::InvalidPlan);
         }
-        Ok(())
+        self.catalog
+            .resolve_pin_request(plan.pins())
+            .map_err(|_| ObjectManagerError::InvalidPlan)
     }
 
     fn allocation_retry_limit(&self, replica_class: ReplicaClass) -> usize {
@@ -605,29 +642,27 @@ impl ObjectManager {
 
     fn evict_after_allocation_failure(
         &self,
-        reclaim_bytes: u64,
-        allocation_bytes: u64,
+        shortfall: AllocationShortfall,
         now: CatalogTick,
-    ) -> bool {
+    ) -> Option<AllocationEviction> {
         let Some(eviction) = &self.memory_eviction else {
-            return false;
+            return None;
         };
-        eviction.record_allocation_failure();
-        self.catalog.request_reclaim(reclaim_bytes);
+        let generation = eviction.request_allocation_reclaim(shortfall.reclaim_bytes);
         let before = self.pool().space_for(ReplicaClass::Memory);
         let report = self
             .maintenance(now, eviction.config().allocation_failure_budget())
             .catalog;
         let after = self.pool().space_for(ReplicaClass::Memory);
         let should_retry = !report.busy
-            && after.largest_free_region_bytes >= allocation_bytes
-            && (report.reclaimed_bytes != 0
+            && after.largest_free_region_bytes >= shortfall.allocation_bytes
+            && (report.reclaimed_memory_bytes != 0
                 || after.used_bytes < before.used_bytes
                 || after.largest_free_region_bytes > before.largest_free_region_bytes);
         log::debug!(
             target: "cakemaster::object::eviction",
-            reclaim_bytes = reclaim_bytes,
-            allocation_bytes = allocation_bytes,
+            reclaim_bytes = shortfall.reclaim_bytes,
+            allocation_bytes = shortfall.allocation_bytes,
             used_bytes_before = before.used_bytes,
             used_bytes_after = after.used_bytes,
             largest_free_region_before = before.largest_free_region_bytes,
@@ -637,7 +672,16 @@ impl ObjectManager {
             should_retry = should_retry;
             "bounded allocation-failure eviction completed"
         );
-        should_retry
+        Some(AllocationEviction {
+            made_progress: should_retry,
+            generation,
+        })
+    }
+
+    fn clear_allocation_reclaim(&self, generation: Option<u64>) {
+        if let (Some(eviction), Some(generation)) = (&self.memory_eviction, generation) {
+            eviction.clear_allocation_reclaim(generation);
+        }
     }
 
     fn record_allocation_retry(&self) {
@@ -680,16 +724,25 @@ fn started_put<'a>(
     })
 }
 
-fn allocation_failure_reclaim_bytes(plan: &ObjectPutPlan) -> u64 {
-    let replica_count = u64::try_from(plan.placement().replicas().count()).unwrap_or(u64::MAX);
-    plan.placement()
-        .allocation()
-        .bytes()
-        .saturating_mul(replica_count)
+fn allocation_shortfall(
+    plan: &ObjectPutPlan,
+    requested_replicas: usize,
+    allocated_replicas: usize,
+) -> AllocationShortfall {
+    let missing_replicas = match plan.placement().fulfillment() {
+        FulfillmentPolicy::AllOrNothing => requested_replicas.saturating_sub(allocated_replicas),
+        FulfillmentPolicy::BestEffort => 1,
+    };
+    let replica_count = u64::try_from(missing_replicas).unwrap_or(u64::MAX);
+    let allocation_bytes = plan.placement().allocation().bytes();
+    AllocationShortfall {
+        allocation_bytes,
+        reclaim_bytes: allocation_bytes.saturating_mul(replica_count),
+    }
 }
 
 fn validate_pending(
-    ticket: &PutTicket,
+    ticket: &WriteTransaction,
     owner: WriteOwner,
     selector: ReplicaSelector,
 ) -> Result<(), ObjectManagerError> {

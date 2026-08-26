@@ -62,6 +62,8 @@ pub struct CollectReport {
     pub busy: bool,
     pub scanned_candidates: usize,
     pub expired_pending: usize,
+    pub scanned_soft_pins: usize,
+    pub expired_soft_pins: usize,
     pub invalidated_pending: usize,
     pub invalidated_published: usize,
     pub pruned_objects: usize,
@@ -71,6 +73,7 @@ pub struct CollectReport {
     pub retired_bytes: u64,
     pub reclaimed_objects: usize,
     pub reclaimed_bytes: u64,
+    pub reclaimed_memory_bytes: u64,
     pub removed_empty_slots: usize,
     pub scoped_retired_objects: usize,
     pub scoped_retired_bytes: u64,
@@ -79,6 +82,7 @@ pub struct CollectReport {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReclaimFilter {
     Any,
+    Class(ReplicaClass),
     Scope {
         namespace: NamespaceId,
         replica_class: ReplicaClass,

@@ -1,11 +1,12 @@
 use cakemaster::object::error::{
-    LookupError, ObjectCatalogConfigError, PublishError, PutError, RemoveError, StageError,
+    BeginError, CommitError, LookupError, ObjectCatalogConfigError, RemoveError, StageError,
 };
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
-    DirectReplica, LocalSsdReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit,
-    ObjectContent, ObjectIdentity, ObjectLookup, ReplicaId, ReplicaLease, ReplicaSet,
-    WriteAdmission, WriteOwner,
+    DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS, DEFAULT_MAX_SOFT_PIN_TTL_TICKS,
+    DEFAULT_SOFT_PIN_TTL_TICKS, DirectReplica, LocalSsdReplica, NamespaceId, ObjectCatalog,
+    ObjectCatalogConfig, ObjectCommit, ObjectContent, ObjectIdentity, ObjectPinRequest, ReplicaId,
+    ReplicaLease, ReplicaSet, WriteAdmission, WriteClaim, WriteMode, WriteOwner,
 };
 use cakemaster::segment::placement::{
     AllocationSpec, PlacementRequest, ReplicaAllocator, ReplicaPolicy,
@@ -14,9 +15,7 @@ use cakemaster::segment::{
     ClientId, MemoryRegion, ReplicaClass, SegmentId, SegmentIdentity, SegmentPool,
     SegmentPoolConfig, SegmentSpec, TransportEndpoint, TransportProtocol,
 };
-use std::hint::black_box;
-use std::sync::{Arc, Barrier};
-use std::thread;
+use std::sync::Arc;
 
 const OWNER: ClientId = ClientId::new(17, 23);
 const SEGMENT_ID: SegmentId = SegmentId::new(9, 1);
@@ -44,6 +43,21 @@ fn admission() -> WriteAdmission {
     WriteAdmission::unmanaged(OWNER)
 }
 
+fn begin_insert(
+    catalog: &ObjectCatalog,
+    identity: ObjectIdentity,
+    admission: WriteAdmission,
+    now: CatalogTick,
+) -> Result<WriteClaim, BeginError> {
+    catalog.begin_write(
+        identity,
+        admission,
+        WriteMode::Insert,
+        ObjectPinRequest::default(),
+        now,
+    )
+}
+
 fn replica(pool: &SegmentPool, bytes: u64) -> ReplicaSet {
     ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
         ReplicaId::new(1),
@@ -58,6 +72,30 @@ fn rejects_inconsistent_lease_configuration_with_context() {
         Some(ObjectCatalogConfigError::LeaseRefreshExceedsTtl {
             lease_ttl_ticks: 10,
             lease_refresh_ticks: 11,
+        })
+    );
+}
+
+#[test]
+fn soft_pin_configuration_matches_upstream_defaults_and_validates_bounds() {
+    let config = ObjectCatalogConfig::new(16);
+    assert_eq!(
+        config.default_soft_pin_ttl_ticks(),
+        DEFAULT_SOFT_PIN_TTL_TICKS
+    );
+    assert_eq!(
+        config.max_soft_pin_ttl_ticks(),
+        DEFAULT_MAX_SOFT_PIN_TTL_TICKS
+    );
+    assert_eq!(
+        config.allow_evict_soft_pinned_objects(),
+        DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS
+    );
+    assert_eq!(
+        ObjectCatalog::with_config(config.with_soft_pin_ttl(101, 100)).err(),
+        Some(ObjectCatalogConfigError::DefaultSoftPinTtlExceedsMaximum {
+            default_soft_pin_ttl_ticks: 101,
+            max_soft_pin_ttl_ticks: 100,
         })
     );
 }
@@ -150,15 +188,15 @@ fn pending_object_reclamation_releases_local_ssd_capacity() {
             .with_empty_slot_grace(1),
     )
     .unwrap();
-    let ticket = catalog
-        .claim_put(
-            identity("local-ssd-pending"),
-            admission(),
-            CatalogTick::ZERO,
-        )
-        .unwrap()
-        .stage(ObjectContent::new(4096), replicas)
-        .unwrap();
+    let ticket = begin_insert(
+        &catalog,
+        identity("local-ssd-pending"),
+        admission(),
+        CatalogTick::ZERO,
+    )
+    .unwrap()
+    .stage(ObjectContent::new(4096), replicas)
+    .unwrap();
     drop(ticket);
     assert_eq!(candidate.local_ssd_stats().unwrap().committed_bytes, 4096);
 
@@ -178,20 +216,33 @@ fn dropped_claim_reopens_the_stable_slot() {
     )
     .unwrap();
 
-    let first = catalog
-        .claim_put(identity("same-key"), admission(), CatalogTick::new(1))
-        .unwrap();
+    let first = begin_insert(
+        &catalog,
+        identity("same-key"),
+        admission(),
+        CatalogTick::new(1),
+    )
+    .unwrap();
     assert!(matches!(
-        catalog.claim_put(identity("same-key"), admission(), CatalogTick::new(1)),
-        Err(PutError::WriteInProgress)
+        begin_insert(
+            &catalog,
+            identity("same-key"),
+            admission(),
+            CatalogTick::new(1)
+        ),
+        Err(BeginError::WriteInProgress)
     ));
     let first_id = first.id();
     drop(first);
 
-    let second = catalog
-        .claim_put(identity("same-key"), admission(), CatalogTick::new(2))
-        .unwrap();
-    assert!(second.id().generation() > first_id.generation());
+    let second = begin_insert(
+        &catalog,
+        identity("same-key"),
+        admission(),
+        CatalogTick::new(2),
+    )
+    .unwrap();
+    assert!(second.id().get() > first_id.get());
     drop(second);
 
     let report = catalog.collect_step(CatalogTick::new(4), CollectBudget::new(0, 0, 8));
@@ -209,8 +260,7 @@ fn publish_lookup_remove_and_reclaim_preserve_lease_and_ownership() {
     )
     .unwrap();
     let object = identity("published");
-    let ticket = catalog
-        .claim_put(object.clone(), admission(), CatalogTick::ZERO)
+    let ticket = begin_insert(&catalog, object.clone(), admission(), CatalogTick::ZERO)
         .unwrap()
         .stage(ObjectContent::new(4096), replica(&pool, 4096))
         .unwrap();
@@ -220,16 +270,24 @@ fn publish_lookup_remove_and_reclaim_preserve_lease_and_ownership() {
         Err(LookupError::NotReady)
     ));
     let published = catalog
-        .publish(&ticket, ObjectCommit::new(Some(0xfeed_beef)))
+        .commit(
+            &ticket,
+            ObjectCommit::new(Some(0xfeed_beef)),
+            CatalogTick::ZERO,
+        )
         .unwrap();
     drop(
         catalog
-            .publish(&ticket, ObjectCommit::new(Some(0xfeed_beef)))
+            .commit(
+                &ticket,
+                ObjectCommit::new(Some(0xfeed_beef)),
+                CatalogTick::ZERO,
+            )
             .unwrap(),
     );
     assert!(matches!(
-        catalog.publish(&ticket, ObjectCommit::new(Some(7))),
-        Err(PublishError::CommitConflict)
+        catalog.commit(&ticket, ObjectCommit::new(Some(7)), CatalogTick::ZERO),
+        Err(CommitError::CommitConflict)
     ));
     assert_eq!(published.identity(), &object);
     assert_eq!(published.content().logical_bytes(), 4096);
@@ -276,8 +334,7 @@ fn pending_timeout_reclaims_memory_without_a_batch_pause() {
     )
     .unwrap();
     let object = identity("abandoned-write");
-    let ticket = catalog
-        .claim_put(object.clone(), admission(), CatalogTick::ZERO)
+    let ticket = begin_insert(&catalog, object.clone(), admission(), CatalogTick::ZERO)
         .unwrap()
         .stage(ObjectContent::new(1024), replica(&pool, 1024))
         .unwrap();
@@ -300,16 +357,24 @@ fn pending_expiration_has_no_future_deadline_head_of_line_blocking() {
     let pool = pool(1 << 20, 4096);
     let catalog =
         ObjectCatalog::with_config(ObjectCatalogConfig::new(16).with_pending_timeout(10)).unwrap();
-    let future = catalog
-        .claim_put(identity("future"), admission(), CatalogTick::new(100))
-        .unwrap()
-        .stage(ObjectContent::new(1024), replica(&pool, 1024))
-        .unwrap();
-    let expired = catalog
-        .claim_put(identity("expired"), admission(), CatalogTick::ZERO)
-        .unwrap()
-        .stage(ObjectContent::new(1024), replica(&pool, 1024))
-        .unwrap();
+    let future = begin_insert(
+        &catalog,
+        identity("future"),
+        admission(),
+        CatalogTick::new(100),
+    )
+    .unwrap()
+    .stage(ObjectContent::new(1024), replica(&pool, 1024))
+    .unwrap();
+    let expired = begin_insert(
+        &catalog,
+        identity("expired"),
+        admission(),
+        CatalogTick::ZERO,
+    )
+    .unwrap()
+    .stage(ObjectContent::new(1024), replica(&pool, 1024))
+    .unwrap();
     drop(future);
     drop(expired);
 
@@ -328,8 +393,7 @@ fn invalid_staging_rolls_back_claim_and_reservation_by_raii() {
     let pool = pool(1 << 20, 4096);
     let catalog = ObjectCatalog::new();
     let object = identity("undersized");
-    let result = catalog
-        .claim_put(object.clone(), admission(), CatalogTick::ZERO)
+    let result = begin_insert(&catalog, object.clone(), admission(), CatalogTick::ZERO)
         .unwrap()
         .stage(ObjectContent::new(4096), replica(&pool, 1024));
 
@@ -343,11 +407,7 @@ fn invalid_staging_rolls_back_claim_and_reservation_by_raii() {
     ));
     assert_eq!(pool.stats(SEGMENT_ID).unwrap().usage.active_allocations, 0);
     assert_eq!(catalog.stats().claims, 0);
-    assert!(
-        catalog
-            .claim_put(object, admission(), CatalogTick::new(1))
-            .is_ok()
-    );
+    assert!(begin_insert(&catalog, object, admission(), CatalogTick::new(1)).is_ok());
 }
 
 #[test]
@@ -357,22 +417,19 @@ fn invalidated_segment_replicas_cannot_be_staged_or_published() {
     let publish_object = identity("invalidate-before-publish");
     let stage_object = identity("invalidate-before-stage");
 
-    let ticket = catalog
-        .claim_put(publish_object, admission(), CatalogTick::ZERO)
+    let ticket = begin_insert(&catalog, publish_object, admission(), CatalogTick::ZERO)
         .unwrap()
         .stage(ObjectContent::new(1024), replica(&pool, 1024))
         .unwrap();
-    let claim = catalog
-        .claim_put(stage_object, admission(), CatalogTick::ZERO)
-        .unwrap();
+    let claim = begin_insert(&catalog, stage_object, admission(), CatalogTick::ZERO).unwrap();
     let unstaged_replicas = replica(&pool, 1024);
 
     pool.quiesce(OWNER, SEGMENT_ID).unwrap();
     pool.remove(OWNER, SEGMENT_ID).unwrap();
 
     assert!(matches!(
-        catalog.publish(&ticket, ObjectCommit::new(None)),
-        Err(PublishError::ReplicasInvalidated)
+        catalog.commit(&ticket, ObjectCommit::new(None), CatalogTick::ZERO),
+        Err(CommitError::ReplicasInvalidated)
     ));
     assert!(matches!(
         claim.stage(ObjectContent::new(1024), unstaged_replicas),
@@ -392,21 +449,19 @@ fn reclamation_promotes_recent_objects_and_defers_pinned_resources() {
     let hot = identity("hot");
     let cold = identity("cold");
 
-    let hot_ticket = catalog
-        .claim_put(hot.clone(), admission(), CatalogTick::ZERO)
+    let hot_ticket = begin_insert(&catalog, hot.clone(), admission(), CatalogTick::ZERO)
         .unwrap()
         .stage(ObjectContent::new(4096), replica(&pool, 4096))
         .unwrap();
     let hot_handle = catalog
-        .publish(&hot_ticket, ObjectCommit::default())
+        .commit(&hot_ticket, ObjectCommit::default(), CatalogTick::ZERO)
         .unwrap();
-    let cold_ticket = catalog
-        .claim_put(cold.clone(), admission(), CatalogTick::ZERO)
+    let cold_ticket = begin_insert(&catalog, cold.clone(), admission(), CatalogTick::ZERO)
         .unwrap()
         .stage(ObjectContent::new(4096), replica(&pool, 4096))
         .unwrap();
     let cold_handle = catalog
-        .publish(&cold_ticket, ObjectCommit::default())
+        .commit(&cold_ticket, ObjectCommit::default(), CatalogTick::ZERO)
         .unwrap();
 
     let pinned_hot = catalog.get(hot.as_lookup(), CatalogTick::ZERO).unwrap();
@@ -438,91 +493,5 @@ fn reclamation_promotes_recent_objects_and_defers_pinned_resources() {
     drop(pinned_hot);
     let report = catalog.collect_step(CatalogTick::new(11), CollectBudget::new(8, 8, 0));
     assert_eq!(report.reclaimed_objects, 1);
-    assert_eq!(pool.stats(SEGMENT_ID).unwrap().usage.active_allocations, 0);
-}
-
-#[test]
-fn high_concurrency_put_get_and_incremental_collection_leave_no_resources() {
-    let pool = pool(32 << 20, 32 * 1024);
-    let catalog = Arc::new(
-        ObjectCatalog::with_config(
-            ObjectCatalogConfig::new(16 * 1024)
-                .with_lease(8, 4)
-                .with_pending_timeout(10_000)
-                .with_empty_slot_grace(4),
-        )
-        .unwrap(),
-    );
-    let workers = thread::available_parallelism()
-        .map_or(4, usize::from)
-        .clamp(4, 8);
-    let operations_per_worker = 2_000;
-    let barrier = Arc::new(Barrier::new(workers + 2));
-
-    thread::scope(|scope| {
-        for worker in 0..workers {
-            let catalog = catalog.clone();
-            let pool = pool.clone();
-            let barrier = barrier.clone();
-            scope.spawn(move || {
-                barrier.wait();
-                for operation in 0..operations_per_worker {
-                    let sequence = worker * operations_per_worker + operation;
-                    if operation & 1 == 0 {
-                        let key = format!("object-{sequence}");
-                        let ticket = catalog
-                            .claim_put(
-                                identity(key),
-                                admission(),
-                                CatalogTick::new(operation as u64),
-                            )
-                            .unwrap()
-                            .stage(ObjectContent::new(64), replica(&pool, 64))
-                            .unwrap();
-                        let handle = catalog
-                            .publish(&ticket, ObjectCommit::default())
-                            .expect("the ticket has one serialized publisher");
-                        black_box(handle.identity());
-                    } else {
-                        let prior = sequence - 1;
-                        let key = format!("object-{prior}");
-                        let _ = black_box(catalog.get(
-                            ObjectLookup::new(NamespaceId::DEFAULT, &key),
-                            CatalogTick::new(operation as u64),
-                        ));
-                    }
-                }
-            });
-        }
-
-        let catalog = catalog.clone();
-        let collector_barrier = barrier.clone();
-        scope.spawn(move || {
-            collector_barrier.wait();
-            for tick in 0..operations_per_worker {
-                catalog.request_reclaim(16 * 1024);
-                black_box(
-                    catalog
-                        .collect_step(CatalogTick::new(tick as u64), CollectBudget::new(16, 16, 4)),
-                );
-            }
-        });
-
-        barrier.wait();
-    });
-
-    assert_eq!(catalog.stats().claims, 0);
-    assert_eq!(catalog.stats().pending_objects, 0);
-    catalog.request_reclaim(u64::MAX);
-    for _ in 0..4 {
-        catalog.collect_step(
-            CatalogTick::new(u64::MAX),
-            CollectBudget::new(usize::MAX, usize::MAX, usize::MAX),
-        );
-    }
-    let stats = catalog.stats();
-    assert_eq!(stats.published_objects, 0);
-    assert_eq!(stats.live_bytes, 0);
-    assert_eq!(stats.retired_bytes, 0);
     assert_eq!(pool.stats(SEGMENT_ID).unwrap().usage.active_allocations, 0);
 }

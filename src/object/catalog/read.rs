@@ -10,32 +10,34 @@ impl ObjectCatalog {
             .inner
             .lookup_slot(lookup)
             .ok_or(LookupError::NotFound)?;
-        for _ in 0..3 {
-            let node = slot.current.load_full().ok_or(LookupError::NotFound)?;
-            match node.mutation.state() {
-                ObjectState::Claimed | ObjectState::Pending | ObjectState::Updating => {
-                    return Err(LookupError::NotReady);
+        loop {
+            let Some(version) = slot.load_committed() else {
+                let control = slot.control.lock();
+                if slot.has_committed() {
+                    continue;
                 }
-                ObjectState::Retiring => return Err(LookupError::NotFound),
-                ObjectState::Published => {}
-            }
-            let lease_expires_at = node.access.record_access(
+                return if control.active.is_some() {
+                    Err(LookupError::NotReady)
+                } else {
+                    Err(LookupError::NotFound)
+                };
+            };
+            let lease_expires_at = version.access().record_access(
                 now,
                 self.inner.config.lease_ttl_ticks,
                 self.inner.config.lease_refresh_ticks,
             );
-            let has_live_replica = node.record().replicas.read().has_live();
-            if node.mutation.state() == ObjectState::Published
-                && slot_points_to(&slot, &node)
-                && has_live_replica
-            {
+            let has_live_replica = version.record().replicas.read().has_live();
+            if committed_points_to(&slot, &version) && has_live_replica {
                 return Ok(ObjectRead {
-                    object: ObjectHandle { node },
+                    object: ObjectHandle { version },
                     lease_expires_at,
                 });
             }
+            if committed_points_to(&slot, &version) {
+                return Err(LookupError::NotFound);
+            }
         }
-        Err(LookupError::NotFound)
     }
 
     pub fn get_batch_into<'a, I>(
@@ -52,32 +54,43 @@ impl ObjectCatalog {
 
 impl ObjectHandle {
     pub fn identity(&self) -> &ObjectIdentity {
-        &self.node.record().identity
+        &self.version.record().identity
+    }
+
+    pub fn version_id(&self) -> VersionId {
+        self.version.id()
     }
 
     pub fn content(&self) -> ObjectContent {
-        self.node.record().content
+        self.version.record().content
     }
 
     pub fn commit(&self) -> ObjectCommit {
-        self.node
-            .mutation
-            .commit()
-            .expect("published objects always have commit metadata")
+        self.version.commit()
     }
 
     pub fn replicas(&self) -> LiveReplicaView<'_> {
-        LiveReplicaView::new(self.node.record().replicas.read())
+        LiveReplicaView::new(self.version.record().replicas.read())
     }
 
-    /// Whether at least one replica still belongs to its original live segment
-    /// incarnation.
     pub fn is_live(&self) -> bool {
-        self.node.record().replicas.read().has_live()
+        self.version.record().replicas.read().has_live()
     }
 
     pub fn owner(&self) -> WriteOwner {
-        self.node.owner()
+        self.version.owner
+    }
+
+    pub fn is_hard_pinned(&self) -> bool {
+        self.version.access().hard_pinned()
+    }
+
+    pub fn soft_pin_expires_at(&self) -> Option<CatalogTick> {
+        self.version.access().soft_pin_until()
+    }
+
+    pub fn is_soft_pinned(&self, now: CatalogTick) -> bool {
+        self.version.access().is_soft_pinned(now)
     }
 }
 
@@ -85,6 +98,7 @@ impl fmt::Debug for ObjectHandle {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("ObjectHandle")
+            .field("version_id", &self.version_id())
             .field("identity", &self.identity())
             .field("content", &self.content())
             .field("commit", &self.commit())

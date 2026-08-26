@@ -24,12 +24,30 @@ pub enum ObjectCatalogConfigError {
     ZeroPendingTimeout,
     #[error("`max_retired_bytes` must be greater than zero")]
     ZeroMaxRetiredBytes,
+    #[error(
+        "default soft-pin TTL ({default_soft_pin_ttl_ticks}) must not exceed the maximum ({max_soft_pin_ttl_ticks})"
+    )]
+    DefaultSoftPinTtlExceedsMaximum {
+        default_soft_pin_ttl_ticks: u64,
+        max_soft_pin_ttl_ticks: u64,
+    },
+    #[error("soft-pin TTL is only valid with the enable action")]
+    SoftPinTtlRequiresEnable,
+    #[error(
+        "soft-pin TTL ({soft_pin_ttl_ticks}) exceeds the configured maximum ({max_soft_pin_ttl_ticks})"
+    )]
+    SoftPinTtlExceedsMaximum {
+        soft_pin_ttl_ticks: u64,
+        max_soft_pin_ttl_ticks: u64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum PutError {
+pub enum BeginError {
     #[error("object key must not be empty")]
     EmptyKey,
+    #[error("object pin request is invalid: {0}")]
+    InvalidPinRequest(ObjectCatalogConfigError),
     #[error("object already exists")]
     AlreadyExists,
     #[error("an object write is already in progress")]
@@ -64,13 +82,13 @@ pub enum StageError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum PublishError {
-    #[error("put ticket belongs to another object catalog")]
+pub enum CommitError {
+    #[error("write transaction belongs to another object catalog")]
     ForeignCatalog,
-    #[error("object write no longer exists")]
-    ObjectGone,
-    #[error("object is not pending publication")]
-    NotPending,
+    #[error("object write transaction no longer exists")]
+    TransactionGone,
+    #[error("object write transaction is not staged")]
+    NotStaged,
     #[error("object commit metadata conflicts with the pending publication")]
     CommitConflict,
     #[error("one or more object replicas belong to an invalidated segment")]
@@ -78,13 +96,13 @@ pub enum PublishError {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum RevokeError {
-    #[error("put ticket belongs to another object catalog")]
+pub enum AbortError {
+    #[error("write transaction belongs to another object catalog")]
     ForeignCatalog,
-    #[error("object write no longer exists")]
-    ObjectGone,
-    #[error("object has already been published")]
-    AlreadyPublished,
+    #[error("object write transaction no longer exists")]
+    TransactionGone,
+    #[error("object write transaction has already committed")]
+    AlreadyCommitted,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -103,6 +121,8 @@ pub enum RemoveError {
     NotReady,
     #[error("object is leased until catalog tick {}", .expires_at.get())]
     Leased { expires_at: CatalogTick },
+    #[error("object is hard-pinned")]
+    HardPinned,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -113,6 +133,8 @@ pub enum ObjectRemoveError {
     NotReady,
     #[error("object is leased until catalog tick {}", .expires_at.get())]
     Leased { expires_at: CatalogTick },
+    #[error("object is hard-pinned")]
+    HardPinned,
 }
 
 impl From<RemoveError> for ObjectRemoveError {
@@ -121,6 +143,7 @@ impl From<RemoveError> for ObjectRemoveError {
             RemoveError::NotFound => Self::NotFound,
             RemoveError::NotReady => Self::NotReady,
             RemoveError::Leased { expires_at } => Self::Leased { expires_at },
+            RemoveError::HardPinned => Self::HardPinned,
         }
     }
 }
@@ -148,12 +171,12 @@ pub enum ObjectManagerError {
     Internal,
 }
 
-impl From<PutError> for ObjectManagerError {
-    fn from(error: PutError) -> Self {
+impl From<BeginError> for ObjectManagerError {
+    fn from(error: BeginError) -> Self {
         match error {
-            PutError::EmptyKey => Self::InvalidPlan,
-            PutError::AlreadyExists | PutError::WriteInProgress => Self::AlreadyExists,
-            PutError::ReclamationBacklog => Self::NoAvailableReplicas,
+            BeginError::EmptyKey | BeginError::InvalidPinRequest(_) => Self::InvalidPlan,
+            BeginError::AlreadyExists | BeginError::WriteInProgress => Self::AlreadyExists,
+            BeginError::ReclamationBacklog => Self::NoAvailableReplicas,
         }
     }
 }

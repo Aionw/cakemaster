@@ -127,14 +127,15 @@ async fn run_server(address: &str, arguments: Arguments) -> Result<(), Box<dyn E
         && catalog.reclaim_debt == 0
         && catalog.retired_bytes == 0;
     println!(
-        "object_catalog_rpc_server_final published_objects={} pending_bytes={} live_bytes={} retired_bytes={} reclaim_debt={} requested_reclaim_debt={} watermark_reclaim_debt={} capacity_bytes={} used_bytes={} used_ratio={:.6} high_watermark_bytes={} low_watermark_bytes={} maximum_used_bytes={} maximum_used_ratio={:.6} watermark_triggered={} settled_to_low={} trigger_events={} controller_steps={} busy_steps={} controller_retired_objects={} controller_retired_bytes={} controller_reclaimed_objects={} controller_reclaimed_bytes={} allocation_failures={} allocation_retries={} allocation_retry_successes={} wakeups={}",
+        "object_catalog_rpc_server_final published_objects={} pending_bytes={} live_bytes={} retired_bytes={} reclaim_debt={} requested_reclaim_debt={} allocation_reclaim_debt={} watermark_reclaim_debt={} capacity_bytes={} used_bytes={} used_ratio={:.6} high_watermark_bytes={} low_watermark_bytes={} maximum_used_bytes={} maximum_used_ratio={:.6} watermark_triggered={} settled_to_low={} trigger_events={} controller_steps={} busy_steps={} controller_retired_objects={} controller_retired_bytes={} controller_reclaimed_objects={} controller_reclaimed_bytes={} allocation_failures={} allocation_retries={} allocation_retry_successes={} wakeups={}",
         catalog.published_objects,
         catalog.pending_bytes,
         catalog.live_bytes,
         catalog.retired_bytes,
         catalog.reclaim_debt,
-        catalog.requested_reclaim_debt,
-        catalog.watermark_reclaim_debt,
+        eviction.requested_reclaim_debt_bytes,
+        eviction.allocation_reclaim_debt_bytes,
+        eviction.watermark_reclaim_debt_bytes,
         space.capacity_bytes,
         space.used_bytes,
         final_used_ratio,

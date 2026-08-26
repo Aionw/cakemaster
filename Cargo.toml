@@ -30,6 +30,7 @@ crossbeam-queue = "0.3"
 futures-util = "0.3"
 log.workspace = true
 logforth = { version = "0.30", features = ["append-async", "append-file", "bridge-log", "filter-rustlog", "layout-text"] }
+mimalloc = "0.1.52"
 offset-allocator = "0.2"
 parking_lot = "0.12"
 regex = "1"

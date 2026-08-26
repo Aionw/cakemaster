@@ -74,9 +74,7 @@ use cakemaster::segment::placement::{PlacementRequest, ReplicaAllocator};
 
 ```bash
 cargo run --release -- \
-  --listen 127.0.0.1:50051 \
-  --eviction-high-watermark 0.90 \
-  --eviction-low-watermark 0.80
+  --listen 127.0.0.1:50051
 ```
 
 不传参数时默认监听 `127.0.0.1:50051`；也可传 `--listen 127.0.0.1:0` 让系统选择
@@ -86,7 +84,7 @@ cargo run --release -- \
 root 中只构建一次 `SegmentPool`、内存态
 `ObjectManager`、`MasterClock` 和 `ObjectCatalogRpcService`，并从 service 派生共享
 `ClientManager`、clock、deadline `Notify` 和 memory-pressure `Notify` 的
-`MasterReconciler`。production manager 默认用 90%/80% 高低水位驱动有界 Memory eviction；
+`MasterReconciler`。production manager 使用内部固定的 90%/80% 高低水位驱动有界 Memory eviction；
 水位、物理容量/used、live/retired/debt accounting、allocation-failure 有限重试与诊断详见
 [`docs/memory_eviction.md`](docs/memory_eviction.md)。RPC server 与 reconciler
 并发运行；Unix 上 Ctrl-C/SIGTERM、其他平台上 Ctrl-C 会通知两者停止，进程等待监听器、
@@ -322,7 +320,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 `ExistKey`、`GetReplicaList` 以及 `BatchExistKey`、`BatchGetReplicaList`、
 `BatchPutStart`、`BatchPutEnd`、`BatchPutRevoke`、六个 Upsert 路由和四个 Remove 路由接到
 真实 `ObjectManager`。RPC 层只负责 wire 校验、plan 转换和错误码映射；同步、线程安全的
-ObjectManager 负责 owner、pending/published/upsert 生命周期、lease 和 reservation 协调。
+ObjectManager 负责 owner、per-key transaction/committed version、lease、soft/hard pin 和 reservation 协调。
 
 client bootstrap 路由也已对齐固定的 Mooncake `5c0724d` 基线：`ServiceReady` 返回其
 严格版本校验所需的 `2.0.0`，`GetStorageConfig` 返回 `fsdir=""`、
@@ -337,7 +335,8 @@ RPC server 和 `MasterReconciler` 的统一 shutdown/join。workspace 的主 bin
 
 当前明确不支持 checksum：PutEnd 携带 checksum 返回 `INVALID_PARAMS`，Get/BatchGet
 固定返回 `None`。Memory-only replica 使用与 C++ 一致的 best-effort 语义，NoF-only
-使用 all-or-nothing；混合 Memory+NoF、group、pin 和 Disk 仍需领域模型支持，不在 RPC
+使用 all-or-nothing；`ReplicateConfig` 的 soft-pin action/TTL 和 hard pin 已接入事务、
+淘汰与强制删除生命周期。混合 Memory+NoF、group 和 Disk 仍需领域模型支持，不在 RPC
 handler 中静默降级。multi-tenant 构造会解析 tenant、隔离 namespace 并执行
 Memory/NoF quota admission。
 

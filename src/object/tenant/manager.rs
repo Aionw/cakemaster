@@ -1,3 +1,4 @@
+use super::super::MemoryEvictionConfig;
 use super::super::catalog::{ObjectCatalog, ObjectRead};
 use super::super::config::ObjectCatalogConfig;
 use super::super::diagnostics::ObjectCatalogStats;
@@ -6,11 +7,11 @@ use super::super::error::{
 };
 use super::super::identity::{ObjectIdentity, ObjectLookup};
 use super::super::manager::{
-    ObjectManager, ObjectManagerMaintenance, ObjectPutPlan, PendingWriteRevoker, PreparedUpsert,
-    ReplicaSelector, StartedPut,
+    ObjectManager, ObjectManagerMaintenance, ObjectPutPlan, PendingWriteRevoker, ReplicaSelector,
+    StartedPut,
 };
 use super::super::reclamation::{CatalogTick, CollectBudget};
-use super::super::write::{WriteAdmission, WriteOwner};
+use super::super::write::{WriteAdmission, WriteMode, WriteOwner};
 use super::quota::{QuotaReservationGuard, admission_charge};
 use super::registry::{ResolvedTenant, TenantRegistry};
 use super::{
@@ -112,6 +113,25 @@ impl TenantObjectManager {
         tenant_config: TenantConfig,
     ) -> Result<Self, TenantObjectManagerCreateError> {
         let object = ObjectManager::with_config(pool.clone(), object_config)?;
+        Self::from_object_manager(pool, tenant_config, object)
+    }
+
+    pub fn with_eviction_config(
+        pool: Arc<SegmentPool>,
+        object_config: ObjectCatalogConfig,
+        tenant_config: TenantConfig,
+        eviction_config: MemoryEvictionConfig,
+    ) -> Result<Self, TenantObjectManagerCreateError> {
+        let object =
+            ObjectManager::with_eviction_config(pool.clone(), object_config, eviction_config)?;
+        Self::from_object_manager(pool, tenant_config, object)
+    }
+
+    fn from_object_manager(
+        pool: Arc<SegmentPool>,
+        tenant_config: TenantConfig,
+        object: ObjectManager,
+    ) -> Result<Self, TenantObjectManagerCreateError> {
         let catalog = TenantCatalog {
             inner: object.catalog().clone(),
         };
@@ -154,17 +174,7 @@ impl TenantObjectManager {
         plan: ObjectPutPlan,
         now: CatalogTick,
     ) -> Result<StartedPut, TenantObjectError> {
-        // The reservation's post-CAS version check is the linearization
-        // point for multi-tenant admission, so only validate the immutable
-        // opaque handle's manager binding here.
-        self.registry.validate_binding(tenant)?;
-        let identity = ObjectIdentity::new(tenant.namespace, key);
-        let Some(entry) = &tenant.entry else {
-            return Ok(self.object.start_put(identity, admission, plan, now)?);
-        };
-        let (class, charge_bytes) = admission_charge(&plan)?;
-        let reservation = entry.reserve(class, charge_bytes, tenant.version)?;
-        self.start_put_accounted(identity, admission, plan, now, reservation)
+        self.start_write(tenant, key, admission, plan, now, WriteMode::Insert)
     }
 
     pub fn start_upsert(
@@ -175,22 +185,32 @@ impl TenantObjectManager {
         plan: ObjectPutPlan,
         now: CatalogTick,
     ) -> Result<StartedPut, TenantObjectError> {
+        self.start_write(tenant, key, admission, plan, now, WriteMode::Upsert)
+    }
+
+    fn start_write(
+        &self,
+        tenant: &ResolvedTenant,
+        key: impl Into<Arc<str>>,
+        admission: WriteAdmission,
+        plan: ObjectPutPlan,
+        now: CatalogTick,
+        mode: WriteMode,
+    ) -> Result<StartedPut, TenantObjectError> {
+        // The reservation's post-CAS version check is the linearization
+        // point for multi-tenant admission, so only validate the immutable
+        // opaque handle's manager binding here.
         self.registry.validate_binding(tenant)?;
         let identity = ObjectIdentity::new(tenant.namespace, key);
-        let class = admission_charge(&plan)?.0;
-        match self.object.prepare_upsert(identity, admission, plan, now)? {
-            PreparedUpsert::Reused(started) => Ok(started),
-            PreparedUpsert::Write(prepared) => {
-                let Some(entry) = &tenant.entry else {
-                    return Ok(self.object.finalize_start_put(prepared, None)?);
-                };
-                let reservation =
-                    entry.reserve(class, prepared.actual_charge_bytes()?, tenant.version)?;
-                Ok(self
-                    .object
-                    .finalize_start_put(prepared, Some(reservation))?)
-            }
-        }
+        let Some(entry) = &tenant.entry else {
+            return Ok(match mode {
+                WriteMode::Insert => self.object.start_put(identity, admission, plan, now)?,
+                WriteMode::Upsert => self.object.start_upsert(identity, admission, plan, now)?,
+            });
+        };
+        let (class, charge_bytes) = admission_charge(&plan)?;
+        let reservation = entry.reserve(class, charge_bytes, tenant.version)?;
+        self.start_write_accounted(identity, admission, plan, now, mode, reservation)
     }
 
     pub fn start_upsert_batch(
@@ -200,24 +220,23 @@ impl TenantObjectManager {
         requests: Vec<TenantPutRequest>,
         now: CatalogTick,
     ) -> Vec<Result<StartedPut, TenantObjectError>> {
-        requests
-            .into_iter()
-            .map(|request| {
-                self.start_upsert(tenant, request.key, admission.clone(), request.plan, now)
-            })
-            .collect()
+        self.start_write_batch(tenant, admission, requests, now, WriteMode::Upsert)
     }
 
     #[inline]
-    fn start_put_accounted(
+    fn start_write_accounted(
         &self,
         identity: ObjectIdentity,
         admission: WriteAdmission,
         plan: ObjectPutPlan,
         now: CatalogTick,
+        mode: WriteMode,
         mut reservation: QuotaReservationGuard,
     ) -> Result<StartedPut, TenantObjectError> {
-        let prepared = self.object.prepare_put(identity, admission, plan, now)?;
+        let prepared = match mode {
+            WriteMode::Insert => self.object.prepare_put(identity, admission, plan, now)?,
+            WriteMode::Upsert => self.object.prepare_upsert(identity, admission, plan, now)?,
+        };
         reservation.resize(prepared.actual_charge_bytes()?)?;
         Ok(self
             .object
@@ -234,12 +253,24 @@ impl TenantObjectManager {
         requests: Vec<TenantPutRequest>,
         now: CatalogTick,
     ) -> Vec<Result<StartedPut, TenantObjectError>> {
+        self.start_write_batch(tenant, admission, requests, now, WriteMode::Insert)
+    }
+
+    fn start_write_batch(
+        &self,
+        tenant: &ResolvedTenant,
+        admission: WriteAdmission,
+        requests: Vec<TenantPutRequest>,
+        now: CatalogTick,
+        mode: WriteMode,
+    ) -> Vec<Result<StartedPut, TenantObjectError>> {
         if requests.len() == 1 {
             let request = requests
                 .into_iter()
                 .next()
                 .expect("a one-item batch contains one request");
-            return vec![self.start_put(tenant, request.key, admission, request.plan, now)];
+            let result = self.start_write(tenant, request.key, admission, request.plan, now, mode);
+            return vec![result];
         }
         if let Err(error) = self.registry.validate(tenant) {
             return requests.into_iter().map(|_| Err(error)).collect();
@@ -248,12 +279,19 @@ impl TenantObjectManager {
             return requests
                 .into_iter()
                 .map(|request| -> Result<StartedPut, TenantObjectError> {
-                    Ok(self.object.start_put(
-                        ObjectIdentity::new(tenant.namespace, request.key),
-                        admission.clone(),
-                        request.plan,
-                        now,
-                    )?)
+                    let identity = ObjectIdentity::new(tenant.namespace, request.key);
+                    Ok(match mode {
+                        WriteMode::Insert => {
+                            self.object
+                                .start_put(identity, admission.clone(), request.plan, now)?
+                        }
+                        WriteMode::Upsert => self.object.start_upsert(
+                            identity,
+                            admission.clone(),
+                            request.plan,
+                            now,
+                        )?,
+                    })
                 })
                 .collect();
         };
@@ -297,11 +335,12 @@ impl TenantObjectManager {
                     return Err(error);
                 }
                 let reservation = QuotaReservationGuard::from_reserved(entry.clone(), class, bytes);
-                self.start_put_accounted(
+                self.start_write_accounted(
                     ObjectIdentity::new(tenant.namespace, request.key),
                     admission.clone(),
                     request.plan,
                     now,
+                    mode,
                     reservation,
                 )
             })
@@ -318,6 +357,24 @@ impl TenantObjectManager {
         self.registry.validate(tenant)?;
         self.object
             .finish_put_lookup(ObjectLookup::new(tenant.namespace, key), owner, selector)?;
+        Ok(())
+    }
+
+    pub fn finish_put_at(
+        &self,
+        tenant: &ResolvedTenant,
+        key: &str,
+        owner: WriteOwner,
+        selector: ReplicaSelector,
+        now: CatalogTick,
+    ) -> Result<(), TenantObjectError> {
+        self.registry.validate(tenant)?;
+        self.object.finish_put_lookup_at(
+            ObjectLookup::new(tenant.namespace, key),
+            owner,
+            selector,
+            now,
+        )?;
         Ok(())
     }
 
@@ -452,6 +509,23 @@ impl TenantObjectManager {
     {
         self.map_validated_keys(tenant, keys, |lookup| {
             self.object.finish_put_lookup(lookup, owner, selector)
+        })
+    }
+
+    pub fn finish_put_batch_at<'a, I>(
+        &self,
+        tenant: &ResolvedTenant,
+        keys: I,
+        owner: WriteOwner,
+        selector: ReplicaSelector,
+        now: CatalogTick,
+    ) -> Result<Vec<Result<(), ObjectManagerError>>, TenantObjectError>
+    where
+        I: IntoIterator<Item = &'a str>,
+    {
+        self.map_validated_keys(tenant, keys, |lookup| {
+            self.object
+                .finish_put_lookup_at(lookup, owner, selector, now)
         })
     }
 

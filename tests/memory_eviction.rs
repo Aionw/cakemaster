@@ -2,10 +2,12 @@ use cakemaster::object::error::ObjectManagerError;
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     MemoryEvictionConfig, MemoryEvictionConfigError, NamespaceId, ObjectCatalogConfig,
-    ObjectContent, ObjectIdentity, ObjectManager, ObjectPutPlan, ReplicaSelector, WriteAdmission,
-    WriteOwner,
+    ObjectContent, ObjectIdentity, ObjectManager, ObjectPinRequest, ObjectPutPlan, ReplicaSelector,
+    SoftPinAction, WriteAdmission, WriteOwner,
 };
-use cakemaster::segment::placement::{AllocationSpec, PlacementRequest, ReplicaPolicy};
+use cakemaster::segment::placement::{
+    AllocationSpec, FulfillmentPolicy, PlacementRequest, ReplicaPolicy,
+};
 use cakemaster::segment::{
     ClientId, CxlArenaId, CxlArenaSpec, MemoryRegion, ReplicaClass, SegmentId, SegmentIdentity,
     SegmentPool, SegmentSpec, TransportEndpoint, TransportProtocol,
@@ -63,6 +65,14 @@ fn nof_plan(bytes: u64) -> ObjectPutPlan {
         ObjectContent::new(bytes),
         PlacementRequest::new(AllocationSpec::new(bytes), ReplicaPolicy::new(1))
             .for_replica_class(ReplicaClass::Nof),
+    )
+}
+
+fn best_effort_plan(bytes: u64, replicas: usize) -> ObjectPutPlan {
+    ObjectPutPlan::new(
+        ObjectContent::new(bytes),
+        PlacementRequest::new(AllocationSpec::new(bytes), ReplicaPolicy::new(replicas))
+            .with_fulfillment(FulfillmentPolicy::BestEffort),
     )
 }
 
@@ -173,7 +183,7 @@ fn active_cycle_runs_in_bounded_steps_until_physical_usage_reaches_low() {
     let final_stats = manager.memory_eviction_stats().unwrap();
     assert!(!final_stats.active);
     assert_eq!(final_stats.used_bytes, 5 * BYTES);
-    assert_eq!(manager.catalog().stats().watermark_reclaim_debt, 0);
+    assert_eq!(final_stats.watermark_reclaim_debt_bytes, 0);
     assert_eq!(manager.catalog().stats().published_objects, 5);
 }
 
@@ -213,6 +223,109 @@ fn retired_pin_remains_used_and_covers_inflight_debt_without_duplicate_eviction(
 }
 
 #[test]
+fn mvcc_upsert_keeps_the_committed_replacement_while_an_old_reader_delays_reclaim() {
+    let eviction = MemoryEvictionConfig::new(0.75, 0.50).unwrap();
+    let manager = manager(2 * BYTES, eviction);
+    let object = identity(0);
+    publish(&manager, 0, CatalogTick::ZERO);
+    let old_reader = manager.get(object.as_lookup(), CatalogTick::ZERO).unwrap();
+
+    manager
+        .start_upsert(
+            object.clone(),
+            WriteAdmission::unmanaged(OWNER),
+            plan(BYTES),
+            CatalogTick::new(1),
+        )
+        .unwrap();
+    manager
+        .finish_put_at(
+            &object,
+            WriteOwner::new(OWNER),
+            ReplicaSelector::All,
+            CatalogTick::new(1),
+        )
+        .unwrap();
+
+    let blocked = manager.maintenance(CatalogTick::new(2), CollectBudget::new(8, 8, 0));
+    assert_eq!(blocked.catalog.retired_objects, 0);
+    assert_eq!(blocked.catalog.reclaimed_objects, 0);
+    let blocked_stats = blocked.memory_eviction.unwrap();
+    assert!(blocked_stats.active);
+    assert_eq!(blocked_stats.used_bytes, 2 * BYTES);
+    assert_eq!(blocked_stats.live_bytes, BYTES);
+    assert_eq!(blocked_stats.retired_bytes, BYTES);
+    assert_eq!(manager.catalog().stats().published_objects, 1);
+    assert!(manager.exists(object.as_lookup(), CatalogTick::new(2)));
+
+    drop(old_reader);
+    let released = manager.maintenance(CatalogTick::new(3), CollectBudget::new(8, 8, 0));
+    assert_eq!(released.catalog.reclaimed_objects, 1);
+    let released_stats = released.memory_eviction.unwrap();
+    assert!(!released_stats.active);
+    assert_eq!(released_stats.used_bytes, BYTES);
+    assert_eq!(released_stats.retired_bytes, 0);
+    assert_eq!(manager.catalog().stats().reclaim_debt, 0);
+    assert!(manager.exists(object.as_lookup(), CatalogTick::new(3)));
+}
+
+#[test]
+fn allocation_failure_retry_reclaims_around_an_active_mvcc_upsert() {
+    let eviction = MemoryEvictionConfig::new(0.90, 0.60)
+        .unwrap()
+        .with_allocation_failure_policy(CollectBudget::new(2, 1, 0), 1)
+        .unwrap();
+    let manager = manager(2 * BYTES, eviction);
+    let protected = identity(0);
+    manager
+        .start_put(
+            protected.clone(),
+            WriteAdmission::unmanaged(OWNER),
+            plan(BYTES).with_pins(ObjectPinRequest::new(SoftPinAction::Preserve, None, true)),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    manager
+        .finish_put(&protected, WriteOwner::new(OWNER), ReplicaSelector::All)
+        .unwrap();
+    publish(&manager, 1, CatalogTick::ZERO);
+
+    manager
+        .start_upsert(
+            protected.clone(),
+            WriteAdmission::unmanaged(OWNER),
+            plan(BYTES),
+            CatalogTick::new(2),
+        )
+        .unwrap();
+
+    let old_reader = manager
+        .get(protected.as_lookup(), CatalogTick::new(2))
+        .unwrap();
+    assert!(old_reader.object().is_hard_pinned());
+    assert!(!manager.exists(identity(1).as_lookup(), CatalogTick::new(2)));
+    let retry_stats = manager.memory_eviction_stats().unwrap();
+    assert_eq!(retry_stats.allocation_failures, 1);
+    assert_eq!(retry_stats.allocation_retries, 1);
+    assert_eq!(retry_stats.allocation_retry_successes, 1);
+    assert_eq!(retry_stats.reclaimed_objects, 1);
+
+    manager
+        .finish_put_at(
+            &protected,
+            WriteOwner::new(OWNER),
+            ReplicaSelector::All,
+            CatalogTick::new(2),
+        )
+        .unwrap();
+    let replacement = manager
+        .get(protected.as_lookup(), CatalogTick::new(2))
+        .unwrap();
+    assert!(replacement.object().is_hard_pinned());
+    drop(old_reader);
+}
+
+#[test]
 fn capacity_growth_cancels_stale_watermark_debt_before_retiring_objects() {
     let eviction = MemoryEvictionConfig::new(0.70, 0.50).unwrap();
     let manager = manager(8 * BYTES, eviction);
@@ -220,16 +333,17 @@ fn capacity_growth_cancels_stale_watermark_debt_before_retiring_objects() {
         publish(&manager, index, CatalogTick::ZERO);
     }
     let armed = manager.maintenance(CatalogTick::new(2), CollectBudget::new(0, 0, 0));
-    assert!(armed.memory_eviction.unwrap().active);
-    assert_eq!(manager.catalog().stats().watermark_reclaim_debt, 2 * BYTES);
+    let armed_stats = armed.memory_eviction.unwrap();
+    assert!(armed_stats.active);
+    assert_eq!(armed_stats.watermark_reclaim_debt_bytes, 2 * BYTES);
 
     manager.pool().attach(segment(2, 8 * BYTES)).unwrap();
     let grown = manager.maintenance(CatalogTick::new(3), CollectBudget::new(32, 32, 0));
     assert_eq!(grown.catalog.retired_objects, 0);
     assert_eq!(manager.catalog().stats().published_objects, 6);
-    assert_eq!(manager.catalog().stats().watermark_reclaim_debt, 0);
     let stats = manager.memory_eviction_stats().unwrap();
     assert!(!stats.active);
+    assert_eq!(stats.watermark_reclaim_debt_bytes, 0);
     assert_eq!(stats.capacity_bytes, 16 * BYTES);
     assert_eq!(stats.used_bytes, 6 * BYTES);
 }
@@ -258,9 +372,85 @@ fn allocation_failure_runs_one_bounded_collection_and_retries_after_progress() {
     assert_eq!(stats.allocation_failures, 1);
     assert_eq!(stats.allocation_retries, 1);
     assert_eq!(stats.allocation_retry_successes, 1);
+    assert_eq!(stats.allocation_reclaim_debt_bytes, 0);
     assert_eq!(stats.reclaimed_objects, 1);
     assert_eq!(manager.catalog().stats().pending_objects, 1);
     assert_eq!(manager.catalog().stats().published_objects, 2);
+}
+
+#[test]
+fn best_effort_failure_requests_only_one_replica_of_reclaim() {
+    let eviction = MemoryEvictionConfig::new(0.90, 0.60)
+        .unwrap()
+        .with_allocation_failure_policy(CollectBudget::new(4, 4, 0), 0)
+        .unwrap();
+    let manager = manager(BYTES, eviction);
+    let existing = identity(0);
+    manager
+        .start_put(
+            existing.clone(),
+            WriteAdmission::unmanaged(OWNER),
+            plan(BYTES).with_pins(ObjectPinRequest::new(SoftPinAction::Preserve, None, true)),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    manager
+        .finish_put(&existing, WriteOwner::new(OWNER), ReplicaSelector::All)
+        .unwrap();
+
+    assert_eq!(
+        manager.start_put(
+            identity(1),
+            WriteAdmission::unmanaged(OWNER),
+            best_effort_plan(BYTES, 3),
+            CatalogTick::new(1),
+        ),
+        Err(ObjectManagerError::NoAvailableReplicas)
+    );
+    let stats = manager.memory_eviction_stats().unwrap();
+    assert_eq!(stats.allocation_reclaim_debt_bytes, BYTES);
+}
+
+#[test]
+fn memory_watermark_never_retires_nof_objects() {
+    let pool = Arc::new(SegmentPool::new());
+    pool.attach(segment(1, 2 * BYTES)).unwrap();
+    pool.attach(SegmentSpec::nof(
+        SegmentIdentity::new(SegmentId::new(211, 1), OWNER, "watermark-nof"),
+        MemoryRegion::new(0, BYTES),
+        "nvme://127.0.0.1/watermark",
+    ))
+    .unwrap();
+    let manager = ObjectManager::with_eviction_config(
+        pool,
+        ObjectCatalogConfig::new(32).with_lease(1, 0),
+        MemoryEvictionConfig::new(0.75, 0.50).unwrap(),
+    )
+    .unwrap();
+    let nof = identity(10);
+    manager
+        .start_put(
+            nof.clone(),
+            WriteAdmission::unmanaged(OWNER),
+            nof_plan(BYTES),
+            CatalogTick::ZERO,
+        )
+        .unwrap();
+    manager
+        .finish_put(&nof, WriteOwner::new(OWNER), ReplicaSelector::All)
+        .unwrap();
+    publish(&manager, 11, CatalogTick::ZERO);
+    publish(&manager, 12, CatalogTick::ZERO);
+
+    manager.maintenance(CatalogTick::new(2), CollectBudget::new(16, 16, 0));
+    manager.maintenance(CatalogTick::new(3), CollectBudget::new(16, 16, 0));
+
+    assert!(manager.exists(nof.as_lookup(), CatalogTick::new(3)));
+    assert_eq!(
+        manager.pool().space_for(ReplicaClass::Nof).used_bytes,
+        BYTES
+    );
+    assert!(manager.pool().space_for(ReplicaClass::Memory).used_bytes <= BYTES);
 }
 
 #[test]
@@ -411,8 +601,8 @@ fn concurrent_allocators_and_bounded_collection_converge_without_debt_oscillatio
 
     for tick in 300..600 {
         let stats = manager.catalog().stats();
-        let usage = manager.pool().space_for(ReplicaClass::Memory);
-        if stats.reclaim_debt == 0 && stats.retired_bytes == 0 && usage.used_bytes <= 32 * BYTES {
+        let pressure = manager.memory_eviction_stats().unwrap();
+        if stats.reclaim_debt == 0 && stats.retired_bytes == 0 && !pressure.active {
             break;
         }
         let _ = manager.maintenance(CatalogTick::new(tick), CollectBudget::new(16, 16, 0));
@@ -426,6 +616,8 @@ fn concurrent_allocators_and_bounded_collection_converge_without_debt_oscillatio
     assert_eq!(catalog.pending_objects, 0);
     assert_eq!(catalog.retired_bytes, 0);
     assert_eq!(catalog.reclaim_debt, 0);
-    assert!(usage.used_bytes <= eviction.low_watermark_bytes);
+    assert_eq!(eviction.reclaim_debt_bytes, 0);
+    assert!(!eviction.active);
+    assert!(usage.used_bytes <= eviction.high_watermark_bytes);
     assert_eq!(usage.used_bytes, catalog.live_bytes);
 }

@@ -225,16 +225,25 @@ impl MasterReconciler {
                 biased;
                 _ = &mut shutdown => break,
                 _ = interval.tick() => {
-                    self.reconcile_and_log();
+                    self.reconcile_and_reschedule().await;
                 },
-                _ = &mut deadline_wait => self.reconcile_and_log(),
-                _ = &mut eviction_notified => self.reconcile_and_log(),
-                _ = &mut notified => {},
+                _ = &mut deadline_wait => self.reconcile_and_reschedule().await,
+                _ = &mut eviction_notified => self.reconcile_and_reschedule().await,
+                _ = &mut notified => self.reconcile_and_reschedule().await,
             }
         }
     }
 
-    fn reconcile_and_log(&self) {
+    async fn reconcile_and_reschedule(&self) {
+        if self.reconcile_and_log() {
+            tokio::task::yield_now().await;
+            if let Some(notify) = &self.memory_eviction_notify {
+                notify.notify_one();
+            }
+        }
+    }
+
+    fn reconcile_and_log(&self) -> bool {
         let report = self.reconcile_once();
         if let Err(error) = &report.client_cleanup {
             log::error!(
@@ -254,6 +263,7 @@ impl MasterReconciler {
             || report.graceful_unmount.stale_or_cancelled != 0
             || report.graceful_unmount.retried != 0
             || report.object_collection.expired_writes != 0
+            || catalog.expired_soft_pins != 0
             || catalog.invalidated_pending != 0
             || catalog.invalidated_published != 0
             || catalog.pruned_objects != 0
@@ -269,6 +279,7 @@ impl MasterReconciler {
                 graceful_unmount_completed = report.graceful_unmount.completed,
                 graceful_unmount_retried = report.graceful_unmount.retried,
                 expired_writes = report.object_collection.expired_writes,
+                expired_soft_pins = catalog.expired_soft_pins,
                 invalidated_pending = catalog.invalidated_pending,
                 invalidated_published = catalog.invalidated_published,
                 pruned_objects = catalog.pruned_objects,
@@ -291,6 +302,7 @@ impl MasterReconciler {
                     retired_bytes = stats.retired_bytes,
                     reclaim_debt_bytes = stats.reclaim_debt_bytes,
                     requested_reclaim_debt_bytes = stats.requested_reclaim_debt_bytes,
+                    allocation_reclaim_debt_bytes = stats.allocation_reclaim_debt_bytes,
                     watermark_reclaim_debt_bytes = stats.watermark_reclaim_debt_bytes,
                     trigger_events = stats.trigger_events,
                     allocation_failures = stats.allocation_failures;
@@ -298,5 +310,8 @@ impl MasterReconciler {
                 );
             }
         }
+        memory_eviction.is_some_and(|stats| stats.active)
+            && !catalog.busy
+            && (catalog.reclaimed_objects != 0 || catalog.pruned_objects != 0)
     }
 }

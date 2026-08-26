@@ -344,20 +344,31 @@ async fn generated_mooncake_rpc_drives_the_real_object_manager() {
             .unwrap(),
         vec![Err(ErrorCode::InvalidParams)]
     );
-    let mut unsupported = config(1, 0);
-    unsupported.soft_pin_action = SoftPinAction::Enable;
+    let mut pinned = config(1, 0);
+    pinned.soft_pin_action = SoftPinAction::Enable;
+    pinned.soft_pin_ttl_ms = Some(1_000);
+    let pinned_start = client
+        .batch_put_start(
+            writer.clone(),
+            vec!["pinned".to_owned()],
+            vec![4096],
+            pinned,
+            "ignored".to_owned(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(pinned_start[0].as_ref().unwrap().len(), 1);
     assert_eq!(
         client
-            .batch_put_start(
+            .batch_put_revoke(
                 writer.clone(),
                 vec!["pinned".to_owned()],
-                vec![4096],
-                unsupported,
+                ReplicaType::Memory,
                 "ignored".to_owned(),
             )
             .await
             .unwrap(),
-        vec![Err(ErrorCode::InvalidParams)]
+        vec![Ok(())]
     );
     assert_eq!(
         client
@@ -443,7 +454,7 @@ async fn upsert_and_remove_routes_drive_transactional_catalog_semantics() {
         .unwrap()
         .unwrap();
 
-    let reused = client
+    let replacement = client
         .upsert_start(
             writer.clone(),
             "upsert-key".to_owned(),
@@ -454,16 +465,26 @@ async fn upsert_and_remove_routes_drive_transactional_catalog_semantics() {
         .await
         .unwrap()
         .unwrap();
-    let DescriptorVariant::Memory(reused) = &reused[0].descriptor_variant else {
+    let DescriptorVariant::Memory(replacement) = &replacement[0].descriptor_variant else {
         panic!("expected memory descriptor");
     };
-    assert_eq!(reused.buffer_descriptor.buffer_address, original_address);
+    assert_ne!(
+        replacement.buffer_descriptor.buffer_address,
+        original_address
+    );
+    let visible_during_upsert = client
+        .get_replica_list("upsert-key".to_owned(), "ignored".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    let DescriptorVariant::Memory(visible_during_upsert) =
+        &visible_during_upsert.replicas[0].descriptor_variant
+    else {
+        panic!("expected memory descriptor");
+    };
     assert_eq!(
-        client
-            .get_replica_list("upsert-key".to_owned(), "ignored".to_owned())
-            .await
-            .unwrap(),
-        Err(ErrorCode::ReplicaIsNotReady)
+        visible_during_upsert.buffer_descriptor.buffer_address,
+        original_address
     );
     client
         .upsert_revoke(
@@ -492,6 +513,63 @@ async fn upsert_and_remove_routes_drive_transactional_catalog_semantics() {
         .await
         .unwrap()
         .unwrap();
+
+    let mut pinned_config = config(1, 0);
+    pinned_config.soft_pin_action = SoftPinAction::Enable;
+    pinned_config.soft_pin_ttl_ms = Some(1_000);
+    pinned_config.with_hard_pin = true;
+    client
+        .upsert_start(
+            writer.clone(),
+            "hard-pinned".to_owned(),
+            1024,
+            pinned_config,
+            "ignored".to_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    client
+        .upsert_end(
+            writer.clone(),
+            ObjectMeta {
+                key: "hard-pinned".to_owned(),
+                object_checksum: None,
+            },
+            ReplicaType::All,
+            "ignored".to_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        client
+            .remove("hard-pinned".to_owned(), false, "ignored".to_owned())
+            .await
+            .unwrap(),
+        Err(ErrorCode::ObjectHasLease)
+    );
+    client
+        .remove("hard-pinned".to_owned(), true, "ignored".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut invalid_pin = config(1, 0);
+    invalid_pin.soft_pin_ttl_ms = Some(1);
+    assert_eq!(
+        client
+            .upsert_start(
+                writer.clone(),
+                "invalid-pin".to_owned(),
+                1024,
+                invalid_pin,
+                "ignored".to_owned(),
+            )
+            .await
+            .unwrap(),
+        Err(ErrorCode::InvalidParams)
+    );
 
     let keys = vec![
         "regex-a".to_owned(),
@@ -654,7 +732,7 @@ async fn multi_tenant_rpc_resolves_once_per_batch_and_maps_tenant_errors() {
             )
             .await
             .unwrap(),
-        vec![Err(ErrorCode::InvalidParams)]
+        vec![Err(ErrorCode::TenantNotRegistered)]
     );
     assert_eq!(
         service

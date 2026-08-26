@@ -134,6 +134,7 @@ pub struct MemoryEvictionStats {
     pub retired_bytes: u64,
     pub reclaim_debt_bytes: u64,
     pub requested_reclaim_debt_bytes: u64,
+    pub allocation_reclaim_debt_bytes: u64,
     pub watermark_reclaim_debt_bytes: u64,
     pub trigger_events: u64,
     pub controller_steps: u64,
@@ -156,7 +157,15 @@ pub(crate) struct MemoryEvictionController {
 struct MemoryEvictionInner {
     config: MemoryEvictionConfig,
     notify: Arc<Notify>,
-    state: Mutex<MemoryEvictionStats>,
+    state: Mutex<MemoryEvictionState>,
+}
+
+#[derive(Default)]
+struct MemoryEvictionState {
+    stats: MemoryEvictionStats,
+    watermark_active: bool,
+    allocation_reclaim_bytes: u64,
+    allocation_generation: u64,
 }
 
 impl MemoryEvictionController {
@@ -165,7 +174,7 @@ impl MemoryEvictionController {
             inner: Arc::new(MemoryEvictionInner {
                 config,
                 notify: Arc::new(Notify::new()),
-                state: Mutex::new(MemoryEvictionStats::default()),
+                state: Mutex::new(MemoryEvictionState::default()),
             }),
         }
     }
@@ -179,7 +188,7 @@ impl MemoryEvictionController {
     }
 
     pub(crate) fn stats(&self) -> MemoryEvictionStats {
-        *self.inner.state.lock()
+        self.inner.state.lock().stats
     }
 
     /// Samples physical usage and returns the absolute bytes still required to
@@ -194,18 +203,28 @@ impl MemoryEvictionController {
         let high_bytes = config.high_bytes(space.capacity_bytes);
         let low_bytes = config.low_bytes(space.capacity_bytes);
         let mut state = self.inner.state.lock();
-        if space.capacity_bytes == 0 || state.active && space.used_bytes <= low_bytes {
-            state.active = false;
-        } else if !state.active && space.used_bytes > high_bytes {
-            state.active = true;
-            state.trigger_events = state.trigger_events.saturating_add(1);
+        if space.capacity_bytes == 0 || state.watermark_active && space.used_bytes <= low_bytes {
+            state.watermark_active = false;
+        } else if !state.watermark_active && space.used_bytes > high_bytes {
+            state.watermark_active = true;
+            state.stats.trigger_events = state.stats.trigger_events.saturating_add(1);
         }
-        update_sample(&mut state, space, catalog, high_bytes, low_bytes);
-        if state.active {
+        let watermark_reclaim_bytes = if state.watermark_active {
             space.used_bytes.saturating_sub(low_bytes)
         } else {
             0
-        }
+        };
+        update_sample(
+            &mut state,
+            space,
+            catalog,
+            high_bytes,
+            low_bytes,
+            watermark_reclaim_bytes,
+        );
+        let watermark_retirement_bytes =
+            watermark_reclaim_bytes.saturating_sub(catalog.retired_memory_bytes);
+        watermark_retirement_bytes.max(state.allocation_reclaim_bytes)
     }
 
     pub(crate) fn finish_step(
@@ -217,83 +236,132 @@ impl MemoryEvictionController {
         let high_bytes = self.inner.config.high_bytes(space.capacity_bytes);
         let low_bytes = self.inner.config.low_bytes(space.capacity_bytes);
         let mut state = self.inner.state.lock();
+        state.allocation_reclaim_bytes = state
+            .allocation_reclaim_bytes
+            .saturating_sub(report.reclaimed_memory_bytes);
         if space.capacity_bytes == 0 || space.used_bytes <= low_bytes {
-            state.active = false;
+            state.watermark_active = false;
         }
-        state.controller_steps = state.controller_steps.saturating_add(1);
-        state.busy_steps = state.busy_steps.saturating_add(u64::from(report.busy));
-        state.retired_objects = state
+        let watermark_reclaim_bytes = if state.watermark_active {
+            space.used_bytes.saturating_sub(low_bytes)
+        } else {
+            0
+        };
+        state.stats.controller_steps = state.stats.controller_steps.saturating_add(1);
+        state.stats.retired_objects = state
+            .stats
             .retired_objects
             .saturating_add(report.retired_objects as u64);
-        state.retired_bytes_total = state
+        state.stats.retired_bytes_total = state
+            .stats
             .retired_bytes_total
             .saturating_add(report.retired_bytes);
-        state.reclaimed_objects = state
+        state.stats.reclaimed_objects = state
+            .stats
             .reclaimed_objects
             .saturating_add(report.reclaimed_objects as u64);
-        state.reclaimed_bytes_total = state
+        state.stats.reclaimed_bytes_total = state
+            .stats
             .reclaimed_bytes_total
             .saturating_add(report.reclaimed_bytes);
-        update_sample(&mut state, space, catalog, high_bytes, low_bytes);
-        state.active
+        update_sample(
+            &mut state,
+            space,
+            catalog,
+            high_bytes,
+            low_bytes,
+            watermark_reclaim_bytes,
+        );
+        state.stats.active
     }
 
-    pub(crate) fn record_allocation_failure(&self) {
+    pub(crate) fn record_busy_step(&self) {
         let mut state = self.inner.state.lock();
-        state.allocation_failures = state.allocation_failures.saturating_add(1);
-        state.wakeups = state.wakeups.saturating_add(1);
+        state.stats.controller_steps = state.stats.controller_steps.saturating_add(1);
+        state.stats.busy_steps = state.stats.busy_steps.saturating_add(1);
+    }
+
+    pub(crate) fn request_allocation_reclaim(&self, bytes: u64) -> u64 {
+        let mut state = self.inner.state.lock();
+        state.allocation_generation = state.allocation_generation.wrapping_add(1);
+        state.allocation_reclaim_bytes = state.allocation_reclaim_bytes.max(bytes);
+        state.stats.allocation_failures = state.stats.allocation_failures.saturating_add(1);
+        state.stats.wakeups = state.stats.wakeups.saturating_add(1);
+        let generation = state.allocation_generation;
+        let requested = state.stats.requested_reclaim_debt_bytes;
+        refresh_debt_stats(&mut state, requested, None);
         drop(state);
         self.inner.notify.notify_one();
+        generation
     }
 
-    pub(crate) fn refresh_catalog(&self, catalog: ObjectCatalogStats) {
+    pub(crate) fn clear_allocation_reclaim(&self, generation: u64) {
         let mut state = self.inner.state.lock();
-        state.pending_bytes = catalog.pending_bytes;
-        state.live_bytes = catalog.live_bytes;
-        state.retired_bytes = catalog.retired_bytes;
-        state.reclaim_debt_bytes = catalog.reclaim_debt;
-        state.requested_reclaim_debt_bytes = catalog.requested_reclaim_debt;
-        state.watermark_reclaim_debt_bytes = catalog.watermark_reclaim_debt;
+        if state.allocation_generation != generation {
+            return;
+        }
+        state.allocation_reclaim_bytes = 0;
+        let requested = state.stats.requested_reclaim_debt_bytes;
+        refresh_debt_stats(&mut state, requested, None);
     }
 
     pub(crate) fn record_allocation_retry(&self) {
         let mut state = self.inner.state.lock();
-        state.allocation_retries = state.allocation_retries.saturating_add(1);
+        state.stats.allocation_retries = state.stats.allocation_retries.saturating_add(1);
     }
 
     pub(crate) fn record_allocation_retry_success(&self) {
         let mut state = self.inner.state.lock();
-        state.allocation_retry_successes = state.allocation_retry_successes.saturating_add(1);
+        state.stats.allocation_retry_successes =
+            state.stats.allocation_retry_successes.saturating_add(1);
     }
 }
 
 fn update_sample(
-    state: &mut MemoryEvictionStats,
+    state: &mut MemoryEvictionState,
     space: ReplicaClassSpaceStats,
     catalog: ObjectCatalogStats,
     high_bytes: u64,
     low_bytes: u64,
+    watermark_reclaim_bytes: u64,
 ) {
-    state.capacity_bytes = space.capacity_bytes;
-    state.used_bytes = space.used_bytes;
-    state.maximum_used_bytes = state.maximum_used_bytes.max(space.used_bytes);
+    let stats = &mut state.stats;
+    stats.capacity_bytes = space.capacity_bytes;
+    stats.used_bytes = space.used_bytes;
+    stats.maximum_used_bytes = stats.maximum_used_bytes.max(space.used_bytes);
     if space.capacity_bytes != 0 {
         let used_ratio_ppm = u64::try_from(
             u128::from(space.used_bytes) * u128::from(WATERMARK_SCALE)
                 / u128::from(space.capacity_bytes),
         )
         .unwrap_or(u64::MAX);
-        state.maximum_used_ratio_ppm = state.maximum_used_ratio_ppm.max(used_ratio_ppm);
+        stats.maximum_used_ratio_ppm = stats.maximum_used_ratio_ppm.max(used_ratio_ppm);
     }
-    state.available_bytes = space.available_bytes;
-    state.high_watermark_bytes = high_bytes;
-    state.low_watermark_bytes = low_bytes;
-    state.pending_bytes = catalog.pending_bytes;
-    state.live_bytes = catalog.live_bytes;
-    state.retired_bytes = catalog.retired_bytes;
-    state.reclaim_debt_bytes = catalog.reclaim_debt;
-    state.requested_reclaim_debt_bytes = catalog.requested_reclaim_debt;
-    state.watermark_reclaim_debt_bytes = catalog.watermark_reclaim_debt;
+    stats.available_bytes = space.available_bytes;
+    stats.high_watermark_bytes = high_bytes;
+    stats.low_watermark_bytes = low_bytes;
+    stats.pending_bytes = catalog.pending_bytes;
+    stats.live_bytes = catalog.live_bytes;
+    stats.retired_bytes = catalog.retired_bytes;
+    refresh_debt_stats(state, catalog.reclaim_debt, Some(watermark_reclaim_bytes));
+}
+
+fn refresh_debt_stats(
+    state: &mut MemoryEvictionState,
+    requested_reclaim_bytes: u64,
+    watermark_reclaim_bytes: Option<u64>,
+) {
+    if let Some(bytes) = watermark_reclaim_bytes {
+        state.stats.watermark_reclaim_debt_bytes = bytes;
+    }
+    state.stats.requested_reclaim_debt_bytes = requested_reclaim_bytes;
+    state.stats.allocation_reclaim_debt_bytes = state.allocation_reclaim_bytes;
+    state.stats.reclaim_debt_bytes = requested_reclaim_bytes
+        .max(state.allocation_reclaim_bytes)
+        .max(state.stats.watermark_reclaim_debt_bytes);
+    state.stats.active = state.watermark_active
+        || state.allocation_reclaim_bytes != 0
+        || requested_reclaim_bytes != 0;
 }
 
 fn ratio_to_ppm(ratio: f64) -> Option<u32> {

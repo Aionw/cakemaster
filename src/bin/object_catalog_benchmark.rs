@@ -3,9 +3,12 @@
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     DirectReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
-    ObjectIdentity, ReplicaId, ReplicaLease, ReplicaSet, WriteAdmission,
+    ObjectIdentity, ObjectPinRequest, ObjectPutPlan, ReplicaId, ReplicaLease, ReplicaSelector,
+    ReplicaSet, TenantConfig, TenantId, TenantObjectManager, TenantPutRequest, WriteAdmission,
+    WriteMode, WriteOwner,
 };
 use cakemaster::segment::config::DEFAULT_MAX_ALLOCATOR_NODES_PER_SEGMENT;
+use cakemaster::segment::placement::{AllocationSpec, PlacementRequest, ReplicaPolicy};
 use cakemaster::segment::{
     ClientId, MemoryRegion, PoolSnapshot, SegmentId, SegmentIdentity, SegmentPool,
     SegmentPoolConfig, SegmentSpec, TransportEndpoint, TransportProtocol,
@@ -21,6 +24,7 @@ const SEGMENT_CAPACITY: u64 = 8_u64 << 30;
 const MAX_COLLECTOR_SAMPLES: usize = 1_000_000;
 const COLLECT_EVERY_OPERATIONS: u64 = 32;
 const COLLECT_BATCH: usize = 16;
+const TRANSACTION_BATCH_SIZES: [usize; 3] = [1, 16, 333];
 const OWNER: ClientId = ClientId::new(41, 73);
 
 #[derive(Clone, Copy)]
@@ -117,6 +121,222 @@ fn main() {
         let mut sample = samples.swap_remove(samples.len() / 2);
         print_result(scenario, threads * operations_per_thread, &mut sample);
     }
+
+    let transaction_items = operations_per_thread.clamp(333, 10_000);
+    run_transaction_benchmarks(threads, segments, transaction_items, rounds);
+}
+
+fn run_transaction_benchmarks(workers: usize, segments: usize, items: usize, rounds: usize) {
+    println!();
+    println!("Per-key transaction benchmark");
+    println!(
+        "workers={workers} items={items} segments={segments} object={OBJECT_BYTES}B rounds={rounds}"
+    );
+    println!("operation              batch      items/s");
+
+    for mode in [WriteMode::Insert, WriteMode::Upsert] {
+        let samples = (0..rounds)
+            .map(|round| benchmark_write(mode, segments, items, round))
+            .collect::<Vec<_>>();
+        let elapsed = median_duration(samples);
+        println!(
+            "{:<22} {:>5} {:>12.0}",
+            match mode {
+                WriteMode::Insert => "insert-stage-commit",
+                WriteMode::Upsert => "upsert-stage-commit",
+            },
+            1,
+            items as f64 / elapsed.as_secs_f64(),
+        );
+    }
+
+    for batch_size in TRANSACTION_BATCH_SIZES {
+        let samples = (0..rounds)
+            .map(|round| benchmark_batch_finish(workers, segments, items, batch_size, round))
+            .collect::<Vec<_>>();
+        let elapsed = median_duration(samples);
+        println!(
+            "{:<22} {:>5} {:>12.0}",
+            "insert-finish",
+            batch_size,
+            items as f64 / elapsed.as_secs_f64(),
+        );
+    }
+}
+
+fn benchmark_write(mode: WriteMode, segments: usize, items: usize, round: usize) -> Duration {
+    let pool = build_pool(segments);
+    let snapshot = pool.snapshot();
+    let catalog = benchmark_catalog(items);
+    let identities = (0..items)
+        .map(|index| {
+            ObjectIdentity::new(
+                NamespaceId::DEFAULT,
+                format!("transaction-{round:04x}-{index:08x}"),
+            )
+        })
+        .collect::<Vec<_>>();
+    if mode == WriteMode::Upsert {
+        for (index, identity) in identities.iter().enumerate() {
+            stage_and_commit(
+                &catalog,
+                &pool,
+                &snapshot,
+                identity.clone(),
+                WriteMode::Insert,
+                index,
+            );
+        }
+    }
+
+    let started = Instant::now();
+    for (index, identity) in identities.into_iter().enumerate() {
+        stage_and_commit(&catalog, &pool, &snapshot, identity, mode, index);
+    }
+    started.elapsed()
+}
+
+fn benchmark_batch_finish(
+    workers: usize,
+    segments: usize,
+    items: usize,
+    batch_size: usize,
+    round: usize,
+) -> Duration {
+    let manager = Arc::new(
+        TenantObjectManager::with_config(
+            build_pool(segments),
+            benchmark_config(items),
+            TenantConfig::Single,
+        )
+        .expect("benchmark manager configuration is valid"),
+    );
+    let tenant = manager
+        .resolve_tenant(&TenantId::new("transaction-benchmark").unwrap())
+        .unwrap();
+    let mut next_item = 0;
+    let items_per_worker = items / workers;
+    let extra_items = items % workers;
+    let mut worker_batches = Vec::with_capacity(workers);
+    for worker in 0..workers {
+        let worker_items = items_per_worker + usize::from(worker < extra_items);
+        let worker_end = next_item + worker_items;
+        let mut batches = Vec::with_capacity(worker_items.div_ceil(batch_size));
+        while next_item < worker_end {
+            let batch_end = (next_item + batch_size).min(worker_end);
+            let keys = (next_item..batch_end)
+                .map(|index| {
+                    Arc::<str>::from(format!("finish-{round:04x}-{worker:04x}-{index:08x}"))
+                })
+                .collect::<Vec<_>>();
+            let requests = keys
+                .iter()
+                .map(|key| TenantPutRequest::new(key.clone(), transaction_plan()))
+                .collect();
+            for result in manager.start_put_batch(
+                &tenant,
+                WriteAdmission::unmanaged(OWNER),
+                requests,
+                CatalogTick::ZERO,
+            ) {
+                result.expect("benchmark writes can start");
+            }
+            batches.push(keys);
+            next_item = batch_end;
+        }
+        worker_batches.push(batches);
+    }
+
+    let barrier = Arc::new(Barrier::new(workers + 1));
+    thread::scope(|scope| {
+        let handles = worker_batches
+            .into_iter()
+            .map(|batches| {
+                let manager = manager.clone();
+                let tenant = tenant.clone();
+                let barrier = barrier.clone();
+                scope.spawn(move || {
+                    barrier.wait();
+                    for keys in batches {
+                        let results = manager
+                            .finish_put_batch(
+                                &tenant,
+                                keys.iter().map(AsRef::as_ref),
+                                WriteOwner::new(OWNER),
+                                ReplicaSelector::All,
+                            )
+                            .expect("benchmark tenant remains valid");
+                        for result in &results {
+                            result.expect("staged benchmark writes can commit");
+                        }
+                        black_box(results);
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        barrier.wait();
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        started.elapsed()
+    })
+}
+
+fn benchmark_catalog(items: usize) -> ObjectCatalog {
+    ObjectCatalog::with_config(benchmark_config(items)).unwrap()
+}
+
+fn benchmark_config(items: usize) -> ObjectCatalogConfig {
+    ObjectCatalogConfig::new(items.saturating_add(1024))
+        .with_pending_timeout(u64::MAX)
+        .with_max_retired_bytes(u64::MAX)
+}
+
+fn transaction_plan() -> ObjectPutPlan {
+    ObjectPutPlan::new(
+        ObjectContent::new(OBJECT_BYTES),
+        PlacementRequest::new(AllocationSpec::new(OBJECT_BYTES), ReplicaPolicy::new(1)),
+    )
+}
+
+fn stage_and_commit(
+    catalog: &ObjectCatalog,
+    pool: &SegmentPool,
+    snapshot: &PoolSnapshot,
+    identity: ObjectIdentity,
+    mode: WriteMode,
+    index: usize,
+) {
+    let reservation = pool
+        .reserve(&snapshot.candidates()[index % snapshot.len()], OBJECT_BYTES)
+        .expect("benchmark segment must have capacity");
+    let transaction = catalog
+        .begin_write(
+            identity,
+            WriteAdmission::unmanaged(OWNER),
+            mode,
+            ObjectPinRequest::default(),
+            CatalogTick::ZERO,
+        )
+        .expect("benchmark write can begin")
+        .stage(
+            ObjectContent::new(OBJECT_BYTES),
+            ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
+                ReplicaId::new(1),
+                reservation,
+            ))),
+        )
+        .expect("benchmark write can stage");
+    let handle = catalog
+        .commit(&transaction, ObjectCommit::default(), CatalogTick::ZERO)
+        .expect("benchmark write can commit");
+    black_box(handle.version_id());
+}
+
+fn median_duration(mut samples: Vec<Duration>) -> Duration {
+    samples.sort_unstable();
+    samples[samples.len() / 2]
 }
 
 fn run_once(
@@ -244,7 +464,13 @@ fn run_worker(
                 .reserve(&candidate, OBJECT_BYTES)
                 .expect("benchmark segment must have capacity");
             let ticket = catalog
-                .claim_put(identity, WriteAdmission::unmanaged(OWNER), now)
+                .begin_write(
+                    identity,
+                    WriteAdmission::unmanaged(OWNER),
+                    WriteMode::Insert,
+                    ObjectPinRequest::default(),
+                    now,
+                )
                 .expect("benchmark keys are unique")
                 .stage(
                     ObjectContent::new(OBJECT_BYTES),
@@ -255,7 +481,7 @@ fn run_worker(
                 )
                 .expect("benchmark objects are valid");
             let handle = catalog
-                .publish(&ticket, ObjectCommit::default())
+                .commit(&ticket, ObjectCommit::default(), now)
                 .expect("a fresh ticket can be published");
             black_box(handle.identity());
             put_latencies.push(elapsed_nanos(started));
@@ -357,9 +583,11 @@ fn preload_hot_objects(
             .reserve(&snapshot.candidates()[index % snapshot.len()], OBJECT_BYTES)
             .unwrap();
         let ticket = catalog
-            .claim_put(
+            .begin_write(
                 identity.clone(),
                 WriteAdmission::unmanaged(OWNER),
+                WriteMode::Insert,
+                ObjectPinRequest::default(),
                 CatalogTick::ZERO,
             )
             .unwrap()
@@ -371,7 +599,11 @@ fn preload_hot_objects(
                 ))),
             )
             .unwrap();
-        drop(catalog.publish(&ticket, ObjectCommit::default()).unwrap());
+        drop(
+            catalog
+                .commit(&ticket, ObjectCommit::default(), CatalogTick::ZERO)
+                .unwrap(),
+        );
         drop(
             catalog
                 .get(identity.as_lookup(), CatalogTick::ZERO)
