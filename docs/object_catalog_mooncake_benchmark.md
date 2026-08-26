@@ -4,6 +4,134 @@
 > `interop/mooncake_benchmark.cpp` 已随主线契约升级到 `5c0724d`；下面先记录基于
 > per-key MVCC `main` 的当前重实现，再保留 PR #19 原实现和更早的历史对比。
 
+## Production Master 最大吞吐与 1 秒 p99 边界（2026-08-27）
+
+这一组使用 Mooncake
+[`PR #3147`](https://github.com/kvcache-ai/Mooncake/pull/3147) 的 synthetic master
+workload（提交 `28223ae4a2de0d4aae7e69618e7a60a8f2bb5a5f`）对完整 production
+Master 做固定到达率扫描。Cakemaster 基于 `6337bb6086813624881b091eddcc79a122dbac4e`
+加本次容量调优改动；C++ Mooncake 为
+`cafc50785855f7904c7de7727a6c0baf5c7a3dc8`。两边因 wire 漂移分别使用同一份
+benchmark 源码针对 `5c0724d` 和当前 Mooncake headers 构建，工作负载逻辑完全相同。
+
+本地 benchmark instrumentation 在 PR #3147 原有统计上增加了每类操作的
+avg/p50/p95/p99/p99.9/max，并记录从计划到达时间到操作完成的 `end_to_end` 延迟。
+这里的 SLO 判定使用后者，而不是只看 RPC service time；只要前端 worker queue 持续
+积压，端到端 p99 就会反映出来。
+
+### 环境与 workload
+
+- AMD Ryzen 7 9700X（8C/16T）、46 GiB RAM、Linux 7.1.3；未绑核；
+- Cakemaster 使用 Rust 1.97.1 release build 和 mimalloc；C++ 使用 GCC 16.1.1
+  release build、16 个 RPC thread，并由 `ldd` 确认链接
+  `/usr/lib/libjemalloc.so.2`；
+- 3 个 256 GiB Memory segment，448 KiB value，preferred placement；
+- Exist/Put/Get batch size 分别为 86/45/128；完整 Put transaction 包含
+  `BatchPutStart`、1,152 us commit delay 和 `BatchPutEnd`；
+- 保持 Get 开启；每个 segment 的基准速率为 6.3359 Exist、3.1431 Put transaction、
+  2.0242 Get QPS，再按同一个 factor 放大；
+- fixed open-loop 到达模型、16 个同步 client worker/segment、每个 segment 最多保留
+  1M 个 committed key ID；每档生成 30 秒并等待队列完全排空；
+- Cakemaster 使用 1M allocator node/segment、20M expected object slot 和每步 2,688
+  个 background candidate/reclaim；C++ 关闭 metrics，其他 eviction 参数保持默认。
+
+最初的 8 worker/segment 粗扫在约 58K logical task/s 处先撞到 client worker 上限：
+Put commit delay 会占住同步 worker。下表改用 16 worker/segment，避免把 client
+并发限制误报成服务端最大吞吐。10 秒样本也会高估持续容量，因此最大通过点和相邻
+失败点均使用 30 秒窗口；通过点另做两轮相同 workload 复测。
+
+### p99 不超过 1 秒的最大通过点
+
+`offered logical` 是 client 每秒计划的 Exist/Get/Put transaction 数；`completed
+logical` 用总完成数除以包含 drain 的完整 elapsed time。`actual RPC` 只统计真正调用
+服务端的 RPC：如果 PutStart 没有返回任何 placement，client 不再发送 PutEnd，因此它
+低于假设每个 Put 都执行 Start+End 的目标 business RPC QPS。`committed keys` 和 Put
+key 成功率单列，避免失败快速返回抬高表面吞吐。
+
+| 实现 | 最大通过 factor | offered logical/s | completed logical/s | actual RPC/s | committed keys/s | Put key 成功率 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cakemaster | 2,950x | 101,804 | 98,747 | 114,268 | 639,907 | 52.70% |
+| C++ Mooncake + jemalloc | 1,750x | 60,392 | 59,976 | 62,103 | 80,520 | 10.92% |
+
+| 实现 | end-to-end avg | p50 | p95 | p99 | p99.9 | max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cakemaster | 152.786 ms | 27.041 ms | 782.756 ms | 928.468 ms | 950.677 ms | 956.479 ms |
+| C++ Mooncake + jemalloc | 148.443 ms | 84.929 ms | 469.574 ms | 663.856 ms | 734.288 ms | 751.560 ms |
+
+对应的服务端操作 p99 如下。Put transaction 包含 commit delay；其余为单次 batch RPC
+service time，不包含 client queue wait。
+
+| 实现 | Exist | Get | PutStart | PutEnd | Put transaction |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Cakemaster | 0.744 ms | 0.794 ms | 1.122 ms | 0.858 ms | 2.611 ms |
+| C++ Mooncake + jemalloc | 6.048 ms | 6.851 ms | 5.847 ms | 0.666 ms | 6.016 ms |
+
+在这个 SLO 限制下，Cakemaster 的 completed logical throughput 是 C++ 的 1.65x，
+actual RPC throughput 是 1.84x。有效提交 key 吞吐是 7.95x，但这部分倍率同时包含
+C++ 在持续 eviction/admission 压力下更低的 Put 成功率，不能解释成纯 RPC 执行性能。
+
+相邻档位确认了边界，而不是 client 限速：Cakemaster 3,000x 完成 99,517 logical/s，
+仅 queue dispatch p99 已达 1.185 秒；C++ 1,800x 完成 59,894 logical/s，dispatch
+p99 为 1.101 秒。端到端延迟不会低于 dispatch，因此两档均明确失败。当前扫描精度下
+边界分别为 `[2,950x, 3,000x)` 和 `[1,750x, 1,800x)`。Cakemaster 2,950x 已靠近
+1 秒线；需要为生产抖动留余量时，2,900x 的 30 秒 dispatch p99 为 654 ms。
+
+通过点的另两轮复测中，Cakemaster completed logical throughput 为
+98,725/98,945 ops/s，dispatch p99 为 904/865 ms；C++ 为
+59,426/59,616 ops/s 和 636/333 ms。重复样本都满足 SLO，但仍应把这些数据视作这台
+未绑核机器的容量基线，不外推成跨硬件固定倍率。
+
+Cakemaster 在 20M `expected-objects` 容量提示下的采样 VmHWM 为 13.2 GiB，C++ 为
+1.79 GiB。该参数会预留 object index 容量，本轮目标是排除运行时扩容对最大吞吐的
+干扰，并未做等内存优化；因此这组数据不能用于声明内存效率。服务端峰值 CPU 采样约为
+709% 和 1,017%。
+
+### 复现参数
+
+Cakemaster server：
+
+```bash
+cargo build --release --bin cakemaster
+target/release/cakemaster \
+  --listen 127.0.0.1:50450 \
+  --max-allocator-nodes-per-segment 1000000 \
+  --expected-objects 20000000 \
+  --object-collection-budget-per-step 2688 \
+  --log-level off
+```
+
+C++ server：
+
+```bash
+/path/to/Mooncake/build/mooncake-store/src/mooncake_master \
+  --rpc_port=50450 --rpc_thread_num=16 \
+  --enable_metric_reporting=false
+ldd /path/to/Mooncake/build/mooncake-store/src/mooncake_master | grep jemalloc
+```
+
+两个最大通过点分别使用下面的 per-segment QPS；其他参数保留上述 workload 值和 PR
+#3147 默认的 3 个 segment：
+
+```bash
+# Cakemaster 2,950x
+master_synthetic_bench \
+  --master_server=127.0.0.1:50450 --duration=30 \
+  --arrival_model=fixed --workers_per_segment=16 \
+  --exist_qps_per_segment=18690.905 \
+  --put_qps_per_segment=9272.145 \
+  --get_qps_per_segment=5971.390 \
+  --max_pending_events_per_segment=1000000
+
+# C++ Mooncake 1,750x
+master_synthetic_bench \
+  --master_server=127.0.0.1:50450 --duration=30 \
+  --arrival_model=fixed --workers_per_segment=16 \
+  --exist_qps_per_segment=11087.825 \
+  --put_qps_per_segment=5500.425 \
+  --get_qps_per_segment=3542.350 \
+  --max_pending_events_per_segment=1000000
+```
+
 ## 当前 MVCC 实现的 Production 1:1:1 高压闭环（2026-08-17）
 
 当前重实现使用与下一节 PR #19 样本相同的压力参数：115,056,180-byte Memory

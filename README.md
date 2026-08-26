@@ -78,7 +78,18 @@ cargo run --release -- \
 ```
 
 不传参数时默认监听 `127.0.0.1:50051`；也可传 `--listen 127.0.0.1:0` 让系统选择
-测试端口。RPC access 日志默认关闭；传 `--access-log` 后，每个完成的请求会以 info 级别
+测试端口。每个 direct-memory allocator 默认预分配 128K 个 offset metadata node；
+`--max-allocator-nodes-per-segment` 应按同时存活的 slice 数量加上空闲区间余量配置，
+它限制的是分配区间数量而非 segment 字节容量。object catalog 默认以 64K 个 slot
+作为初始容量提示；`--expected-objects` 应覆盖峰值 indexed object（包括 grace period 内
+尚未删除的空 slot），避免运行中并发 hash table 扩容造成尾延迟尖峰。该参数不是对象数量
+硬上限。后台 object collection 默认每步最多扫描
+256 个 candidate 并回收 256 个 retired object；可用
+`--object-collection-budget-per-step` 同时调整这两个上限。更大的预算能更快收敛
+watermark eviction，但单步占用 collector 的时间也可能增加；allocation-failure 请求路径
+仍使用独立的小预算，因此应结合目标负载的成功率和 RPC 尾延迟调优，而不是越大越好。
+RPC access 日志默认关闭；传
+`--access-log` 后，每个完成的请求会以 info 级别
 记录来源地址、路由名/function ID、sequence、结果、请求/响应大小和耗时。通用库调用方也可
 使用 `ServerConfig::default().with_access_log(true)` 开启。binary 在同一个 composition
 root 中只构建一次 `SegmentPool`、内存态
@@ -131,7 +142,9 @@ cakemaster --log-filter \
 数据进入日志。Access 日志同样受等级和模块过滤规则控制。
 
 当前 production 默认值是保守的单进程、单租户内存态配置：最多 65,536 个 client 和预期
-65,536 个 object，client TTL/lease TTL 均为 10 秒，pending write timeout 为 30 秒，
+65,536 个 expected object slot，每个 direct-memory allocator 最多 128K 个 metadata node，后台
+object collection 每步最多处理 256 个 candidate/reclaim，
+client TTL/lease TTL 均为 10 秒，pending write timeout 为 30 秒，
 reconcile 周期为 100ms；未配置初始 segment，client 必须通过 Mount/ReMount 注册容量。
 重启会丢失 metadata，且当前不包含 TLS、HA、持久化、HTTP metadata、NoF/LocalSSD
 工作流。当前 `WrappedMasterService` 已包含 `ServiceReady` 和返回空持久化配置的

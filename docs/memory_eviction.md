@@ -60,6 +60,20 @@ Existing second-chance recency, object leases, tenant-scoped reclaim,
 segment-invalidation pruning, and reservation RAII remain the candidate and
 release authority.
 
+The production binary defaults both background limits to 256. The
+`--object-collection-budget-per-step` option changes the candidate and reclaim
+limits together while retaining the default empty-slot budget. This option
+does not change the separate 64-candidate/64-reclaim allocation-failure budget,
+so increasing background throughput does not silently add synchronous work to
+the request path. Larger background steps should be selected with RPC tail
+latency measurements because the collector gate is held for the complete step.
+
+The object index separately uses `--expected-objects` as its initial capacity
+hint. It should cover peak indexed slots, including empty slots retained during
+their grace period. It is not a hard object limit; undersizing it permits the
+concurrent hash table to grow on the request path and can create isolated
+latency spikes independently of watermark eviction.
+
 ## Allocation failures and lifecycle
 
 A Memory allocation failure publishes a controller-owned physical-byte
