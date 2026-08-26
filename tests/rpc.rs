@@ -402,6 +402,126 @@ async fn generated_mooncake_rpc_drives_the_real_object_manager() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn single_put_routes_drive_start_finish_and_revoke() {
+    let pool = pool();
+    let manager = Arc::new(
+        ObjectManager::with_config(pool, ObjectCatalogConfig::new(16).with_lease(10_000, 5_000))
+            .unwrap(),
+    );
+    let service = ObjectCatalogRpcService::new(manager);
+    service
+        .client_manager()
+        .remount(OWNER, Vec::new(), ClientTick::ZERO)
+        .unwrap();
+    let server = WrappedMasterServiceServer::new(service)
+        .into_rpc_server()
+        .unwrap();
+    let bound = server.bind("127.0.0.1:0").await.unwrap();
+    let address = bound.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = oneshot::channel();
+    let server_task = tokio::spawn(bound.run_until(async {
+        let _ = shutdown_rx.await;
+    }));
+    let client = WrappedMasterServiceClient::connect(address).await.unwrap();
+    let writer = Uuid { high: 17, low: 23 };
+
+    let started = client
+        .put_start(
+            writer.clone(),
+            "single-finish".to_owned(),
+            4096,
+            config(1, 0),
+            "ignored".to_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(started.len(), 1);
+    assert_eq!(started[0].status, ReplicaStatus::Processing);
+    assert_eq!(
+        client
+            .put_end(
+                writer.clone(),
+                ObjectMeta {
+                    key: "single-finish".to_owned(),
+                    object_checksum: Some(7),
+                },
+                ReplicaType::Memory,
+                "ignored".to_owned(),
+            )
+            .await
+            .unwrap(),
+        Err(ErrorCode::InvalidParams)
+    );
+    client
+        .put_end(
+            writer.clone(),
+            ObjectMeta {
+                key: "single-finish".to_owned(),
+                object_checksum: None,
+            },
+            ReplicaType::Memory,
+            "ignored".to_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        client
+            .exist_key("single-finish".to_owned(), "ignored".to_owned())
+            .await
+            .unwrap(),
+        Ok(true)
+    );
+    assert_eq!(
+        client
+            .put_start(
+                writer.clone(),
+                "single-finish".to_owned(),
+                4096,
+                config(1, 0),
+                "ignored".to_owned(),
+            )
+            .await
+            .unwrap(),
+        Err(ErrorCode::ObjectAlreadyExists)
+    );
+
+    client
+        .put_start(
+            writer.clone(),
+            "single-revoke".to_owned(),
+            1024,
+            config(1, 0),
+            "ignored".to_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    client
+        .put_revoke(
+            writer,
+            "single-revoke".to_owned(),
+            ReplicaType::All,
+            "ignored".to_owned(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        client
+            .exist_key("single-revoke".to_owned(), "ignored".to_owned())
+            .await
+            .unwrap(),
+        Ok(false)
+    );
+
+    drop(client);
+    shutdown_tx.send(()).unwrap();
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn upsert_and_remove_routes_drive_transactional_catalog_semantics() {
     let pool = pool();
     let manager = Arc::new(
@@ -687,6 +807,19 @@ async fn multi_tenant_rpc_resolves_once_per_batch_and_maps_tenant_errors() {
     assert_eq!(
         service
             .get_replica_list("key".to_owned(), "missing".to_owned())
+            .await
+            .unwrap(),
+        Err(ErrorCode::TenantNotRegistered)
+    );
+    assert_eq!(
+        service
+            .put_start(
+                writer.clone(),
+                "key".to_owned(),
+                1,
+                config(1, 0),
+                "missing".to_owned(),
+            )
             .await
             .unwrap(),
         Err(ErrorCode::TenantNotRegistered)

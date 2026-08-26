@@ -36,9 +36,9 @@ binary；由于路由和存储能力仍不完整，它还不能完整替换 `moo
 Mooncake Store。
 
 - 上游实际在 `RegisterRpcService` 中注册 **60** 个 coro_rpc 路由；本仓库 contract 和
-  adapter 有 **24** 个，缺少 **36** 个路由。
-- 这 24 个路由已由 workspace 主 binary `cakemaster` 组合；原 `DemoService` 入口已移除。
-- 24 个路由均已对齐固定的最新上游 wire；`BatchPutStart` 的 `SoftPinAction`/TTL schema
+  adapter 有 **27** 个，缺少 **33** 个路由。
+- 这 27 个路由已由 workspace 主 binary `cakemaster` 组合；原 `DemoService` 入口已移除。
+- 27 个路由均已对齐固定的最新上游 wire；`BatchPutStart` 的 `SoftPinAction`/TTL schema
   drift 已修复，`ServiceReady`/`GetStorageConfig` 已足够让无持久化 Client 完成初始化。
 - 已有 `ObjectCatalog`、`SegmentPool`、tenant quota 和 LocalSSD primitive 能复用，但
   client 生命周期、完整对象 API、分层存储任务、HA/恢复、数据面和运维面仍未完成。
@@ -54,7 +54,7 @@ Mooncake Store。
 | Segment/placement | `ClientManager` 已把 `Ping`、Memory/CXL `MountSegment`/`ReMountSegment`、立即/Graceful unmount、session TTL fencing 和批量 cleanup 接到 `SegmentPool`；production runtime 显式运行并 join 兼有 100ms 周期维护和 Graceful deadline 唤醒的 `MasterReconciler` | 没有 NoF lifecycle RPC、探活和真实 I/O |
 | Placement | 支持 preferred segment、free-capacity 排序、replica failure domain 和 RAII 回滚 | 不是上游可配置的五种策略；不支持 mixed Memory+NoF 和 host-local placement |
 | Tenant | `TenantObjectManager` 已有 namespace 隔离、Memory/NoF 分账、quota admission、RAII accounting 和定向回收 | 没有上游 policy connector、HTTP admin、持久化和启动恢复 |
-| Mooncake RPC | 有 `ServiceReady`、禁用持久化的 `GetStorageConfig`、`Ping`、四个 Memory/CXL segment lifecycle 路由、exists/get/batch put、六个 upsert 和四个 remove 路由，并由 `cakemaster` 组合 | `GetFsdir` 兼容 fallback 未实现；production 入口仍是内存态单租户子集，不是完整 upstream Master |
+| Mooncake RPC | 有 `ServiceReady`、禁用持久化的 `GetStorageConfig`、`Ping`、四个 Memory/CXL segment lifecycle 路由、single/batch exists/get/put、六个 upsert 和四个 remove 路由，并由 `cakemaster` 组合 | `GetFsdir` 兼容 fallback 未实现；production 入口仍是内存态单租户子集，不是完整 upstream Master |
 | RPC runtime | TCP 上兼容 coro_rpc v0/struct_pack，支持 multiplexing、attachment、timeout、取消和流式拆帧 | 没有上游可选的 RDMA RPC socket、leader-aware client pool 和 Store API |
 | Task/client primitive | `ClientRegistry` 已封装在 core `ClientManager` 后，并有 generation-fenced cleanup；另有单 client 有界 `ClientTaskQueue<T>` | 没有任务事实表、重试、恢复、task/LocalSSD cleanup hook 或 task RPC |
 
@@ -92,9 +92,8 @@ literal/type hash。C++ yalantinglibs 生成的 metadata 和代表性请求字�
 
 状态：**部分实现，基础 Memory Master 的 P0 缺口**。
 
-当前有十七个对象相关 handler。以下上游能力尚未形成兼容的公开服务：
+当前有二十个对象相关 handler。以下上游能力尚未形成兼容的公开服务：
 
-- 单 key `PutStart/End/Revoke`；
 - `GetReplicaListByRegex`；
 - `BatchReplicaClear` 和 `BatchQueryIp`；
 - checksum 的保存、返回、数据面校验、snapshot/oplog 兼容；当前 RPC 明确拒绝非空
@@ -300,7 +299,7 @@ tenant feature：
 
 benchmark binary 中的固定 segment 和 eviction thread 不能替代 production
 composition/configuration；它们仍只用于性能测量。production binary 会同时注册已合并的
-`ServiceReady` 与空 `GetStorageConfig`，当前 route 数按 24 个计算。
+`ServiceReady` 与空 `GetStorageConfig`，当前 route 数按 27 个计算。
 
 上游依据：[`master.cpp`](https://github.com/kvcache-ai/Mooncake/blob/5c0724d22e7f04513a3453c8b6642a5a21b80b47/mooncake-store/src/master.cpp)、
 [`MasterAdminServer 路由`](https://github.com/kvcache-ai/Mooncake/blob/5c0724d22e7f04513a3453c8b6642a5a21b80b47/mooncake-store/src/master_admin_service.cpp#L1190-L1291)、
@@ -313,13 +312,13 @@ composition/configuration；它们仍只用于性能测量。production binary �
 
 | 分组 | 上游路由数 | 当前 contract/adapter | 结论 |
 | --- | ---: | ---: | --- |
-| 对象、metadata 与查询 | 23 | 17 | 6 个缺失 |
+| 对象、metadata 与查询 | 23 | 20 | 3 个缺失 |
 | Segment、client lifecycle 与配置 | 15 | 7 | 8 个缺失 |
 | LocalSSD offload/promotion | 11 | 0 | 全部缺失 |
 | Copy/Move 与异步任务 | 11 | 0 | 全部缺失 |
-| **合计** | **60** | **24** | **36 个路由缺失；最新完整 wire 兼容为 24/60** |
+| **合计** | **60** | **27** | **33 个路由缺失；最新完整 wire 兼容为 27/60** |
 
-### 已有的二十四个路由
+### 已有的二十七个路由
 
 ```text
 Ping
@@ -331,6 +330,9 @@ ExistKey
 GetReplicaList
 BatchExistKey
 BatchGetReplicaList
+PutStart
+PutEnd
+PutRevoke
 BatchPutStart
 BatchPutEnd
 BatchPutRevoke
@@ -348,17 +350,14 @@ GetStorageConfig
 ServiceReady
 ```
 
-### 缺少的 36 个路由
+### 缺少的 33 个路由
 
-对象与 metadata（6）：
+对象与 metadata（3）：
 
 ```text
 BatchQueryIp
 BatchReplicaClear
 GetReplicaListByRegex
-PutStart
-PutEnd
-PutRevoke
 ```
 
 Segment、client lifecycle 与配置（8）：
@@ -423,7 +422,7 @@ MarkTaskToComplete
 - production server composition/config（基础内存态版本已完成）；
 - `ClientManager` 已接入 production composition 并运行 TTL cleanup；仍需补齐 NoF
   Mount/ReMount/Unmount；
-- 补齐单 key put、query 和管理所需的对象 API；remove/upsert 路由已完成基础内存语义；
+- 单 key put 和 remove/upsert 路由已完成基础内存语义；仍需补齐 query 和管理所需的对象 API；
 - 补 checksum、group、mixed replica、pin 持久化和两个 pending timeout 语义；
 - 扩展 NoF watermark、外部 metrics exporter、group eviction 和 soft-pin 全局 priority；
 - 用上游 C++ Client 完成 mount -> put -> get metadata -> remove -> remount 的 E2E。

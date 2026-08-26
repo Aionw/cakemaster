@@ -201,6 +201,22 @@ public:
     return response;
   }
 
+  ExpectedReplicaDescriptors
+  PutStart(const UUID &, const std::string &, const std::uint64_t,
+           const ReplicateConfig &, const std::string &) {
+    return std::vector<ReplicaDescriptor>{memory_replica()};
+  }
+
+  ExpectedVoid PutEnd(const UUID &, const ObjectMeta &, ReplicaType,
+                      const std::string &) {
+    return {};
+  }
+
+  ExpectedVoid PutRevoke(const UUID &, const std::string &, ReplicaType,
+                         const std::string &) {
+    return {};
+  }
+
   std::vector<ExpectedReplicaDescriptors>
   BatchPutStart(const UUID &, const std::vector<std::string> &keys,
                 const std::vector<std::uint64_t> &, const ReplicateConfig &,
@@ -268,6 +284,15 @@ void print_metadata() {
   using Service = mooncake::WrappedMasterService;
   using SingleKeyRequest = std::tuple<std::string, std::string>;
   using BatchKeyRequest = std::tuple<std::vector<std::string>, std::string>;
+  using PutStartRequest =
+      std::tuple<mooncake::UUID, std::string, std::uint64_t,
+                 mooncake::ReplicateConfig, std::string>;
+  using PutEndRequest =
+      std::tuple<mooncake::UUID, mooncake::ObjectMeta, mooncake::ReplicaType,
+                 std::string>;
+  using PutRevokeRequest =
+      std::tuple<mooncake::UUID, std::string, mooncake::ReplicaType,
+                 std::string>;
   using BatchPutStartRequest =
       std::tuple<mooncake::UUID, std::vector<std::string>,
                  std::vector<std::uint64_t>, mooncake::ReplicateConfig,
@@ -286,6 +311,9 @@ void print_metadata() {
   print_type<std::vector<mooncake::ExpectedBool>>("batch_exists_response");
   print_type<std::vector<mooncake::ExpectedGetReplicaListResponse>>(
       "batch_get_response");
+  print_type<PutStartRequest>("put_start_request");
+  print_type<PutEndRequest>("put_end_request");
+  print_type<PutRevokeRequest>("put_revoke_request");
   print_type<BatchPutStartRequest>("batch_put_start_request");
   print_type<std::vector<mooncake::ExpectedReplicaDescriptors>>(
       "batch_put_start_response");
@@ -334,6 +362,12 @@ void print_metadata() {
             << coro_rpc::func_id<&Service::BatchExistKey>() << '\n';
   std::cout << "batch_get_route="
             << coro_rpc::func_id<&Service::BatchGetReplicaList>() << '\n';
+  std::cout << "put_start_route=" << coro_rpc::func_id<&Service::PutStart>()
+            << '\n';
+  std::cout << "put_end_route=" << coro_rpc::func_id<&Service::PutEnd>()
+            << '\n';
+  std::cout << "put_revoke_route="
+            << coro_rpc::func_id<&Service::PutRevoke>() << '\n';
   std::cout << "batch_put_start_route="
             << coro_rpc::func_id<&Service::BatchPutStart>() << '\n';
   std::cout << "batch_put_end_route="
@@ -1148,6 +1182,9 @@ int main(int argc, char **argv) {
                           &mooncake::WrappedMasterService::GetReplicaList,
                           &mooncake::WrappedMasterService::BatchExistKey,
                           &mooncake::WrappedMasterService::BatchGetReplicaList,
+                          &mooncake::WrappedMasterService::PutStart,
+                          &mooncake::WrappedMasterService::PutEnd,
+                          &mooncake::WrappedMasterService::PutRevoke,
                           &mooncake::WrappedMasterService::BatchPutStart,
                           &mooncake::WrappedMasterService::BatchPutEnd,
                           &mooncake::WrappedMasterService::BatchPutRevoke,

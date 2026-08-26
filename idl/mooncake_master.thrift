@@ -298,6 +298,28 @@ service WrappedMasterService {
     2: required string tenant_id
   ) (coro_rpc.name = "mooncake::WrappedMasterService::BatchGetReplicaList")
 
+  ExpectedReplicaDescriptors PutStart(
+    1: required UUID client_id,
+    2: required string key,
+    3: required u64 slice_length,
+    4: required ReplicateConfig config,
+    5: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::PutStart")
+
+  ExpectedVoid PutEnd(
+    1: required UUID client_id,
+    2: required ObjectMeta object_meta,
+    3: required ReplicaType replica_type,
+    4: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::PutEnd")
+
+  ExpectedVoid PutRevoke(
+    1: required UUID client_id,
+    2: required string key,
+    3: required ReplicaType replica_type,
+    4: required string tenant_id
+  ) (coro_rpc.name = "mooncake::WrappedMasterService::PutRevoke")
+
   list<ExpectedReplicaDescriptors> BatchPutStart(
     1: required UUID client_id,
     2: required list<string> keys,

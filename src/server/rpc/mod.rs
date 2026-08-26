@@ -321,6 +321,122 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         ))
     }
 
+    async fn put_start(
+        &self,
+        client_id: Uuid,
+        key: String,
+        slice_length: u64,
+        config: ReplicateConfig,
+        tenant_id: String,
+    ) -> Result<ExpectedReplicaDescriptors, RpcFailure> {
+        let client_id = client_id_from_uuid(&client_id);
+        let labels = RpcLabels::new("put_start")
+            .with_client(client_id)
+            .with_tenant(&tenant_id);
+        let template = match PutPlanTemplate::try_from(&config) {
+            Ok(template) => template,
+            Err(error) => return Ok(observe_result(labels, Err(error))),
+        };
+        let admission = match self.clients.write_admission(client_id) {
+            Ok(admission) => admission,
+            Err(error) => {
+                return Ok(observe_result(labels, Err(client_lifecycle_error(error))));
+            }
+        };
+        let requests = vec![TenantPutRequest::new(key, template.plan(slice_length))];
+        let now = self.clock().now();
+        let started = only_item(self.backend.execute_batch(
+            &tenant_id,
+            1,
+            move |backend, tenant| backend.start_put_batch(tenant, admission, requests, now),
+        ));
+        let result = started.and_then(|started| {
+            started
+                .replicas()
+                .iter()
+                .map(started_replica_descriptor)
+                .collect()
+        });
+        Ok(observe_result(labels, result))
+    }
+
+    async fn put_end(
+        &self,
+        client_id: Uuid,
+        object_meta: ObjectMeta,
+        replica_type: ReplicaType,
+        tenant_id: String,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        let client_id = client_id_from_uuid(&client_id);
+        let labels = RpcLabels::new("put_end")
+            .with_client(client_id)
+            .with_tenant(&tenant_id);
+        if object_meta.object_checksum.is_some() {
+            return Ok(observe_result(labels, Err(ErrorCode::InvalidParams)));
+        }
+        let selector = match replica_selector(replica_type) {
+            Ok(selector) => selector,
+            Err(error) => return Ok(observe_result(labels, Err(error))),
+        };
+        let owner = match self.clients.write_owner(client_id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                return Ok(observe_result(labels, Err(client_lifecycle_error(error))));
+            }
+        };
+        let now = self.clock().now();
+        let result = only_item(
+            self.backend
+                .execute_batch(&tenant_id, 1, |backend, tenant| {
+                    backend.finish_put_batch(
+                        tenant,
+                        &[object_meta.key.as_str()],
+                        owner,
+                        selector,
+                        now,
+                    )
+                }),
+        );
+        Ok(observe_result(labels, result))
+    }
+
+    async fn put_revoke(
+        &self,
+        client_id: Uuid,
+        key: String,
+        replica_type: ReplicaType,
+        tenant_id: String,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        let client_id = client_id_from_uuid(&client_id);
+        let labels = RpcLabels::new("put_revoke")
+            .with_client(client_id)
+            .with_tenant(&tenant_id);
+        let selector = match replica_selector(replica_type) {
+            Ok(selector) => selector,
+            Err(error) => return Ok(observe_result(labels, Err(error))),
+        };
+        let owner = match self.clients.write_owner(client_id) {
+            Ok(owner) => owner,
+            Err(error) => {
+                return Ok(observe_result(labels, Err(client_lifecycle_error(error))));
+            }
+        };
+        let now = self.clock().now();
+        let result = only_item(
+            self.backend
+                .execute_batch(&tenant_id, 1, |backend, tenant| {
+                    backend.revoke_put_batch(
+                        tenant,
+                        std::slice::from_ref(&key),
+                        owner,
+                        selector,
+                        now,
+                    )
+                }),
+        );
+        Ok(observe_result(labels, result))
+    }
+
     async fn batch_put_start(
         &self,
         client_id: Uuid,
