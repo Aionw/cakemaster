@@ -21,6 +21,9 @@ type BatchPutStartResponse = Vec<ExpectedReplicaDescriptors>;
 type BatchPutEndRequest = (Uuid, Vec<ObjectMeta>, ReplicaType, String);
 type BatchPutRevokeRequest = (Uuid, Vec<String>, ReplicaType, String);
 type BatchVoidResponse = Vec<ExpectedVoid>;
+type PutStartRequest = (Uuid, String, u64, ReplicateConfig, String);
+type PutEndRequest = (Uuid, ObjectMeta, ReplicaType, String);
+type PutRevokeRequest = (Uuid, String, ReplicaType, String);
 type PingRequest = Uuid;
 type RemountRequest = (Vec<Segment>, Uuid);
 type MountSegmentRequest = (Segment, Uuid);
@@ -62,6 +65,12 @@ fn mooncake_rpc_schema_matches_yalantinglibs_metadata() {
         "8487fd84fd0486fdfd0404800c800cfffffdfd0404800c800cfffffd800c04fffdfd04048989ff04800cffff01ff048504ff01",
         3_125_797_772,
     );
+    assert_type::<PutStartRequest>(
+        "fdfd04048989ff800c04fd04040685040b84800c800c84800c0b06800c8584800cff800cff",
+        2_413_733_834,
+    );
+    assert_type::<PutEndRequest>("fdfd04048989fffd800c8504ff01800cff", 3_514_929_698);
+    assert_type::<PutRevokeRequest>("fdfd04048989ff800c01800cff", 460_989_066);
     assert_type::<BatchPutStartRequest>(
         "fdfd04048989ff84800c8404fd04040685040b84800c800c84800c0b06800c8584800cff800cff",
         1_937_958_152,
@@ -124,6 +133,18 @@ fn mooncake_rpc_routes_match_wrapped_master_service() {
     assert_eq!(
         function_id("mooncake::WrappedMasterService::BatchGetReplicaList"),
         453_845_247
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::PutStart"),
+        1_709_873_857
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::PutEnd"),
+        2_391_482_521
+    );
+    assert_eq!(
+        function_id("mooncake::WrappedMasterService::PutRevoke"),
+        2_692_119_620
     );
     assert_eq!(
         function_id("mooncake::WrappedMasterService::BatchPutStart"),

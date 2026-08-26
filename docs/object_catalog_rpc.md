@@ -4,8 +4,8 @@
 handler 中复制 catalog、placement 或事务规则。当前实现提供 client lifecycle 的
 `Ping`、`MountSegment`、`ReMountSegment`、`UnmountSegment`、
 `GracefulUnmountSegment`，单 key `ExistKey`、`GetReplicaList`，以及
-`BatchExistKey`、`BatchGetReplicaList`、`BatchPutStart`、`BatchPutEnd` 和
-`BatchPutRevoke`。对象更新已覆盖 `UpsertStart/End/Revoke` 及其 batch 版本；删除已覆盖
+`BatchExistKey`、`BatchGetReplicaList`；`PutStart/End/Revoke` 和对应 batch 版本均已覆盖。
+对象更新已覆盖 `UpsertStart/End/Revoke` 及其 batch 版本；删除已覆盖
 `Remove`、`BatchRemove`、`RemoveByRegex` 和 `RemoveAll`。此外，`ServiceReady` 和
 `GetStorageConfig` 提供上游 Client 初始化所需的版本握手与无持久化配置。
 

@@ -25,7 +25,7 @@ Cakemaster workspace 包含高并发 object catalog、异构 segment/placement �
 - 入站帧大小、容器大小和单连接并发上限
 - 真实 ObjectCatalog/SegmentPool 驱动的 Mooncake `Ping`、`MountSegment`、
   `ReMountSegment`、`UnmountSegment`、`GracefulUnmountSegment`、single/batch exists/get
-  与 batch put、single/batch upsert、single/batch/regex/all remove RPC adapter，以及 client
+  与 single/batch put、single/batch upsert、single/batch/regex/all remove RPC adapter，以及 client
   初始化所需的 `ServiceReady`/`GetStorageConfig`
 
 暂不包含 TLS/NTLS、RDMA/CUDA transport、struct_pack varint 配置、IDL 外的自定义 variant/多态指针，以及 C++ 未使用 `YLT_REFL` 的 ABI/padding 结构体。大二进制建议放在 coro_rpc attachment 中，无需经过 struct_pack。
@@ -318,7 +318,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 异步 `WrappedMasterService` trait：`Ping`、三种 segment mount/unmount 和 `ReMountSegment`
 接到 core `ClientManager`，单 key
 `ExistKey`、`GetReplicaList` 以及 `BatchExistKey`、`BatchGetReplicaList`、
-`BatchPutStart`、`BatchPutEnd`、`BatchPutRevoke`、六个 Upsert 路由和四个 Remove 路由接到
+single/batch `PutStart`、`PutEnd`、`PutRevoke`、六个 Upsert 路由和四个 Remove 路由接到
 真实 `ObjectManager`。RPC 层只负责 wire 校验、plan 转换和错误码映射；同步、线程安全的
 ObjectManager 负责 owner、per-key transaction/committed version、lease、soft/hard pin 和 reservation 协调。
 
@@ -430,7 +430,7 @@ target/release/mooncake_benchmark metadata
 /tmp/mooncake_benchmark metadata
 ```
 
-[`tests/mooncake_wire.rs`](tests/mooncake_wire.rs) 固定了二十四个接口的 C++ type metadata 与 route hash，以及 bootstrap 响应、代表性的 `BatchPutEnd` 和最新 `BatchPutStart` 字节序列。
+[`tests/mooncake_wire.rs`](tests/mooncake_wire.rs) 固定了二十七个接口的 C++ type metadata 与 route hash，以及 bootstrap 响应、代表性的 `BatchPutEnd` 和最新 `BatchPutStart` 字节序列。
 
 ## 本机性能对比
 

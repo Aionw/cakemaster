@@ -22,6 +22,9 @@ const GRACEFUL_UNMOUNT_SEGMENT: &str = "mooncake::WrappedMasterService::Graceful
 const GET_REPLICA_LIST: &str = "mooncake::WrappedMasterService::GetReplicaList";
 const BATCH_EXIST_KEY: &str = "mooncake::WrappedMasterService::BatchExistKey";
 const BATCH_GET_REPLICA_LIST: &str = "mooncake::WrappedMasterService::BatchGetReplicaList";
+const PUT_START: &str = "mooncake::WrappedMasterService::PutStart";
+const PUT_END: &str = "mooncake::WrappedMasterService::PutEnd";
+const PUT_REVOKE: &str = "mooncake::WrappedMasterService::PutRevoke";
 const BATCH_PUT_START: &str = "mooncake::WrappedMasterService::BatchPutStart";
 const BATCH_PUT_END: &str = "mooncake::WrappedMasterService::BatchPutEnd";
 const BATCH_PUT_REVOKE: &str = "mooncake::WrappedMasterService::BatchPutRevoke";
@@ -44,6 +47,9 @@ type SingleGetResponse = ExpectedGetReplicaListResponse;
 type BatchKeyRequest = (Vec<String>, String);
 type BatchExistResponse = Vec<ExpectedBool>;
 type BatchGetResponse = Vec<ExpectedGetReplicaListResponse>;
+type PutStartRequest = (Uuid, String, u64, ReplicateConfig, String);
+type PutEndRequest = (Uuid, ObjectMeta, ReplicaType, String);
+type PutRevokeRequest = (Uuid, String, ReplicaType, String);
 type BatchPutStartRequest = (Uuid, Vec<String>, Vec<u64>, ReplicateConfig, String);
 type BatchPutStartResponse = Vec<ExpectedReplicaDescriptors>;
 type BatchPutEndRequest = (Uuid, Vec<ObjectMeta>, ReplicaType, String);
@@ -209,6 +215,37 @@ impl WrappedMasterService for BenchmarkMasterService {
                 })
             })
             .collect())
+    }
+
+    async fn put_start(
+        &self,
+        _client_id: Uuid,
+        _key: String,
+        _slice_length: u64,
+        _config: ReplicateConfig,
+        _tenant_id: String,
+    ) -> Result<ExpectedReplicaDescriptors, RpcFailure> {
+        Ok(Ok(vec![memory_replica()]))
+    }
+
+    async fn put_end(
+        &self,
+        _client_id: Uuid,
+        _object_meta: ObjectMeta,
+        _replica_type: ReplicaType,
+        _tenant_id: String,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        Ok(Ok(()))
+    }
+
+    async fn put_revoke(
+        &self,
+        _client_id: Uuid,
+        _key: String,
+        _replica_type: ReplicaType,
+        _tenant_id: String,
+    ) -> Result<ExpectedVoid, RpcFailure> {
+        Ok(Ok(()))
     }
 
     async fn batch_put_start(
@@ -396,6 +433,9 @@ fn print_metadata() {
     print_type::<BatchKeyRequest>("batch_key_request");
     print_type::<BatchExistResponse>("batch_exists_response");
     print_type::<BatchGetResponse>("batch_get_response");
+    print_type::<PutStartRequest>("put_start_request");
+    print_type::<PutEndRequest>("put_end_request");
+    print_type::<PutRevokeRequest>("put_revoke_request");
     print_type::<BatchPutStartRequest>("batch_put_start_request");
     print_type::<BatchPutStartResponse>("batch_put_start_response");
     print_type::<BatchPutEndRequest>("batch_put_end_request");
@@ -464,6 +504,9 @@ fn print_metadata() {
     println!("single_get_route={}", function_id(GET_REPLICA_LIST));
     println!("batch_exists_route={}", function_id(BATCH_EXIST_KEY));
     println!("batch_get_route={}", function_id(BATCH_GET_REPLICA_LIST));
+    println!("put_start_route={}", function_id(PUT_START));
+    println!("put_end_route={}", function_id(PUT_END));
+    println!("put_revoke_route={}", function_id(PUT_REVOKE));
     println!("batch_put_start_route={}", function_id(BATCH_PUT_START));
     println!("batch_put_end_route={}", function_id(BATCH_PUT_END));
     println!("batch_put_revoke_route={}", function_id(BATCH_PUT_REVOKE));
