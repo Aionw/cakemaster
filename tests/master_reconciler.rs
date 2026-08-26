@@ -311,7 +311,8 @@ async fn rpc_and_background_collection_converge_without_duplicate_retirement() {
     rpc_task.await.unwrap();
 
     for _ in 0..512 {
-        if manager.catalog().stats().published_objects == 0 {
+        let stats = manager.catalog().stats();
+        if stats.published_objects == 0 && stats.retired_candidates == 0 {
             break;
         }
         let _ = reconciler.reconcile_once();
