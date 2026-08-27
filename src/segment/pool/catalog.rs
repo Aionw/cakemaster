@@ -1,7 +1,8 @@
 use super::entry::SegmentEntry;
-use super::resource::{CandidateCapability, ResourceRegistry};
+use super::resource::{CandidateCapability, ResourceRegistry, TransferableExtent};
 use super::{
     AttachOutcome, DirectCandidate, OffloadSnapshot, OffloadTarget, PoolSnapshot, SegmentHandle,
+    SegmentTopologyEvent,
 };
 use crate::segment::error::{AttachError, LocalSsdError, SegmentStateError};
 use crate::segment::identity::{ClientId, SegmentId};
@@ -41,6 +42,8 @@ impl Catalog {
         &mut self,
         spec: SegmentSpec,
         max_allocator_nodes: u32,
+        allocator_shards: usize,
+        allocator_shard_index: Option<usize>,
     ) -> Result<AttachOutcome, AttachError> {
         if let Some(existing) = self.segment(spec.identity().id()) {
             return if existing.spec() == &spec {
@@ -54,8 +57,14 @@ impl Catalog {
             &spec,
             self.segments.values().map(|entry| entry.spec()),
             max_allocator_nodes,
+            allocator_shards,
+            allocator_shard_index,
         )?;
-        let entry = Arc::new(SegmentEntry::new(Arc::new(spec), resource));
+        let entry = Arc::new(SegmentEntry::new(
+            Arc::new(spec),
+            resource,
+            allocator_shard_index.is_some(),
+        ));
         let segment = self.handle(entry.clone());
         self.segments.insert(segment.id(), entry);
         self.segments_by_owner
@@ -80,6 +89,14 @@ impl Catalog {
     }
 
     pub(super) fn space_for(&self, replica_class: ReplicaClass) -> ReplicaClassSpaceStats {
+        self.space_for_shard(replica_class, None)
+    }
+
+    pub(super) fn space_for_shard(
+        &self,
+        replica_class: ReplicaClass,
+        allocator_shard: Option<usize>,
+    ) -> ReplicaClassSpaceStats {
         let mut resources = HashSet::new();
         let mut capacity_bytes = 0_u64;
         let mut used_bytes = 0_u64;
@@ -93,7 +110,8 @@ impl Catalog {
             if !resources.insert(entry.spec().resource_id()) {
                 continue;
             }
-            let space = entry.stats().space;
+            let space = allocator_shard
+                .map_or_else(|| entry.stats().space, |shard| entry.space_for_shard(shard));
             capacity_bytes = capacity_bytes.saturating_add(space.capacity_bytes);
             used_bytes = used_bytes.saturating_add(space.used_bytes);
             available_bytes = available_bytes.saturating_add(space.available_bytes);
@@ -125,6 +143,64 @@ impl Catalog {
 
     pub(super) fn len(&self) -> usize {
         self.segments.len()
+    }
+
+    pub(super) fn take_empty_extent(
+        &self,
+        replica_class: ReplicaClass,
+        allocator_shard: usize,
+        minimum_bytes: u64,
+    ) -> Option<(SegmentId, TransferableExtent)> {
+        let mut segments = self
+            .segments
+            .iter()
+            .filter(|(_, entry)| entry.spec().replica_class() == replica_class)
+            .collect::<Vec<_>>();
+        segments.sort_unstable_by_key(|(id, _)| **id);
+        segments.into_iter().find_map(|(id, entry)| {
+            entry
+                .take_empty_extent(allocator_shard, minimum_bytes)
+                .map(|extent| (*id, extent))
+        })
+    }
+
+    pub(super) fn add_extent(
+        &self,
+        segment: SegmentId,
+        allocator_shard: usize,
+        extent: TransferableExtent,
+    ) {
+        self.segments
+            .get(&segment)
+            .expect("capacity transfer retains matching topology on every shard")
+            .add_extent(allocator_shard, extent)
+            .then_some(())
+            .expect("capacity transfer targets an accepting direct segment");
+    }
+
+    pub(super) fn topology_events(&self) -> Vec<SegmentTopologyEvent> {
+        let mut events = Vec::with_capacity(self.segments.len());
+        for entry in self.segments.values() {
+            events.push(SegmentTopologyEvent::Attach {
+                spec: entry.spec().clone(),
+                state: entry.stats().state,
+            });
+            if let Some(stats) = entry.local_ssd_stats() {
+                events.push(SegmentTopologyEvent::SetLocalSsdOffloadEnabled {
+                    owner: entry.spec().identity().owner(),
+                    id: entry.spec().identity().id(),
+                    enabled: stats.offload_enabled,
+                });
+                if stats.capacity_reported {
+                    events.push(SegmentTopologyEvent::ReportLocalSsdCapacity {
+                        owner: entry.spec().identity().owner(),
+                        id: entry.spec().identity().id(),
+                        capacity_bytes: stats.capacity_bytes,
+                    });
+                }
+            }
+        }
+        events
     }
 
     pub(super) fn report_local_ssd_capacity(

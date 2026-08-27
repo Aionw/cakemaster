@@ -254,7 +254,7 @@ fn payload_lengths(body: &Bytes, attachment: &Bytes) -> Result<(u32, u32), Proto
     ))
 }
 
-fn validate_lengths(
+pub(crate) fn validate_lengths(
     body_len: u32,
     attachment_len: u32,
     limits: FrameLimits,

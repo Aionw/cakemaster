@@ -1,7 +1,7 @@
 use super::descriptor::{LocalSsdDescriptor, LocalSsdDescriptorRef};
 use super::error::LocalSsdError;
 use super::identity::SegmentId;
-use super::lifetime::SegmentLease;
+use super::lifetime::{SegmentLease, SegmentLiveness};
 use super::spec::SegmentSpec;
 use parking_lot::Mutex;
 use std::fmt;
@@ -237,6 +237,10 @@ impl LocalSsdLease {
     /// still logically valid.
     pub fn is_live(&self) -> bool {
         self.segment_lease.is_live()
+    }
+
+    pub(crate) fn liveness(&self) -> SegmentLiveness {
+        self.segment_lease.observer()
     }
 
     pub fn transport_endpoint(&self) -> &str {

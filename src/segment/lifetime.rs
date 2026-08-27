@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 
 /// Lifecycle control for one mounted segment incarnation.
 ///
@@ -20,6 +20,15 @@ struct LifetimeState {
 /// allocation counted by [`SegmentLifetime::active_leases`].
 pub(crate) struct SegmentLease {
     state: Arc<LifetimeState>,
+}
+
+/// Non-owning liveness view used by immutable object metadata snapshots.
+///
+/// Unlike [`SegmentLease`], this observer neither keeps the mounted segment
+/// incarnation alive nor contributes to its active allocation count.
+#[derive(Clone)]
+pub(crate) struct SegmentLiveness {
+    state: Weak<LifetimeState>,
 }
 
 impl SegmentLifetime {
@@ -54,5 +63,19 @@ impl SegmentLifetime {
 impl SegmentLease {
     pub(crate) fn is_live(&self) -> bool {
         self.state.live.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn observer(&self) -> SegmentLiveness {
+        SegmentLiveness {
+            state: Arc::downgrade(&self.state),
+        }
+    }
+}
+
+impl SegmentLiveness {
+    pub(crate) fn is_live(&self) -> bool {
+        self.state
+            .upgrade()
+            .is_some_and(|state| state.live.load(Ordering::Acquire))
     }
 }

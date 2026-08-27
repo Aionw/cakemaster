@@ -1,15 +1,19 @@
 //! Multi-tenant RPC backend adapter.
 
-use super::backend::{ObjectBatchBackend, batch_error, mutation_maintenance_budget};
+use super::backend::{
+    ObjectBatchBackend, ObjectReadSnapshot, batch_error, mutation_maintenance_budget,
+    snapshot_object_read,
+};
 use super::response::{map_lookup_error, map_manager_error, map_remove_error, map_tenant_error};
 use crate::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
 use crate::object::reclamation::CatalogTick;
 use crate::object::{
-    ObjectRead, ReplicaSelector, ResolvedTenant, StartedPut, TenantId, TenantObjectError,
-    TenantObjectManager, TenantPutRequest, WriteAdmission, WriteOwner,
+    ReplicaSelector, ResolvedTenant, StartedPut, TenantId, TenantObjectError, TenantObjectManager,
+    TenantPutRequest, WriteAdmission, WriteOwner,
 };
 use regex::Regex;
 
+#[async_trait::async_trait]
 impl ObjectBatchBackend for TenantObjectManager {
     type Tenant = ResolvedTenant;
 
@@ -18,62 +22,66 @@ impl ObjectBatchBackend for TenantObjectManager {
         TenantObjectManager::resolve_tenant(self, &tenant_id).map_err(map_tenant_error)
     }
 
-    fn exists_batch(
+    async fn exists_batch(
         &self,
-        tenant: &Self::Tenant,
-        keys: &[String],
+        tenant: Self::Tenant,
+        keys: Vec<String>,
         now: CatalogTick,
     ) -> Vec<ExpectedBool> {
         map_tenant_batch(
             keys.len(),
-            TenantObjectManager::exists_batch(self, tenant, keys.iter().map(String::as_str), now),
+            TenantObjectManager::exists_batch(self, &tenant, keys.iter().map(String::as_str), now),
             Ok,
         )
     }
 
-    fn get_batch(
+    async fn get_batch(
         &self,
-        tenant: &Self::Tenant,
-        keys: &[String],
+        tenant: Self::Tenant,
+        keys: Vec<String>,
         now: CatalogTick,
-    ) -> Vec<Result<ObjectRead, ErrorCode>> {
+    ) -> Vec<Result<ObjectReadSnapshot, ErrorCode>> {
         map_tenant_batch(
             keys.len(),
-            TenantObjectManager::get_batch(self, tenant, keys.iter().map(String::as_str), now),
-            |value| value.map_err(map_lookup_error),
+            TenantObjectManager::get_batch(self, &tenant, keys.iter().map(String::as_str), now),
+            |value| {
+                value
+                    .map_err(map_lookup_error)
+                    .and_then(snapshot_object_read)
+            },
         )
     }
 
-    fn start_put_batch(
+    async fn start_put_batch(
         &self,
-        tenant: &Self::Tenant,
+        tenant: Self::Tenant,
         admission: WriteAdmission,
         requests: Vec<TenantPutRequest>,
         now: CatalogTick,
     ) -> Vec<Result<StartedPut, ErrorCode>> {
-        TenantObjectManager::start_put_batch(self, tenant, admission, requests, now)
+        TenantObjectManager::start_put_batch(self, &tenant, admission, requests, now)
             .into_iter()
             .map(|result| result.map_err(map_tenant_error))
             .collect()
     }
 
-    fn start_upsert_batch(
+    async fn start_upsert_batch(
         &self,
-        tenant: &Self::Tenant,
+        tenant: Self::Tenant,
         admission: WriteAdmission,
         requests: Vec<TenantPutRequest>,
         now: CatalogTick,
     ) -> Vec<Result<StartedPut, ErrorCode>> {
-        TenantObjectManager::start_upsert_batch(self, tenant, admission, requests, now)
+        TenantObjectManager::start_upsert_batch(self, &tenant, admission, requests, now)
             .into_iter()
             .map(|result| result.map_err(map_tenant_error))
             .collect()
     }
 
-    fn finish_put_batch(
+    async fn finish_put_batch(
         &self,
-        tenant: &Self::Tenant,
-        keys: &[&str],
+        tenant: Self::Tenant,
+        keys: Vec<String>,
         owner: WriteOwner,
         selector: ReplicaSelector,
         now: CatalogTick,
@@ -82,32 +90,7 @@ impl ObjectBatchBackend for TenantObjectManager {
             keys.len(),
             TenantObjectManager::finish_put_batch_at(
                 self,
-                tenant,
-                keys.iter().copied(),
-                owner,
-                selector,
-                now,
-            ),
-            |result| result.map_err(map_manager_error),
-        );
-        let _ =
-            TenantObjectManager::maintenance(self, now, mutation_maintenance_budget(keys.len()));
-        results
-    }
-
-    fn revoke_put_batch(
-        &self,
-        tenant: &Self::Tenant,
-        keys: &[String],
-        owner: WriteOwner,
-        selector: ReplicaSelector,
-        now: CatalogTick,
-    ) -> Vec<ExpectedVoid> {
-        let results = map_tenant_batch(
-            keys.len(),
-            TenantObjectManager::revoke_put_batch(
-                self,
-                tenant,
+                &tenant,
                 keys.iter().map(String::as_str),
                 owner,
                 selector,
@@ -120,10 +103,35 @@ impl ObjectBatchBackend for TenantObjectManager {
         results
     }
 
-    fn remove_batch(
+    async fn revoke_put_batch(
         &self,
-        tenant: &Self::Tenant,
-        keys: &[String],
+        tenant: Self::Tenant,
+        keys: Vec<String>,
+        owner: WriteOwner,
+        selector: ReplicaSelector,
+        now: CatalogTick,
+    ) -> Vec<ExpectedVoid> {
+        let results = map_tenant_batch(
+            keys.len(),
+            TenantObjectManager::revoke_put_batch(
+                self,
+                &tenant,
+                keys.iter().map(String::as_str),
+                owner,
+                selector,
+                now,
+            ),
+            |result| result.map_err(map_manager_error),
+        );
+        let _ =
+            TenantObjectManager::maintenance(self, now, mutation_maintenance_budget(keys.len()));
+        results
+    }
+
+    async fn remove_batch(
+        &self,
+        tenant: Self::Tenant,
+        keys: Vec<String>,
         now: CatalogTick,
         force: bool,
     ) -> Vec<ExpectedVoid> {
@@ -131,7 +139,7 @@ impl ObjectBatchBackend for TenantObjectManager {
             keys.len(),
             TenantObjectManager::remove_batch(
                 self,
-                tenant,
+                &tenant,
                 keys.iter().map(String::as_str),
                 now,
                 force,
@@ -143,20 +151,21 @@ impl ObjectBatchBackend for TenantObjectManager {
         results
     }
 
-    fn remove_matching(
+    async fn remove_matching(
         &self,
-        tenant: &Self::Tenant,
-        pattern: Option<&Regex>,
+        tenant: Self::Tenant,
+        pattern: Option<Regex>,
         now: CatalogTick,
         force: bool,
     ) -> Result<usize, ErrorCode> {
-        let removed = TenantObjectManager::remove_matching(self, tenant, pattern, now, force)
-            .map_err(map_tenant_error)?;
+        let removed =
+            TenantObjectManager::remove_matching(self, &tenant, pattern.as_ref(), now, force)
+                .map_err(map_tenant_error)?;
         let _ = TenantObjectManager::maintenance(self, now, mutation_maintenance_budget(removed));
         Ok(removed)
     }
 
-    fn remove_all(
+    async fn remove_all(
         &self,
         tenant_id: &str,
         now: CatalogTick,

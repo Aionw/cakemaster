@@ -1,9 +1,10 @@
 use cakemaster::client::ClientId;
 use cakemaster::mooncake::{
-    ClientStatus, ObjectDataType, ObjectMeta, ReplicaStatus, ReplicaType, ReplicateConfig, Segment,
-    SoftPinAction, Uuid, WrappedMasterService, WrappedMasterServiceClient,
+    ClientStatus, DescriptorVariant, ErrorCode, ObjectDataType, ObjectMeta, ReplicaStatus,
+    ReplicaType, ReplicateConfig, Segment, SoftPinAction, Uuid, WrappedMasterService,
+    WrappedMasterServiceClient,
 };
-use cakemaster::object::ObjectCatalogConfig;
+use cakemaster::object::{NamespaceId, ObjectCatalogConfig};
 use cakemaster::segment::{
     MemoryRegion, SegmentId, SegmentIdentity, SegmentSpec, TransportEndpoint, TransportProtocol,
 };
@@ -62,6 +63,21 @@ fn replicate_config() -> ReplicateConfig {
         host_id: String::new(),
         group_ids: None,
     }
+}
+
+fn metadata_owner(tenant: &str, key: &str, shard_count: usize) -> usize {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in tenant
+        .bytes()
+        .chain([0xff])
+        .chain(NamespaceId::DEFAULT.get().to_le_bytes())
+        .chain([0xfe])
+        .chain(key.bytes())
+    {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    (hash as usize) % shard_count
 }
 
 #[test]
@@ -185,6 +201,182 @@ async fn cakemaster_handles_ping_segment_and_object_rpcs_then_joins() {
         .unwrap()
         .unwrap();
     assert!(WrappedMasterServiceClient::connect(address).await.is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sharded_backend_keeps_key_ownership_and_restores_batch_order() {
+    let config = MooncakeServerConfig::default()
+        .with_metadata_shards(4)
+        .with_object_catalog(ObjectCatalogConfig::new(256));
+    let composition = config.build().unwrap();
+    assert_eq!(composition.manager().shard_count(), 4);
+    assert_eq!(
+        composition
+            .manager()
+            .shard_stats()
+            .into_iter()
+            .map(|shard| shard.segment_pool_instance)
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        4,
+        "metadata shards must own distinct segment pools"
+    );
+    composition
+        .service()
+        .client_manager()
+        .remount(
+            CLIENT,
+            vec![core_segment()],
+            composition.clock().client_now(),
+        )
+        .unwrap();
+
+    let tenant = "tenant-a".to_owned();
+    let keys = (0..64)
+        .map(|index| format!("sharded-key-{index}"))
+        .collect::<Vec<_>>();
+    let started = composition
+        .service()
+        .batch_put_start(
+            client_id(),
+            keys.clone(),
+            vec![1024; keys.len()],
+            replicate_config(),
+            tenant.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(started.iter().all(Result::is_ok));
+
+    let arena_size = (1_u64 << 20) / 4;
+    let mut arenas = std::collections::HashSet::new();
+    for replicas in &started {
+        let descriptor = &replicas.as_ref().unwrap()[0];
+        let buffer = match &descriptor.descriptor_variant {
+            DescriptorVariant::Memory(memory) => &memory.buffer_descriptor,
+            other => panic!("unexpected descriptor: {other:?}"),
+        };
+        arenas.insert((buffer.buffer_address - 0x5_0000_0000) / arena_size);
+    }
+    assert_eq!(
+        arenas.len(),
+        4,
+        "stable owners must allocate from local arenas"
+    );
+
+    let metas = keys
+        .iter()
+        .map(|key| ObjectMeta {
+            key: key.clone(),
+            object_checksum: None,
+        })
+        .collect();
+    assert!(
+        composition
+            .service()
+            .batch_put_end(client_id(), metas, ReplicaType::Memory, tenant.clone(),)
+            .await
+            .unwrap()
+            .iter()
+            .all(Result::is_ok)
+    );
+
+    let probes = vec![
+        keys[41].clone(),
+        "missing-a".to_owned(),
+        keys[3].clone(),
+        "missing-b".to_owned(),
+        keys[62].clone(),
+    ];
+    assert_eq!(
+        composition
+            .service()
+            .batch_exist_key(probes, tenant.clone())
+            .await
+            .unwrap(),
+        vec![Ok(true), Ok(false), Ok(true), Ok(false), Ok(true)]
+    );
+    assert_eq!(
+        composition
+            .service()
+            .batch_remove(
+                vec![keys[19].clone(), "missing-c".to_owned(), keys[7].clone()],
+                true,
+                tenant,
+            )
+            .await
+            .unwrap(),
+        vec![Ok(()), Err(ErrorCode::ObjectNotFound), Ok(())]
+    );
+    assert_eq!(composition.manager().catalog_stats().published_objects, 62);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sharded_backend_borrows_a_completely_empty_allocator_extent() {
+    let config = MooncakeServerConfig::default()
+        .with_metadata_shards(2)
+        .with_object_catalog(ObjectCatalogConfig::new(16));
+    let composition = config.build().unwrap();
+    composition
+        .service()
+        .client_manager()
+        .remount(
+            CLIENT,
+            vec![core_segment()],
+            composition.clock().client_now(),
+        )
+        .unwrap();
+
+    let tenant = "capacity-tenant".to_owned();
+    let keys = (0..100)
+        .map(|index| format!("capacity-key-{index}"))
+        .filter(|key| metadata_owner(&tenant, key, 2) == 0)
+        .take(2)
+        .collect::<Vec<_>>();
+    assert_eq!(keys.len(), 2);
+
+    let first = composition
+        .service()
+        .batch_put_start(
+            client_id(),
+            vec![keys[0].clone()],
+            vec![1 << 19],
+            replicate_config(),
+            tenant.clone(),
+        )
+        .await
+        .unwrap();
+    let second = composition
+        .service()
+        .batch_put_start(
+            client_id(),
+            vec![keys[1].clone()],
+            vec![1 << 18],
+            replicate_config(),
+            tenant.clone(),
+        )
+        .await
+        .unwrap();
+
+    let first_address = match &first[0].as_ref().unwrap()[0].descriptor_variant {
+        DescriptorVariant::Memory(memory) => memory.buffer_descriptor.buffer_address,
+        other => panic!("unexpected descriptor: {other:?}"),
+    };
+    let second_address = match &second[0].as_ref().unwrap()[0].descriptor_variant {
+        DescriptorVariant::Memory(memory) => memory.buffer_descriptor.buffer_address,
+        other => panic!("unexpected descriptor: {other:?}"),
+    };
+    assert_eq!(first_address, 0x5_0000_0000);
+    assert_eq!(second_address, 0x5_0008_0000);
+
+    assert_eq!(
+        composition
+            .service()
+            .batch_put_revoke(client_id(), keys, ReplicaType::Memory, tenant)
+            .await
+            .unwrap(),
+        vec![Ok(()), Ok(())]
+    );
 }
 
 #[tokio::test(start_paused = true)]

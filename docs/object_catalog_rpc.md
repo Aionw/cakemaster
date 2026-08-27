@@ -20,7 +20,7 @@ async WrappedMasterService handler
                          └── ReplicaAllocator：placement 与 SegmentPool reservation
 ```
 
-生成的 RPC trait 使用 `async fn`，因此网络入口可以直接被 Tokio/coro_rpc driver
+生成的 RPC trait 使用 `async fn`，因此网络入口可以直接被 coro_rpc driver
 调度。`ObjectManager` 刻意保持同步：目前它只访问并发内存结构和本地
 `SegmentPool`，没有需要等待的 I/O，而且 maintenance 每步都有预算上限。以后若
 placement 需要访问远端调度器，应把异步引入 placement/coordinator 边界，而不是
@@ -105,8 +105,8 @@ cargo run --release -- \
 
 `--listen` 必须是明确的 socket address；默认是保守的 loopback
 `127.0.0.1:50051`。`--max-allocator-nodes-per-segment` 默认 128K，控制每个
-direct-memory allocator 预分配的区间 metadata node 数；应按最大同时存活 slice 数和
-碎片余量设置，并不改变 segment 声明的字节容量。
+direct-memory segment 在全部 allocator extent 间分配的区间 metadata node 总数；应按
+最大同时存活 slice 数和碎片余量设置，并不改变 segment 声明的字节容量。
 `--expected-objects` 默认 64K，是 object index 的初始容量提示而非数量硬上限；应覆盖
 峰值 indexed object，并计入 grace period 内保留的空 slot。配置偏小会允许并发 hash
 table 在请求路径上扩容，形成孤立的尾延迟尖峰。
@@ -114,10 +114,24 @@ table 在请求路径上扩容，形成孤立的尾延迟尖峰。
 candidate scan 和 retired-object reclaim 上限；增大它可以提高 watermark 收敛速度，
 但也会扩大单步 collector 占用时间，应以目标负载下的成功率和 RPC 尾延迟共同调优，
 并非越大越好。allocation-failure 请求路径仍保留独立的 64/64 预算，不受该参数影响。
+`--metadata-shards` 默认取进程可用 CPU 数；每个 shard 使用稳定 key owner、固定线程和
+独立 `ObjectManager`、`SegmentPool`、catalog/collector/eviction 状态，Memory/CXL segment
+也按同一 shard 数切分地址互不重叠的 allocator extent。shard 之间不共享可变 metadata、
+session guard 或 allocator；segment topology、client fence、统计和 maintenance 都经消息边界。
+本地分配失败时，donor shard 只会取出 active allocation 为零的完整 extent，并把 ownership
+随消息移交给 borrower shard。batch 在 Compio 连接 driver 后只做一次 key hash，按 shard 分组
+并各投递一条消息，入口等待所有返回后按原始 item 下标聚合。
+shard-local catalog 不创建 collector step/stage gate；segment 接受状态使用原子值，本地
+allocator extent owner 列表使用不可变快照发布。Get 不把 `ObjectRead`、`ObjectVersion`
+或 reservation lease 送到其他线程，而是复制版本内嵌的 `Empty/One/Many` immutable
+replica snapshot；snapshot 只保存 descriptor 所需的值和 `Weak` segment/liveness observer，
+因此不会延长 allocation 生命周期，也不需要读取 replica-set `RwLock`。每个 shard thread
+同时承载 Compio accept/connection task、owner mailbox 和对象状态；同 shard 的同步 topology/
+fence callback 直接执行，远端 shard 才经过 mailbox，避免 owner 给自己发消息后阻塞等待。
 逐请求 access 日志默认关闭，可通过
 `--access-log` 开启；开启后会
 以 info 级别记录来源、路由、sequence、结果、请求/响应大小和耗时。Unix 同时监听
-Ctrl-C 和 SIGTERM，其他 Tokio 支持的平台监听
+Ctrl-C 和 SIGTERM，其他 Compio 支持的平台监听
 Ctrl-C。当前默认沿用 core 已验证配置：64K expected objects、64K clients、10s client
 TTL、10s object lease、30s pending timeout、1GiB retired-byte ceiling、内部固定的 90%/80%
 Memory 水位和 100ms reconcile interval。完整 accounting、

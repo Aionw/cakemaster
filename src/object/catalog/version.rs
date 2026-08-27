@@ -133,8 +133,10 @@ impl Drop for ObjectRecord {
 impl ReplicaStorage {
     pub(super) fn new(replicas: ReplicaSet) -> Self {
         let reserved_bytes = replicas.reserved_bytes();
+        let snapshot = replicas.snapshot();
         Self {
             set: RwLock::new(replicas),
+            snapshot,
             reserved_bytes: AtomicU64::new(reserved_bytes),
         }
     }
@@ -145,6 +147,10 @@ impl ReplicaStorage {
 
     pub(super) fn reserved_bytes(&self) -> u64 {
         self.reserved_bytes.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn snapshot(&self) -> ReplicaSnapshotSet {
+        self.snapshot.clone()
     }
 
     pub(super) fn prune_invalidated(&self) -> ReplicaPrune {

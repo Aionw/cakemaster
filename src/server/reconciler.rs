@@ -6,8 +6,10 @@ use crate::client::{
 };
 use crate::object::reclamation::{CatalogTick, CollectBudget};
 use crate::object::{ObjectManager, ObjectManagerMaintenance, TenantObjectManager};
+use crate::server::rpc::ShardedObjectManager;
 use std::future::Future;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 use thiserror::Error;
 use tokio::sync::Notify;
@@ -78,16 +80,18 @@ pub struct ReconcileStepReport {
     pub object_collection: ObjectManagerMaintenance,
 }
 
+#[async_trait::async_trait]
 trait ObjectReconcileBackend: Send + Sync {
-    fn reconcile_objects(
+    async fn reconcile_objects(
         &self,
         now: CatalogTick,
         budget: CollectBudget,
     ) -> ObjectManagerMaintenance;
 }
 
+#[async_trait::async_trait]
 impl ObjectReconcileBackend for ObjectManager {
-    fn reconcile_objects(
+    async fn reconcile_objects(
         &self,
         now: CatalogTick,
         budget: CollectBudget,
@@ -96,13 +100,25 @@ impl ObjectReconcileBackend for ObjectManager {
     }
 }
 
+#[async_trait::async_trait]
 impl ObjectReconcileBackend for TenantObjectManager {
-    fn reconcile_objects(
+    async fn reconcile_objects(
         &self,
         now: CatalogTick,
         budget: CollectBudget,
     ) -> ObjectManagerMaintenance {
         self.maintenance(now, budget)
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectReconcileBackend for ShardedObjectManager {
+    async fn reconcile_objects(
+        &self,
+        now: CatalogTick,
+        budget: CollectBudget,
+    ) -> ObjectManagerMaintenance {
+        self.maintenance(now, budget).await
     }
 }
 
@@ -157,6 +173,23 @@ impl MasterReconciler {
         }
     }
 
+    pub(crate) fn for_sharded_object_manager(
+        clients: ClientManager,
+        objects: Arc<ShardedObjectManager>,
+        clock: MasterClock,
+        reconcile_notify: Arc<Notify>,
+        config: MasterReconcileConfig,
+    ) -> Self {
+        Self {
+            clients,
+            objects,
+            clock,
+            reconcile_notify,
+            memory_eviction_notify: None,
+            config,
+        }
+    }
+
     /// Returns this reconciler's immutable scheduling and budget configuration.
     pub const fn config(&self) -> MasterReconcileConfig {
         self.config
@@ -176,14 +209,15 @@ impl MasterReconciler {
     ///
     /// Object collection always runs, even when client cleanup reports an
     /// error. An unfinished client cleanup claim is requeued by its Drop path.
-    pub fn reconcile_once(&self) -> ReconcileStepReport {
+    pub async fn reconcile_once(&self) -> ReconcileStepReport {
         let client_now = self.clock.client_now();
         let catalog_now = self.clock.now();
         let client_cleanup = self.clients.run_cleanup_step(client_now, catalog_now);
         let graceful_unmount = self.clients.run_graceful_unmount_step(client_now);
         let object_collection = self
             .objects
-            .reconcile_objects(catalog_now, self.config.object_budget());
+            .reconcile_objects(catalog_now, self.config.object_budget())
+            .await;
         ReconcileStepReport {
             client_cleanup,
             graceful_unmount,
@@ -234,17 +268,60 @@ impl MasterReconciler {
         }
     }
 
+    /// Runs the production reconciliation loop inside a shard-local Compio
+    /// runtime. Dropping this future is the shutdown mechanism.
+    pub(crate) async fn run_compio(self) {
+        let mut next_tick = std::time::Instant::now() + self.config.interval();
+        loop {
+            let interval_wait =
+                compio::time::sleep(next_tick.saturating_duration_since(std::time::Instant::now()));
+            let notified = self.reconcile_notify.notified();
+            let eviction_notified = async {
+                match &self.memory_eviction_notify {
+                    Some(notify) => notify.notified().await,
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            let deadline = self.clients.next_graceful_unmount_deadline();
+            let deadline_wait = async {
+                match deadline {
+                    Some(deadline) => {
+                        compio::time::sleep(self.clock.delay_until_client_tick(deadline)).await
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::pin!(interval_wait);
+            tokio::pin!(notified);
+            tokio::pin!(eviction_notified);
+            tokio::pin!(deadline_wait);
+            tokio::select! {
+                biased;
+                _ = &mut interval_wait => {
+                    next_tick += self.config.interval();
+                    if next_tick <= std::time::Instant::now() {
+                        next_tick = std::time::Instant::now() + self.config.interval();
+                    }
+                    self.reconcile_and_reschedule().await;
+                },
+                _ = &mut deadline_wait => self.reconcile_and_reschedule().await,
+                _ = &mut eviction_notified => self.reconcile_and_reschedule().await,
+                _ = &mut notified => self.reconcile_and_reschedule().await,
+            }
+        }
+    }
+
     async fn reconcile_and_reschedule(&self) {
-        if self.reconcile_and_log() {
-            tokio::task::yield_now().await;
+        if self.reconcile_and_log().await {
+            yield_now().await;
             if let Some(notify) = &self.memory_eviction_notify {
                 notify.notify_one();
             }
         }
     }
 
-    fn reconcile_and_log(&self) -> bool {
-        let report = self.reconcile_once();
+    async fn reconcile_and_log(&self) -> bool {
+        let report = self.reconcile_once().await;
         if let Err(error) = &report.client_cleanup {
             log::error!(
                 target: "cakemaster::server::reconciler",
@@ -314,4 +391,18 @@ impl MasterReconciler {
             && !catalog.busy
             && (catalog.reclaimed_objects != 0 || catalog.pruned_objects != 0)
     }
+}
+
+async fn yield_now() {
+    let mut yielded = false;
+    std::future::poll_fn(move |context| {
+        if yielded {
+            Poll::Ready(())
+        } else {
+            yielded = true;
+            context.waker().wake_by_ref();
+            Poll::Pending
+        }
+    })
+    .await;
 }

@@ -5,7 +5,10 @@ mod multi_tenant;
 mod observability;
 mod request;
 mod response;
+mod sharded;
 mod single_tenant;
+
+pub use sharded::{MetadataShardStats, ShardedObjectManager};
 
 use super::{MasterClock, MasterReconcileConfig, MasterReconciler};
 use crate::MOONCAKE_STORE_VERSION;
@@ -20,11 +23,9 @@ use crate::mooncake::{
     GetStorageConfigResponse, ObjectMeta, PingResponse, ReplicaStatus, ReplicaType,
     ReplicateConfig, Segment, Uuid, WrappedMasterService,
 };
-use crate::object::{
-    ObjectManager, ObjectRead, ReplicaSelector, TenantObjectManager, TenantPutRequest,
-};
+use crate::object::{ObjectManager, ReplicaSelector, TenantObjectManager, TenantPutRequest};
 use crate::segment::error::AttachError;
-use backend::{ObjectBatchBackend, batch_error};
+use backend::{ObjectBatchBackend, ObjectReadSnapshot, batch_error};
 use coro_rpc::RpcFailure;
 use observability::{RpcLabels, observe_batch, observe_internal_mapping, observe_result};
 use regex::Regex;
@@ -32,7 +33,7 @@ use request::{
     PutPlanTemplate, client_id_from_uuid, replica_selector, segment_id_from_uuid,
     segment_spec_from_wire,
 };
-use response::{replica_descriptor, started_replica_descriptor};
+use response::started_replica_descriptor;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -102,6 +103,49 @@ impl ObjectCatalogRpcService<ObjectManager> {
     /// Creates an explicitly driven reconciler sharing this service's managers and clock.
     pub fn reconciler(&self, config: MasterReconcileConfig) -> MasterReconciler {
         MasterReconciler::for_object_manager(
+            self.clients.clone(),
+            self.backend.clone(),
+            self.clock.clone(),
+            self.reconcile_notify.clone(),
+            config,
+        )
+    }
+}
+
+impl ObjectCatalogRpcService<ShardedObjectManager> {
+    pub fn new_sharded(manager: Arc<ShardedObjectManager>) -> Self {
+        Self::new_sharded_with_clock(manager, MasterClock::new())
+    }
+
+    pub fn new_sharded_with_clock(manager: Arc<ShardedObjectManager>, clock: MasterClock) -> Self {
+        let clients = ClientManager::new(manager.pool().clone(), manager.pending_write_revoker());
+        Self::from_backend(manager, clients, clock, DEFAULT_MASTER_VIEW_VERSION)
+    }
+
+    pub fn new_sharded_with_client_config(
+        manager: Arc<ShardedObjectManager>,
+        config: ClientLifecycleConfig,
+        clock: MasterClock,
+        view_version: i64,
+    ) -> Result<Self, ClientLifecycleConfigError> {
+        let clients = ClientManager::with_config(
+            manager.pool().clone(),
+            manager.pending_write_revoker(),
+            config,
+        )?;
+        Ok(Self::from_backend(manager, clients, clock, view_version))
+    }
+
+    pub fn sharded_manager(&self) -> &Arc<ShardedObjectManager> {
+        &self.backend
+    }
+
+    pub fn manager(&self) -> &Arc<ShardedObjectManager> {
+        &self.backend
+    }
+
+    pub fn reconciler(&self, config: MasterReconcileConfig) -> MasterReconciler {
+        MasterReconciler::for_sharded_object_manager(
             self.clients.clone(),
             self.backend.clone(),
             self.clock.clone(),
@@ -255,8 +299,9 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let result = only_item(
             self.backend
                 .execute_batch(&tenant_id, 1, |backend, tenant| {
-                    backend.exists_batch(tenant, std::slice::from_ref(&key), now)
-                }),
+                    backend.exists_batch(tenant, vec![key], now)
+                })
+                .await,
         );
         Ok(observe_result(
             RpcLabels::new("exist_key").with_tenant(&tenant_id),
@@ -273,8 +318,9 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let read = only_item(
             self.backend
                 .execute_batch(&tenant_id, 1, |backend, tenant| {
-                    backend.get_batch(tenant, std::slice::from_ref(&key), now)
-                }),
+                    backend.get_batch(tenant, vec![key], now)
+                })
+                .await,
         );
         Ok(observe_result(
             RpcLabels::new("get_replica_list").with_tenant(&tenant_id),
@@ -292,8 +338,9 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let results = self
             .backend
             .execute_batch(&tenant_id, item_count, |backend, tenant| {
-                backend.exists_batch(tenant, &keys, now)
-            });
+                backend.exists_batch(tenant, keys, now)
+            })
+            .await;
         Ok(observe_batch(
             RpcLabels::new("batch_exist_key").with_tenant(&tenant_id),
             results,
@@ -310,8 +357,9 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let results = self
             .backend
             .execute_batch(&tenant_id, item_count, |backend, tenant| {
-                backend.get_batch(tenant, &keys, now)
+                backend.get_batch(tenant, keys, now)
             })
+            .await
             .into_iter()
             .map(|read| get_replica_list_response(read, now))
             .collect();
@@ -345,11 +393,13 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         };
         let requests = vec![TenantPutRequest::new(key, template.plan(slice_length))];
         let now = self.clock().now();
-        let started = only_item(self.backend.execute_batch(
-            &tenant_id,
-            1,
-            move |backend, tenant| backend.start_put_batch(tenant, admission, requests, now),
-        ));
+        let started = only_item(
+            self.backend
+                .execute_batch(&tenant_id, 1, move |backend, tenant| {
+                    backend.start_put_batch(tenant, admission, requests, now)
+                })
+                .await,
+        );
         let result = started.and_then(|started| {
             started
                 .replicas()
@@ -388,14 +438,9 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let result = only_item(
             self.backend
                 .execute_batch(&tenant_id, 1, |backend, tenant| {
-                    backend.finish_put_batch(
-                        tenant,
-                        &[object_meta.key.as_str()],
-                        owner,
-                        selector,
-                        now,
-                    )
-                }),
+                    backend.finish_put_batch(tenant, vec![object_meta.key], owner, selector, now)
+                })
+                .await,
         );
         Ok(observe_result(labels, result))
     }
@@ -425,14 +470,9 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let result = only_item(
             self.backend
                 .execute_batch(&tenant_id, 1, |backend, tenant| {
-                    backend.revoke_put_batch(
-                        tenant,
-                        std::slice::from_ref(&key),
-                        owner,
-                        selector,
-                        now,
-                    )
-                }),
+                    backend.revoke_put_batch(tenant, vec![key], owner, selector, now)
+                })
+                .await,
         );
         Ok(observe_result(labels, result))
     }
@@ -479,7 +519,8 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
             .backend
             .execute_batch(&tenant_id, item_count, move |backend, tenant| {
                 backend.start_put_batch(tenant, admission, requests, now)
-            });
+            })
+            .await;
         let results = started
             .into_iter()
             .map(|started| {
@@ -529,13 +570,14 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         if valid.is_empty() {
             return Ok(observe_batch(labels, output));
         }
-        let keys: Vec<_> = valid.iter().map(|(_, key)| *key).collect();
+        let keys: Vec<_> = valid.iter().map(|(_, key)| (*key).to_owned()).collect();
         let now = self.clock().now();
         let results = self
             .backend
             .execute_batch(&tenant_id, keys.len(), |backend, tenant| {
-                backend.finish_put_batch(tenant, &keys, owner, selector, now)
-            });
+                backend.finish_put_batch(tenant, keys, owner, selector, now)
+            })
+            .await;
         debug_assert_eq!(valid.len(), results.len());
         for ((index, _), result) in valid.into_iter().zip(results) {
             output[index] = result;
@@ -572,8 +614,9 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let results = self
             .backend
             .execute_batch(&tenant_id, item_count, move |backend, tenant| {
-                backend.revoke_put_batch(tenant, &keys, owner, selector, now)
-            });
+                backend.revoke_put_batch(tenant, keys, owner, selector, now)
+            })
+            .await;
         Ok(observe_batch(labels, results))
     }
 
@@ -601,11 +644,13 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         };
         let requests = vec![TenantPutRequest::new(key, template.plan(slice_length))];
         let now = self.clock().now();
-        let started = only_item(self.backend.execute_batch(
-            &tenant_id,
-            1,
-            move |backend, tenant| backend.start_upsert_batch(tenant, admission, requests, now),
-        ));
+        let started = only_item(
+            self.backend
+                .execute_batch(&tenant_id, 1, move |backend, tenant| {
+                    backend.start_upsert_batch(tenant, admission, requests, now)
+                })
+                .await,
+        );
         let result = started.and_then(|started| {
             started
                 .replicas()
@@ -644,14 +689,9 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let result = only_item(
             self.backend
                 .execute_batch(&tenant_id, 1, |backend, tenant| {
-                    backend.finish_put_batch(
-                        tenant,
-                        &[object_meta.key.as_str()],
-                        owner,
-                        selector,
-                        now,
-                    )
-                }),
+                    backend.finish_put_batch(tenant, vec![object_meta.key], owner, selector, now)
+                })
+                .await,
         );
         Ok(observe_result(labels, result))
     }
@@ -681,14 +721,9 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let result = only_item(
             self.backend
                 .execute_batch(&tenant_id, 1, |backend, tenant| {
-                    backend.revoke_put_batch(
-                        tenant,
-                        std::slice::from_ref(&key),
-                        owner,
-                        selector,
-                        now,
-                    )
-                }),
+                    backend.revoke_put_batch(tenant, vec![key], owner, selector, now)
+                })
+                .await,
         );
         Ok(observe_result(labels, result))
     }
@@ -736,6 +771,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
             .execute_batch(&tenant_id, item_count, move |backend, tenant| {
                 backend.start_upsert_batch(tenant, admission, requests, now)
             })
+            .await
             .into_iter()
             .map(|started| {
                 started.and_then(|started| {
@@ -780,13 +816,14 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         if valid.is_empty() {
             return Ok(observe_batch(labels, output));
         }
-        let keys: Vec<_> = valid.iter().map(|(_, key)| *key).collect();
+        let keys: Vec<_> = valid.iter().map(|(_, key)| (*key).to_owned()).collect();
         let now = self.clock().now();
         let results = self
             .backend
             .execute_batch(&tenant_id, keys.len(), |backend, tenant| {
-                backend.finish_put_batch(tenant, &keys, owner, ReplicaSelector::All, now)
-            });
+                backend.finish_put_batch(tenant, keys, owner, ReplicaSelector::All, now)
+            })
+            .await;
         debug_assert_eq!(valid.len(), results.len());
         for ((index, _), result) in valid.into_iter().zip(results) {
             output[index] = result;
@@ -818,8 +855,9 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let results = self
             .backend
             .execute_batch(&tenant_id, item_count, move |backend, tenant| {
-                backend.revoke_put_batch(tenant, &keys, owner, ReplicaSelector::All, now)
-            });
+                backend.revoke_put_batch(tenant, keys, owner, ReplicaSelector::All, now)
+            })
+            .await;
         Ok(observe_batch(labels, results))
     }
 
@@ -834,8 +872,9 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let result = only_item(
             self.backend
                 .execute_batch(&tenant_id, 1, |backend, tenant| {
-                    backend.remove_batch(tenant, std::slice::from_ref(&key), now, force)
-                }),
+                    backend.remove_batch(tenant, vec![key], now, force)
+                })
+                .await,
         );
         Ok(observe_result(labels, result))
     }
@@ -855,12 +894,16 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let removed = only_item(
             self.backend
                 .execute_batch(&tenant_id, 1, |backend, tenant| {
-                    vec![
-                        backend
-                            .remove_matching(tenant, Some(&pattern), now, force)
-                            .and_then(usize_to_i64),
-                    ]
-                }),
+                    Box::pin(async move {
+                        vec![
+                            backend
+                                .remove_matching(tenant, Some(pattern), now, force)
+                                .await
+                                .and_then(usize_to_i64),
+                        ]
+                    })
+                })
+                .await,
         );
         Ok(observe_result(labels, removed))
     }
@@ -871,6 +914,7 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let removed = self
             .backend
             .remove_all(&tenant_id, now, force)
+            .await
             .and_then(usize_to_i64);
         Ok(observe_result(labels, removed).unwrap_or(0))
     }
@@ -887,8 +931,9 @@ impl<B: ObjectBatchBackend> WrappedMasterService for ObjectCatalogRpcService<B> 
         let results = self
             .backend
             .execute_batch(&tenant_id, item_count, |backend, tenant| {
-                backend.remove_batch(tenant, &keys, now, force)
-            });
+                backend.remove_batch(tenant, keys, now, force)
+            })
+            .await;
         Ok(observe_batch(labels, results))
     }
 }
@@ -967,21 +1012,24 @@ fn only_item<T>(mut items: Vec<Result<T, ErrorCode>>) -> Result<T, ErrorCode> {
 }
 
 fn get_replica_list_response(
-    read: Result<ObjectRead, ErrorCode>,
+    read: Result<ObjectReadSnapshot, ErrorCode>,
     now: crate::object::reclamation::CatalogTick,
 ) -> ExpectedGetReplicaListResponse {
     let read = read?;
-    let replica_view = read.object().replicas();
-    if replica_view.is_empty() {
-        return Err(ErrorCode::ObjectNotFound);
-    }
-    let replicas = replica_view
+    let replicas = read
+        .replicas
         .iter()
-        .map(|replica| replica_descriptor(replica, ReplicaStatus::Complete))
+        .filter(|replica| replica.is_live())
+        .map(|replica| {
+            let descriptor = replica
+                .owned_direct_descriptor()
+                .ok_or(ErrorCode::InternalError)?;
+            response::owned_replica_descriptor(replica.id(), &descriptor, ReplicaStatus::Complete)
+        })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(GetReplicaListResponse {
         replicas,
-        lease_ttl_ms: read.lease_expires_at().get().saturating_sub(now.get()),
+        lease_ttl_ms: read.lease_expires_at.get().saturating_sub(now.get()),
         object_checksum: None,
     })
 }

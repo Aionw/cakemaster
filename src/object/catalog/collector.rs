@@ -125,11 +125,16 @@ impl ObjectCatalog {
         P: FnOnce() -> u64,
         F: FnOnce(CollectReport),
     {
-        let Some(_collector) = self.inner.collector.step_gate.try_lock() else {
-            return CollectReport {
-                busy: true,
-                ..CollectReport::default()
+        let _collector = if let Some(gate) = &self.inner.collector.step_gate {
+            let Some(guard) = gate.try_lock() else {
+                return CollectReport {
+                    busy: true,
+                    ..CollectReport::default()
+                };
             };
+            Some(guard)
+        } else {
+            None
         };
 
         let mut report = CollectReport::default();
@@ -408,9 +413,14 @@ impl CatalogInner {
         if owners.is_empty() {
             return 0;
         }
-        let _collector = self.collector.step_gate.lock();
+        let _collector = self.collector.step_gate.as_ref().map(Mutex::lock);
         let candidates = {
-            let _stages = self.collector.pending.stage_gate.write();
+            let _stages = self
+                .collector
+                .pending
+                .stage_gate
+                .as_ref()
+                .map(RwLock::write);
             let mut candidates = Vec::with_capacity(self.collector.pending.candidates.len());
             while let Some(pending) = self.collector.pending.candidates.pop() {
                 candidates.push(pending);

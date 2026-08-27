@@ -2,25 +2,27 @@
 
 use super::{
     DEFAULT_MASTER_VIEW_VERSION, MasterClock, MasterReconcileConfig, MasterReconciler,
-    ObjectCatalogRpcService,
+    ObjectCatalogRpcService, ShardedObjectManager,
 };
 use crate::client::{ClientLifecycleConfig, ClientLifecycleConfigError, ClientManager};
 use crate::mooncake::WrappedMasterServiceServer;
 use crate::object::error::ObjectCatalogConfigError;
-use crate::object::{MemoryEvictionConfig, ObjectCatalogConfig, ObjectManager};
+use crate::object::{MemoryEvictionConfig, ObjectCatalogConfig};
 use crate::segment::error::PoolConfigError;
 use crate::segment::{SegmentPool, SegmentPoolConfig};
-use coro_rpc::{BoundRpcServer, RegisterError, ServerConfig};
+use coro_rpc::{CompioLocalTask, RegisterError, ServerConfig};
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use std::future::Future;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use thiserror::Error;
-use tokio::sync::watch;
 
 /// Conservative loopback default for the production Mooncake RPC listener.
 pub const DEFAULT_MOONCAKE_LISTEN_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 50051);
+pub const DEFAULT_METADATA_SHARDS: usize = 1;
 
 /// Complete in-process configuration for the production Mooncake server.
 ///
@@ -37,6 +39,7 @@ pub struct MooncakeServerConfig {
     reconcile: MasterReconcileConfig,
     view_version: i64,
     access_log: bool,
+    metadata_shards: usize,
 }
 
 impl MooncakeServerConfig {
@@ -80,6 +83,11 @@ impl MooncakeServerConfig {
         self
     }
 
+    pub const fn with_metadata_shards(mut self, metadata_shards: usize) -> Self {
+        self.metadata_shards = metadata_shards;
+        self
+    }
+
     pub const fn listen_addr(self) -> SocketAddr {
         self.listen_addr
     }
@@ -112,6 +120,10 @@ impl MooncakeServerConfig {
         self.access_log
     }
 
+    pub const fn metadata_shards(self) -> usize {
+        self.metadata_shards
+    }
+
     /// Builds one explicit manager/service/reconciler object graph.
     pub fn build(self) -> Result<MooncakeServerComposition, MooncakeServerBuildError> {
         MooncakeServerComposition::new(self)
@@ -129,6 +141,7 @@ impl Default for MooncakeServerConfig {
             reconcile: MasterReconcileConfig::default(),
             view_version: DEFAULT_MASTER_VIEW_VERSION,
             access_log: false,
+            metadata_shards: DEFAULT_METADATA_SHARDS,
         }
     }
 }
@@ -160,22 +173,25 @@ pub enum MooncakeServerBindError {
 pub struct MooncakeServerComposition {
     config: MooncakeServerConfig,
     pool: Arc<SegmentPool>,
-    manager: Arc<ObjectManager>,
+    manager: Arc<ShardedObjectManager>,
     clock: MasterClock,
-    service: ObjectCatalogRpcService,
+    service: ObjectCatalogRpcService<ShardedObjectManager>,
     reconciler: MasterReconciler,
 }
 
 impl MooncakeServerComposition {
     fn new(config: MooncakeServerConfig) -> Result<Self, MooncakeServerBuildError> {
-        let pool = Arc::new(SegmentPool::with_config(config.segment_pool())?);
-        let manager = Arc::new(ObjectManager::with_eviction_config(
+        let pool = Arc::new(SegmentPool::with_config(
+            config.segment_pool().with_allocator_shards(1),
+        )?);
+        let manager = Arc::new(ShardedObjectManager::new(
             pool.clone(),
             config.object_catalog(),
             config.memory_eviction(),
+            config.metadata_shards(),
         )?);
         let clock = MasterClock::new();
-        let service = ObjectCatalogRpcService::new_with_client_config(
+        let service = ObjectCatalogRpcService::new_sharded_with_client_config(
             manager.clone(),
             config.client_lifecycle(),
             clock.clone(),
@@ -200,7 +216,7 @@ impl MooncakeServerComposition {
         &self.pool
     }
 
-    pub const fn manager(&self) -> &Arc<ObjectManager> {
+    pub const fn manager(&self) -> &Arc<ShardedObjectManager> {
         &self.manager
     }
 
@@ -208,7 +224,7 @@ impl MooncakeServerComposition {
         &self.clock
     }
 
-    pub const fn service(&self) -> &ObjectCatalogRpcService {
+    pub const fn service(&self) -> &ObjectCatalogRpcService<ShardedObjectManager> {
         &self.service
     }
 
@@ -223,10 +239,30 @@ impl MooncakeServerComposition {
             .into_rpc_server_with_config(
                 ServerConfig::default().with_access_log(self.config.access_log()),
             )?;
-        let server = rpc_server.bind(self.config.listen_addr()).await?;
+        let server = rpc_server.bind_compio(self.config.listen_addr())?;
+        let local_addr = server.local_addr()?;
+        let mut tasks = server.into_shard_tasks(self.manager.shard_count())?;
+        let shard_zero_server = tasks.remove(0);
+        let reconciler = self.reconciler;
+        let shard_zero: CompioLocalTask = Box::new(move || {
+            let server = shard_zero_server();
+            Box::pin(async move {
+                tokio::pin!(server);
+                let reconcile = reconciler.run_compio();
+                tokio::pin!(reconcile);
+                tokio::select! {
+                    result = &mut server => result,
+                    () = &mut reconcile => Err(io::Error::other(
+                        "Compio reconciler stopped unexpectedly"
+                    )),
+                }
+            })
+        });
+        tasks.insert(0, shard_zero);
+        let server_exits = self.manager.start_runtime_tasks(tasks)?;
         Ok(BoundMooncakeServer {
-            server,
-            reconciler: self.reconciler,
+            local_addr,
+            server_exits,
             pool: self.pool,
             manager: self.manager,
             clients,
@@ -237,24 +273,24 @@ impl MooncakeServerComposition {
 
 /// Bound production runtime with explicit shared-state handles.
 pub struct BoundMooncakeServer {
-    server: BoundRpcServer,
-    reconciler: MasterReconciler,
+    local_addr: SocketAddr,
+    server_exits: Vec<tokio::sync::oneshot::Receiver<io::Result<()>>>,
     pool: Arc<SegmentPool>,
-    manager: Arc<ObjectManager>,
+    manager: Arc<ShardedObjectManager>,
     clients: ClientManager,
     clock: MasterClock,
 }
 
 impl BoundMooncakeServer {
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        self.server.local_addr()
+        Ok(self.local_addr)
     }
 
     pub const fn pool(&self) -> &Arc<SegmentPool> {
         &self.pool
     }
 
-    pub const fn manager(&self) -> &Arc<ObjectManager> {
+    pub const fn manager(&self) -> &Arc<ShardedObjectManager> {
         &self.manager
     }
 
@@ -275,48 +311,30 @@ impl BoundMooncakeServer {
     where
         F: Future<Output = ()>,
     {
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let mut server = Box::pin(
-            self.server
-                .run_until(shutdown_requested(shutdown_rx.clone())),
-        );
-        let mut reconciler = Box::pin(self.reconciler.run_until(shutdown_requested(shutdown_rx)));
+        let mut server_exits = FuturesUnordered::new();
+        for exit in self.server_exits {
+            server_exits.push(exit);
+        }
         tokio::pin!(shutdown);
 
         enum FirstExit {
             Shutdown,
             Server(io::Result<()>),
-            Reconciler,
         }
 
         let first = tokio::select! {
             _ = &mut shutdown => FirstExit::Shutdown,
-            result = &mut server => FirstExit::Server(result),
-            () = &mut reconciler => FirstExit::Reconciler,
+            result = server_exits.next() => FirstExit::Server(match result {
+                Some(Ok(result)) => result,
+                Some(Err(_)) => Err(io::Error::other("Compio shard RPC task stopped unexpectedly")),
+                None => Err(io::Error::other("Compio shard RPC tasks were not started")),
+            }),
         };
-        shutdown_tx.send_replace(true);
+        self.manager.stop_runtime_tasks().await;
 
         match first {
-            FirstExit::Shutdown => {
-                let (server_result, ()) = tokio::join!(&mut server, &mut reconciler);
-                server_result
-            }
-            FirstExit::Server(server_result) => {
-                reconciler.await;
-                server_result
-            }
-            FirstExit::Reconciler => server.await,
-        }
-    }
-}
-
-async fn shutdown_requested(mut shutdown: watch::Receiver<bool>) {
-    if *shutdown.borrow() {
-        return;
-    }
-    while shutdown.changed().await.is_ok() {
-        if *shutdown.borrow() {
-            return;
+            FirstExit::Shutdown => Ok(()),
+            FirstExit::Server(server_result) => server_result,
         }
     }
 }

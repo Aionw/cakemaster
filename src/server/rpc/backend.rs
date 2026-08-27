@@ -3,90 +3,114 @@
 use crate::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
 use crate::object::reclamation::{CatalogTick, CollectBudget};
 use crate::object::{
-    ObjectRead, ReplicaSelector, StartedPut, TenantPutRequest, WriteAdmission, WriteOwner,
+    ObjectRead, ReplicaSelector, ReplicaSnapshot, ReplicaSnapshotSet, StartedPut, TenantPutRequest,
+    WriteAdmission, WriteOwner,
 };
 use regex::Regex;
 
+#[derive(Clone)]
+pub(super) struct ObjectReadSnapshot {
+    pub(super) replicas: ReplicaSnapshotSet,
+    pub(super) lease_expires_at: CatalogTick,
+}
+
+pub(super) fn snapshot_object_read(read: ObjectRead) -> Result<ObjectReadSnapshot, ErrorCode> {
+    let replicas = read.object().replica_snapshot();
+    if !replicas.iter().any(ReplicaSnapshot::is_live) {
+        return Err(ErrorCode::ObjectNotFound);
+    }
+    Ok(ObjectReadSnapshot {
+        replicas,
+        lease_expires_at: read.lease_expires_at(),
+    })
+}
+
 /// Private adapter boundary: core managers remain concrete, while the RPC
 /// service is monomorphized over one batch-capable backend.
+#[async_trait::async_trait]
 pub(super) trait ObjectBatchBackend: Send + Sync + 'static {
-    type Tenant: Send;
+    type Tenant: Send + Sync;
 
-    /// Resolves the tenant once and fans an error out to every batch item. The
-    /// generic operation remains statically dispatched.
-    fn execute_batch<T>(
+    async fn execute_batch<T, F>(
         &self,
         tenant_id: &str,
         item_count: usize,
-        operation: impl FnOnce(&Self, &Self::Tenant) -> Vec<Result<T, ErrorCode>>,
+        operation: F,
     ) -> Vec<Result<T, ErrorCode>>
     where
         Self: Sized,
+        T: Send,
+        F: for<'a> FnOnce(
+                &'a Self,
+                Self::Tenant,
+            ) -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = Vec<Result<T, ErrorCode>>> + Send + 'a>,
+            > + Send,
     {
         match self.resolve_tenant(tenant_id) {
-            Ok(tenant) => operation(self, &tenant),
+            Ok(tenant) => operation(self, tenant).await,
             Err(error) => batch_error(item_count, error),
         }
     }
 
     fn resolve_tenant(&self, tenant_id: &str) -> Result<Self::Tenant, ErrorCode>;
-    fn exists_batch(
+    async fn exists_batch(
         &self,
-        tenant: &Self::Tenant,
-        keys: &[String],
+        tenant: Self::Tenant,
+        keys: Vec<String>,
         now: CatalogTick,
     ) -> Vec<ExpectedBool>;
-    fn get_batch(
+    async fn get_batch(
         &self,
-        tenant: &Self::Tenant,
-        keys: &[String],
+        tenant: Self::Tenant,
+        keys: Vec<String>,
         now: CatalogTick,
-    ) -> Vec<Result<ObjectRead, ErrorCode>>;
-    fn start_put_batch(
+    ) -> Vec<Result<ObjectReadSnapshot, ErrorCode>>;
+    async fn start_put_batch(
         &self,
-        tenant: &Self::Tenant,
+        tenant: Self::Tenant,
         admission: WriteAdmission,
         requests: Vec<TenantPutRequest>,
         now: CatalogTick,
     ) -> Vec<Result<StartedPut, ErrorCode>>;
-    fn start_upsert_batch(
+    async fn start_upsert_batch(
         &self,
-        tenant: &Self::Tenant,
+        tenant: Self::Tenant,
         admission: WriteAdmission,
         requests: Vec<TenantPutRequest>,
         now: CatalogTick,
     ) -> Vec<Result<StartedPut, ErrorCode>>;
-    fn finish_put_batch(
+    async fn finish_put_batch(
         &self,
-        tenant: &Self::Tenant,
-        keys: &[&str],
+        tenant: Self::Tenant,
+        keys: Vec<String>,
         owner: WriteOwner,
         selector: ReplicaSelector,
         now: CatalogTick,
     ) -> Vec<ExpectedVoid>;
-    fn revoke_put_batch(
+    async fn revoke_put_batch(
         &self,
-        tenant: &Self::Tenant,
-        keys: &[String],
+        tenant: Self::Tenant,
+        keys: Vec<String>,
         owner: WriteOwner,
         selector: ReplicaSelector,
         now: CatalogTick,
     ) -> Vec<ExpectedVoid>;
-    fn remove_batch(
+    async fn remove_batch(
         &self,
-        tenant: &Self::Tenant,
-        keys: &[String],
+        tenant: Self::Tenant,
+        keys: Vec<String>,
         now: CatalogTick,
         force: bool,
     ) -> Vec<ExpectedVoid>;
-    fn remove_matching(
+    async fn remove_matching(
         &self,
-        tenant: &Self::Tenant,
-        pattern: Option<&Regex>,
+        tenant: Self::Tenant,
+        pattern: Option<Regex>,
         now: CatalogTick,
         force: bool,
     ) -> Result<usize, ErrorCode>;
-    fn remove_all(
+    async fn remove_all(
         &self,
         tenant_id: &str,
         now: CatalogTick,

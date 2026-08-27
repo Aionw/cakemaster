@@ -15,15 +15,20 @@ pub struct ParseTransportProtocolError;
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 #[error(
-    "`max_allocator_nodes_per_segment` must be in {MIN_ALLOCATOR_NODES_PER_SEGMENT}..{MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE}, got {max_allocator_nodes_per_segment}"
+    "invalid segment-pool configuration: max allocator nodes {max_allocator_nodes_per_segment} must be in {MIN_ALLOCATOR_NODES_PER_SEGMENT}..{MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE} and provide at least {MIN_ALLOCATOR_NODES_PER_SEGMENT} nodes per allocator shard; allocator shards {allocator_shards} must be positive"
 )]
 pub struct PoolConfigError {
     pub(super) max_allocator_nodes_per_segment: u32,
+    pub(super) allocator_shards: usize,
 }
 
 impl PoolConfigError {
     pub const fn max_allocator_nodes_per_segment(&self) -> u32 {
         self.max_allocator_nodes_per_segment
+    }
+
+    pub const fn allocator_shards(&self) -> usize {
+        self.allocator_shards
     }
 }
 

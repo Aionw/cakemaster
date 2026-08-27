@@ -229,6 +229,7 @@ impl PlacementPolicy for FreeCapacityPolicy {
 pub struct ReplicaAllocator<P = FreeCapacityPolicy> {
     pool: Arc<SegmentPool>,
     policy: P,
+    allocator_shard: usize,
 }
 
 impl ReplicaAllocator<FreeCapacityPolicy> {
@@ -236,6 +237,15 @@ impl ReplicaAllocator<FreeCapacityPolicy> {
         Self {
             pool,
             policy: FreeCapacityPolicy,
+            allocator_shard: 0,
+        }
+    }
+
+    pub(crate) fn for_shard(pool: Arc<SegmentPool>, allocator_shard: usize) -> Self {
+        Self {
+            pool,
+            policy: FreeCapacityPolicy,
+            allocator_shard,
         }
     }
 }
@@ -245,11 +255,19 @@ where
     P: PlacementPolicy,
 {
     pub fn with_policy(pool: Arc<SegmentPool>, policy: P) -> Self {
-        Self { pool, policy }
+        Self {
+            pool,
+            policy,
+            allocator_shard: 0,
+        }
     }
 
     pub const fn pool(&self) -> &Arc<SegmentPool> {
         &self.pool
+    }
+
+    pub(crate) const fn allocator_shard(&self) -> usize {
+        self.allocator_shard
     }
 
     pub fn reserve(&self, request: &PlacementRequest) -> Result<ReservationSet, PlacementError> {
@@ -271,7 +289,11 @@ where
                 continue;
             }
 
-            match self.pool.reserve(&candidate, request.allocation.bytes) {
+            match self.pool.reserve_for_shard(
+                &candidate,
+                self.allocator_shard,
+                request.allocation.bytes,
+            ) {
                 Ok(reservation) => {
                     domains.insert(domain);
                     reservations.push(reservation);
