@@ -2,7 +2,7 @@
 name = "coro-rpc"
 version = "0.1.0"
 edition = "2024"
-description = "Tokio implementation of the yalantinglibs coro_rpc v0 wire protocol"
+description = "Tokio and Compio implementation of the yalantinglibs coro_rpc v0 wire protocol"
 license = "Apache-2.0"
 
 [dependencies]
@@ -14,3 +14,9 @@ thiserror.workspace = true
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["codec", "rt"] }
 tower-service = "0.3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+compio = { version = "0.19.2", default-features = false, features = ["io", "io-uring", "net", "runtime", "sync"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+compio = { version = "0.19.2", default-features = false, features = ["io", "net", "polling", "runtime", "sync"] }

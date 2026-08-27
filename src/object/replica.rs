@@ -1,9 +1,11 @@
 use crate::segment::placement::ReservationSet;
 use crate::segment::{
-    LocalSsdDescriptor, LocalSsdDescriptorRef, LocalSsdLease, ReplicaClass, Reservation,
-    ReservationDescriptor, ReservationDescriptorRef, SegmentId,
+    LocalSsdDescriptor, LocalSsdDescriptorRef, LocalSsdLease, MemoryRegion, RangeDescriptorRef,
+    ReplicaClass, Reservation, ReservationDescriptor, ReservationDescriptorRef, SegmentId,
+    SegmentLiveness, SegmentSpec,
 };
 use std::fmt;
+use std::sync::Weak;
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ReplicaId(u32);
@@ -143,6 +145,112 @@ impl fmt::Debug for LocalSsdReplica {
 pub enum ReplicaLease {
     Direct(DirectReplica),
     LocalSsd(LocalSsdReplica),
+}
+
+/// Immutable replica metadata published with an object version.
+///
+/// Descriptor ingredients are captured once when the version changes, while
+/// the owned wire descriptor is built outside the shard-owner mailbox. Weak
+/// observers let readers reject invalidated segment incarnations without
+/// taking the mutable replica-set lock or retaining allocation resources.
+#[derive(Clone)]
+pub(crate) enum ReplicaSnapshot {
+    Direct {
+        id: ReplicaId,
+        region: MemoryRegion,
+        replica_class: ReplicaClass,
+        segment: Weak<SegmentSpec>,
+        liveness: SegmentLiveness,
+    },
+    LocalSsd {
+        id: ReplicaId,
+        liveness: SegmentLiveness,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) struct ReplicaSnapshotSet {
+    storage: ReplicaSnapshotStorage,
+}
+
+#[derive(Clone)]
+enum ReplicaSnapshotStorage {
+    Empty,
+    One(ReplicaSnapshot),
+    Many(Box<[ReplicaSnapshot]>),
+}
+
+impl ReplicaSnapshot {
+    fn from_lease(replica: &ReplicaLease) -> Self {
+        match replica {
+            ReplicaLease::Direct(replica) => Self::Direct {
+                id: replica.id(),
+                region: replica.reservation.region(),
+                replica_class: replica.replica_class(),
+                segment: replica.reservation.segment_observer(),
+                liveness: replica.reservation.liveness(),
+            },
+            ReplicaLease::LocalSsd(replica) => Self::LocalSsd {
+                id: replica.id(),
+                liveness: replica.lease.liveness(),
+            },
+        }
+    }
+
+    pub(crate) const fn id(&self) -> ReplicaId {
+        match self {
+            Self::Direct { id, .. } | Self::LocalSsd { id, .. } => *id,
+        }
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        match self {
+            Self::Direct { liveness, .. } | Self::LocalSsd { liveness, .. } => liveness.is_live(),
+        }
+    }
+
+    pub(crate) fn owned_direct_descriptor(&self) -> Option<ReservationDescriptor> {
+        match self {
+            Self::Direct {
+                region,
+                replica_class,
+                segment,
+                ..
+            } => {
+                let segment = segment.upgrade()?;
+                let descriptor = RangeDescriptorRef::new(*region, segment.transport()?);
+                match replica_class {
+                    ReplicaClass::Memory => {
+                        Some(ReservationDescriptorRef::Memory(descriptor).to_owned())
+                    }
+                    ReplicaClass::Nof => Some(ReservationDescriptorRef::Nof(descriptor).to_owned()),
+                    ReplicaClass::LocalSsd => None,
+                }
+            }
+            Self::LocalSsd { .. } => None,
+        }
+    }
+}
+
+impl ReplicaSnapshotSet {
+    fn from_leases(replicas: &[ReplicaLease]) -> Self {
+        let storage = match replicas {
+            [] => ReplicaSnapshotStorage::Empty,
+            [replica] => ReplicaSnapshotStorage::One(ReplicaSnapshot::from_lease(replica)),
+            replicas => ReplicaSnapshotStorage::Many(
+                replicas.iter().map(ReplicaSnapshot::from_lease).collect(),
+            ),
+        };
+        Self { storage }
+    }
+
+    pub(crate) fn iter(&self) -> std::slice::Iter<'_, ReplicaSnapshot> {
+        match &self.storage {
+            ReplicaSnapshotStorage::Empty => [].iter(),
+            ReplicaSnapshotStorage::One(replica) => std::slice::from_ref(replica).iter(),
+            ReplicaSnapshotStorage::Many(replicas) => replicas.iter(),
+        }
+    }
 }
 
 impl ReplicaLease {
@@ -298,6 +406,10 @@ impl ReplicaSet {
             ReplicaStorage::One(replica) => std::slice::from_ref(replica),
             ReplicaStorage::Many(replicas) => replicas,
         }
+    }
+
+    pub(crate) fn snapshot(&self) -> ReplicaSnapshotSet {
+        ReplicaSnapshotSet::from_leases(self.replicas())
     }
 
     pub fn len(&self) -> usize {

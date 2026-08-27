@@ -11,8 +11,10 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use bytes::Bytes;
+use compio::io::framed::Framed as CompioFramed;
+use compio::net::{TcpListener as CompioTcpListener, TcpStream as CompioTcpStream};
 use futures_util::stream::FuturesUnordered;
-use futures_util::{FutureExt, Sink, Stream};
+use futures_util::{FutureExt, Sink, Stream, StreamExt};
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 use tokio_util::codec::Framed;
@@ -20,6 +22,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use tower_service::Service;
 
+use crate::compio_transport::{ServerCodec as CompioServerCodec, ServerFramer};
 use crate::error::RpcErrorCode;
 use crate::method::{RpcMethod, RpcNoArgsMethod};
 use crate::protocol::{FrameError, FrameLimits, RequestFrame, ResponseFrame, ServerCodec};
@@ -304,7 +307,7 @@ struct Route {
     handler: Box<dyn ErasedHandler>,
 }
 
-/// Tokio coro_rpc server and typed route registry.
+/// Typed coro_rpc route registry with Tokio and Compio binding paths.
 pub struct RpcServer {
     config: ServerConfig,
     routes: HashMap<u32, Route>,
@@ -445,6 +448,120 @@ impl RpcServer {
     pub async fn serve(self, address: impl ToSocketAddrs) -> io::Result<()> {
         self.bind(address).await?.run().await
     }
+
+    /// Binds a standard listener that can be attached to one Compio runtime
+    /// per metadata shard.
+    pub fn bind_compio(self, address: SocketAddr) -> io::Result<BoundCompioRpcServer> {
+        let listener = std::net::TcpListener::bind(address)?;
+        listener.set_nonblocking(true)?;
+        Ok(BoundCompioRpcServer {
+            listener,
+            config: self.config,
+            routes: Arc::new(self.routes),
+        })
+    }
+}
+
+/// A task factory that is sent to a shard thread and instantiated inside that
+/// thread's local Compio runtime.
+pub type CompioLocalTask =
+    Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = io::Result<()>> + 'static>> + Send + 'static>;
+
+/// A bound Compio listener before it is cloned across shard runtimes.
+pub struct BoundCompioRpcServer {
+    listener: std::net::TcpListener,
+    config: ServerConfig,
+    routes: Arc<HashMap<u32, Route>>,
+}
+
+impl BoundCompioRpcServer {
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// Creates exactly one accept loop for each fixed-owner shard.
+    pub fn into_shard_tasks(self, shard_count: usize) -> io::Result<Vec<CompioLocalTask>> {
+        assert_ne!(shard_count, 0, "Compio RPC requires at least one shard");
+        let mut listeners = Vec::with_capacity(shard_count);
+        listeners.push(self.listener);
+        while listeners.len() < shard_count {
+            listeners.push(listeners[0].try_clone()?);
+        }
+        Ok(listeners
+            .into_iter()
+            .map(|listener| {
+                let routes = self.routes.clone();
+                let config = self.config.clone();
+                Box::new(move || {
+                    Box::pin(run_compio_acceptor(listener, routes, config))
+                        as Pin<Box<dyn Future<Output = io::Result<()>> + 'static>>
+                }) as CompioLocalTask
+            })
+            .collect())
+    }
+}
+
+async fn run_compio_acceptor(
+    listener: std::net::TcpListener,
+    routes: Arc<HashMap<u32, Route>>,
+    config: ServerConfig,
+) -> io::Result<()> {
+    let listener = CompioTcpListener::from_std(listener)?;
+    let mut connections = FuturesUnordered::new();
+    loop {
+        let accepted = listener.accept().fuse();
+        futures_util::pin_mut!(accepted);
+        let accepted = if connections.is_empty() {
+            accepted.await
+        } else {
+            futures_util::select_biased! {
+                accepted = accepted => accepted,
+                finished = connections.next().fuse() => {
+                    log_compio_connection_exit(finished);
+                    continue;
+                }
+            }
+        };
+        let (stream, peer_addr) = accepted?;
+        stream.set_nodelay(config.tcp_nodelay)?;
+        log::debug!(
+            target: SERVER_CONNECTION_LOG_TARGET,
+            peer_addr:% = peer_addr;
+            "accepted RPC connection"
+        );
+        let connection = ServerConnection::new_compio(stream, peer_addr, routes.clone(), &config);
+        connections.push(compio::runtime::spawn(
+            AssertUnwindSafe(connection).catch_unwind(),
+        ));
+    }
+}
+
+type ConnectionRunResult = Result<Result<(), FrameError>, Box<dyn std::any::Any + Send>>;
+type CompioConnectionExit = Option<Result<ConnectionRunResult, compio::runtime::JoinError>>;
+
+fn log_compio_connection_exit(finished: CompioConnectionExit) {
+    match finished {
+        Some(Ok(Ok(Ok(())))) => log::debug!(
+            target: SERVER_CONNECTION_LOG_TARGET,
+            "RPC connection closed"
+        ),
+        Some(Ok(Ok(Err(error)))) => log::warn!(
+            target: SERVER_CONNECTION_LOG_TARGET,
+            error:% = error;
+            "RPC connection failed"
+        ),
+        Some(Ok(Err(panic))) => log::error!(
+            target: SERVER_CONNECTION_LOG_TARGET,
+            panic_message = panic_message(&panic);
+            "RPC connection task panicked"
+        ),
+        Some(Err(error)) => log::error!(
+            target: SERVER_CONNECTION_LOG_TARGET,
+            error:% = error;
+            "RPC connection task failed"
+        ),
+        None => {}
+    }
 }
 
 /// A bound server, useful for discovering an OS-assigned port before serving.
@@ -492,7 +609,7 @@ impl BoundRpcServer {
                         peer_addr:% = peer_addr;
                         "accepted RPC connection"
                     );
-                    let connection = ServerConnection::new(
+                    let connection = ServerConnection::new_tokio(
                         stream,
                         peer_addr,
                         self.routes.clone(),
@@ -721,8 +838,17 @@ impl Service<RequestFrame> for RpcService {
     }
 }
 
-struct ServerConnection {
-    transport: Framed<TcpStream, ServerCodec>,
+type TokioServerTransport = Framed<TcpStream, ServerCodec>;
+type CompioServerTransport = CompioFramed<
+    CompioTcpStream,
+    CompioTcpStream,
+    CompioServerCodec,
+    ServerFramer,
+    ResponseFrame,
+    RequestFrame,
+>;
+struct ServerConnection<T> {
+    transport: T,
     service: RpcService,
     in_flight: FuturesUnordered<ResponseFuture>,
     pending_responses: VecDeque<ResponseFrame>,
@@ -731,15 +857,47 @@ struct ServerConnection {
     read_closed: bool,
 }
 
-impl ServerConnection {
-    fn new(
+impl ServerConnection<TokioServerTransport> {
+    fn new_tokio(
         stream: TcpStream,
         peer_addr: SocketAddr,
         routes: Arc<HashMap<u32, Route>>,
         config: &ServerConfig,
     ) -> Self {
+        Self::with_transport(
+            Framed::new(stream, ServerCodec::new(config.frame_limits)),
+            peer_addr,
+            routes,
+            config,
+        )
+    }
+}
+
+impl ServerConnection<CompioServerTransport> {
+    fn new_compio(
+        stream: CompioTcpStream,
+        peer_addr: SocketAddr,
+        routes: Arc<HashMap<u32, Route>>,
+        config: &ServerConfig,
+    ) -> Self {
+        let transport = CompioFramed::new::<ResponseFrame, RequestFrame>(
+            CompioServerCodec,
+            ServerFramer::new(config.frame_limits),
+        )
+        .with_duplex(stream);
+        Self::with_transport(transport, peer_addr, routes, config)
+    }
+}
+
+impl<T> ServerConnection<T> {
+    fn with_transport(
+        transport: T,
+        peer_addr: SocketAddr,
+        routes: Arc<HashMap<u32, Route>>,
+        config: &ServerConfig,
+    ) -> Self {
         Self {
-            transport: Framed::new(stream, ServerCodec::new(config.frame_limits)),
+            transport,
             service: RpcService {
                 peer_addr,
                 routes,
@@ -760,7 +918,12 @@ impl ServerConnection {
     }
 }
 
-impl Future for ServerConnection {
+impl<T> Future for ServerConnection<T>
+where
+    T: Stream<Item = Result<RequestFrame, FrameError>>
+        + Sink<ResponseFrame, Error = FrameError>
+        + Unpin,
+{
     type Output = Result<(), FrameError>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {

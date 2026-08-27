@@ -84,6 +84,7 @@ pub struct ObjectCatalogConfig {
     pub(super) default_soft_pin_ttl_ticks: u64,
     pub(super) max_soft_pin_ttl_ticks: u64,
     pub(super) allow_evict_soft_pinned_objects: bool,
+    pub(super) shard_local: bool,
 }
 
 impl ObjectCatalogConfig {
@@ -98,7 +99,16 @@ impl ObjectCatalogConfig {
             default_soft_pin_ttl_ticks: DEFAULT_SOFT_PIN_TTL_TICKS,
             max_soft_pin_ttl_ticks: DEFAULT_MAX_SOFT_PIN_TTL_TICKS,
             allow_evict_soft_pinned_objects: DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS,
+            shard_local: false,
         }
+    }
+
+    pub(crate) fn split_for_shards(mut self, shard_count: usize) -> Self {
+        debug_assert_ne!(shard_count, 0);
+        self.expected_objects = self.expected_objects.div_ceil(shard_count);
+        self.max_retired_bytes = self.max_retired_bytes.div_ceil(shard_count as u64);
+        self.shard_local = true;
+        self
     }
 
     pub const fn with_lease(mut self, ttl_ticks: u64, refresh_ticks: u64) -> Self {

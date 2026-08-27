@@ -24,9 +24,11 @@ thiserror = "2"
 
 [dependencies]
 arc-swap = "1.9"
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 coro-rpc = { path = "crates/coro-rpc" }
 crossbeam-queue = "0.3"
+core_affinity = "0.8"
 futures-util = "0.3"
 log.workspace = true
 logforth = { version = "0.30", features = ["append-async", "append-file", "bridge-log", "filter-rustlog", "layout-text"] }
@@ -37,6 +39,12 @@ regex = "1"
 scc = "3.8"
 thiserror.workspace = true
 tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+compio = { version = "0.19.2", default-features = false, features = ["io", "io-uring", "net", "runtime", "signal", "sync", "time"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
+compio = { version = "0.19.2", default-features = false, features = ["io", "net", "polling", "runtime", "signal", "sync", "time"] }
 
 [build-dependencies]
 coro-rpc-codegen = { path = "crates/coro-rpc-codegen" }

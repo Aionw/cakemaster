@@ -32,8 +32,11 @@ pub struct ObjectManager {
 /// Narrow capability for revoking pending writes after their sessions fence.
 #[derive(Clone)]
 pub struct PendingWriteRevoker {
-    catalog: ObjectCatalog,
+    revoke: Arc<RevokePendingWrites>,
 }
+
+type RevokePendingWrites =
+    dyn Fn(&[crate::client::ClientSession], CatalogTick) -> usize + Send + Sync;
 
 impl PendingWriteRevoker {
     /// Revokes pending writes for multiple fenced sessions with one catalog
@@ -43,8 +46,16 @@ impl PendingWriteRevoker {
         sessions: impl IntoIterator<Item = crate::client::ClientSession>,
         now: CatalogTick,
     ) -> usize {
-        self.catalog
-            .revoke_pending_owners(sessions.into_iter().map(WriteOwner::for_session), now)
+        let sessions = sessions.into_iter().collect::<Vec<_>>();
+        (self.revoke)(&sessions, now)
+    }
+
+    pub(crate) fn from_fn(
+        revoke: impl Fn(&[crate::client::ClientSession], CatalogTick) -> usize + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            revoke: Arc::new(revoke),
+        }
     }
 }
 
@@ -195,6 +206,21 @@ impl ObjectManager {
         Self::with_optional_eviction(pool, config, Some(MemoryEvictionController::new(eviction)))
     }
 
+    pub(crate) fn for_shard(
+        pool: Arc<SegmentPool>,
+        config: ObjectCatalogConfig,
+        eviction: MemoryEvictionConfig,
+        allocator_shard: usize,
+    ) -> Result<Self, ObjectCatalogConfigError> {
+        let observed_segment_epoch = pool.invalidation_epoch();
+        Ok(Self {
+            catalog: ObjectCatalog::with_config(config)?,
+            allocator: ReplicaAllocator::for_shard(pool, allocator_shard),
+            observed_segment_epoch: AtomicU64::new(observed_segment_epoch),
+            memory_eviction: Some(MemoryEvictionController::new(eviction)),
+        })
+    }
+
     fn with_optional_eviction(
         pool: Arc<SegmentPool>,
         config: ObjectCatalogConfig,
@@ -214,13 +240,25 @@ impl ObjectManager {
     }
 
     pub fn pending_write_revoker(&self) -> PendingWriteRevoker {
-        PendingWriteRevoker {
-            catalog: self.catalog.clone(),
-        }
+        let catalog = self.catalog.clone();
+        PendingWriteRevoker::from_fn(move |sessions, now| {
+            catalog
+                .revoke_pending_owners(sessions.iter().copied().map(WriteOwner::for_session), now)
+        })
+    }
+
+    pub(crate) fn revoke_pending_owners(&self, owners: &[WriteOwner], now: CatalogTick) -> usize {
+        self.catalog
+            .revoke_pending_owners(owners.iter().copied(), now)
     }
 
     pub fn pool(&self) -> &Arc<SegmentPool> {
         self.allocator.pool()
+    }
+
+    fn memory_space(&self) -> crate::segment::stats::ReplicaClassSpaceStats {
+        self.pool()
+            .space_for_shard(ReplicaClass::Memory, self.allocator.allocator_shard())
     }
 
     /// Returns production memory-eviction diagnostics when the controller is enabled.
@@ -584,18 +622,9 @@ impl ObjectManager {
                     now,
                     budget,
                     targets,
-                    || {
-                        eviction.prepare_step(
-                            self.pool().space_for(ReplicaClass::Memory),
-                            self.catalog.stats(),
-                        )
-                    },
+                    || eviction.prepare_step(self.memory_space(), self.catalog.stats()),
                     |report| {
-                        eviction.finish_step(
-                            self.pool().space_for(ReplicaClass::Memory),
-                            self.catalog.stats(),
-                            report,
-                        );
+                        eviction.finish_step(self.memory_space(), self.catalog.stats(), report);
                     },
                 );
                 if report.busy {
@@ -649,11 +678,11 @@ impl ObjectManager {
             return None;
         };
         let generation = eviction.request_allocation_reclaim(shortfall.reclaim_bytes);
-        let before = self.pool().space_for(ReplicaClass::Memory);
+        let before = self.memory_space();
         let report = self
             .maintenance(now, eviction.config().allocation_failure_budget())
             .catalog;
-        let after = self.pool().space_for(ReplicaClass::Memory);
+        let after = self.memory_space();
         let should_retry = !report.busy
             && after.largest_free_region_bytes >= shortfall.allocation_bytes
             && (report.reclaimed_memory_bytes != 0

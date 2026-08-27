@@ -21,12 +21,13 @@ pub use descriptor::{
     ReservationDescriptor, ReservationDescriptorRef,
 };
 pub use identity::{ClientId, SegmentId, SegmentIdentity};
+pub(crate) use lifetime::SegmentLiveness;
 pub use local_ssd::{LocalSsdLease, LocalSsdStats, OffloadPermit};
-pub(crate) use pool::SegmentIncarnation;
 pub use pool::{
     AttachOutcome, DirectCandidate, OffloadSnapshot, OffloadTarget, PoolSnapshot,
     ReplicaClassCapacity, SegmentHandle, SegmentPool,
 };
+pub(crate) use pool::{SegmentExtentTransfer, SegmentIncarnation, SegmentTopologyEvent};
 pub use reservation::Reservation;
 pub use spec::{
     CxlArenaId, CxlArenaSpec, ReplicaClass, SegmentKind, SegmentResourceId, SegmentSpec,

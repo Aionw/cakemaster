@@ -11,7 +11,6 @@ use cakemaster::server::{MasterReconcileConfig, MooncakeServerConfig};
 use std::error::Error;
 use std::net::SocketAddr;
 use std::time::Duration;
-use tokio::runtime::Builder;
 
 const DEFAULT_ADDRESS: &str = "127.0.0.1:19094";
 const DEFAULT_THREADS: usize = 8;
@@ -32,7 +31,7 @@ const BENCHMARK_CLIENTS: [ClientId; 4] = [
 
 #[derive(Clone, Copy)]
 struct Arguments {
-    threads: usize,
+    metadata_shards: usize,
     segment_bytes: u64,
     expected_objects: usize,
     max_allocations: u32,
@@ -43,8 +42,9 @@ struct Arguments {
 fn main() -> Result<(), Box<dyn Error>> {
     let mut values = std::env::args().skip(1);
     let address = values.next().unwrap_or_else(|| DEFAULT_ADDRESS.to_owned());
+    let metadata_shards = parse_or(values.next(), DEFAULT_THREADS)?.max(1);
     let arguments = Arguments {
-        threads: parse_or(values.next(), DEFAULT_THREADS)?.max(1),
+        metadata_shards,
         segment_bytes: parse_or(values.next(), DEFAULT_SEGMENT_BYTES)?,
         expected_objects: parse_or(values.next(), DEFAULT_EXPECTED_OBJECTS)?.max(1),
         max_allocations: parse_or(values.next(), DEFAULT_MAX_ALLOCATIONS)?,
@@ -53,11 +53,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     };
     validate(arguments)?;
 
-    Builder::new_multi_thread()
-        .worker_threads(arguments.threads)
-        .enable_all()
-        .build()?
-        .block_on(run_server(&address, arguments))
+    compio::runtime::Runtime::new()?.block_on(run_server(&address, arguments))
 }
 
 async fn run_server(address: &str, arguments: Arguments) -> Result<(), Box<dyn Error>> {
@@ -70,6 +66,7 @@ async fn run_server(address: &str, arguments: Arguments) -> Result<(), Box<dyn E
         .with_listen_addr(listen_addr)
         .with_segment_pool(SegmentPoolConfig::new(arguments.max_allocations))
         .with_object_catalog(ObjectCatalogConfig::new(arguments.expected_objects))
+        .with_metadata_shards(arguments.metadata_shards)
         .with_memory_eviction(memory_eviction)
         .with_client_lifecycle(
             ClientLifecycleConfig::new(BENCHMARK_CLIENTS.len())
@@ -100,9 +97,9 @@ async fn run_server(address: &str, arguments: Arguments) -> Result<(), Box<dyn E
     let manager = composition.manager().clone();
     let bound = composition.bind().await?;
     println!(
-        "object_catalog_rpc_server_ready={} threads={} segment_bytes={} expected_objects={} high_watermark={:.3} low_watermark={:.3} reconcile_interval_ms={}",
+        "object_catalog_rpc_server_ready={} runtime=compio metadata_shards={} segment_bytes={} expected_objects={} high_watermark={:.3} low_watermark={:.3} reconcile_interval_ms={}",
         bound.local_addr()?,
-        arguments.threads,
+        arguments.metadata_shards,
         arguments.segment_bytes,
         arguments.expected_objects,
         arguments.high_watermark,
@@ -111,11 +108,22 @@ async fn run_server(address: &str, arguments: Arguments) -> Result<(), Box<dyn E
     );
     bound
         .run_until(async {
-            let _ = tokio::signal::ctrl_c().await;
+            let _ = compio::signal::ctrl_c().await;
         })
         .await?;
 
-    let catalog = manager.catalog().stats();
+    let catalog = manager.catalog_stats();
+    let shard_stats = manager.shard_stats();
+    let minimum_shard_objects = shard_stats
+        .iter()
+        .map(|shard| shard.catalog.published_objects)
+        .min()
+        .unwrap_or(0);
+    let maximum_shard_objects = shard_stats
+        .iter()
+        .map(|shard| shard.catalog.published_objects)
+        .max()
+        .unwrap_or(0);
     let space = candidate.stats().space;
     let eviction = manager
         .memory_eviction_stats()
@@ -127,8 +135,10 @@ async fn run_server(address: &str, arguments: Arguments) -> Result<(), Box<dyn E
         && catalog.reclaim_debt == 0
         && catalog.retired_bytes == 0;
     println!(
-        "object_catalog_rpc_server_final published_objects={} pending_bytes={} live_bytes={} retired_bytes={} reclaim_debt={} requested_reclaim_debt={} allocation_reclaim_debt={} watermark_reclaim_debt={} capacity_bytes={} used_bytes={} used_ratio={:.6} high_watermark_bytes={} low_watermark_bytes={} maximum_used_bytes={} maximum_used_ratio={:.6} watermark_triggered={} settled_to_low={} trigger_events={} controller_steps={} busy_steps={} controller_retired_objects={} controller_retired_bytes={} controller_reclaimed_objects={} controller_reclaimed_bytes={} allocation_failures={} allocation_retries={} allocation_retry_successes={} wakeups={}",
+        "object_catalog_rpc_server_final published_objects={} minimum_shard_objects={} maximum_shard_objects={} pending_bytes={} live_bytes={} retired_bytes={} reclaim_debt={} requested_reclaim_debt={} allocation_reclaim_debt={} watermark_reclaim_debt={} capacity_bytes={} used_bytes={} used_ratio={:.6} high_watermark_bytes={} low_watermark_bytes={} maximum_used_bytes={} maximum_used_ratio={:.6} watermark_triggered={} settled_to_low={} trigger_events={} controller_steps={} busy_steps={} controller_retired_objects={} controller_retired_bytes={} controller_reclaimed_objects={} controller_reclaimed_bytes={} allocation_failures={} allocation_retries={} allocation_retry_successes={} wakeups={}",
         catalog.published_objects,
+        minimum_shard_objects,
+        maximum_shard_objects,
         catalog.pending_bytes,
         catalog.live_bytes,
         catalog.retired_bytes,

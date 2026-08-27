@@ -104,7 +104,7 @@ async fn production_logs_correlate_transport_and_business_failures() {
     assert!(stderr.contains("sequence=0"));
     assert!(stderr.contains("method=mooncake::WrappedMasterService::MountSegment"));
     assert!(stderr.contains("RPC connection failed"));
-    assert!(stderr.contains("connection closed with 3 bytes of an incomplete coro_rpc frame"));
+    assert!(stderr.contains("invalid magic 66"));
     assert!(stderr.contains("client lifecycle state changed"));
     assert!(stderr.contains("generation=1"));
     assert!(stderr.contains("old_state=absent"));

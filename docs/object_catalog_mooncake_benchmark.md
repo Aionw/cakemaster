@@ -4,6 +4,75 @@
 > `interop/mooncake_benchmark.cpp` 已随主线契约升级到 `5c0724d`；下面先记录基于
 > per-key MVCC `main` 的当前重实现，再保留 PR #19 原实现和更早的历史对比。
 
+## Fixed-owner sharding A/B（2026-08-27，Apple M5）
+
+这一组专门隔离 Issue #25 阶段一的 ownership sharding：baseline 是未修改的 PR #24
+提交 `c2f649619b5b0871c491c328c45d4581fd909b8c`，候选版本保留 8 个 Tokio worker，
+在其后增加 8 个 fixed-owner metadata thread；每个 shard 独占 catalog、collector、
+eviction、SegmentPool 和 allocator extent，完全空闲的 extent 只通过消息转移。两边都
+使用同一个 `-O3` C++ client、同一个 1:1:1 workload 和同一台
+10-core Apple M5；未绑 client/server 到互斥 CPU，Rust 为 1.95.0。
+
+每轮使用 115,056,180-byte Memory segment、1 KiB object、100K prefill、50K hot set、
+0.90/0.85 watermark、batch size 333，预热 3 秒后测量 10 秒。三类操作各 600 batch
+QPS，总计 1,800 logical batch/s、约 599.4K item/s。两边三轮均完成全部 1,998,000
+Put key，Get/Exist 全 hit、零业务错误，并实际越过 high watermark、持续物理 reclaim。
+下表取三轮中位数：
+
+| 操作 | 指标 | PR #24 baseline | 阶段一初版 | 当前 lock-shrunk | 当前相对阶段一 |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Put transaction | p50 | 764.958 us | 998.958 us | 1,160.041 us | +16.1% |
+| Put transaction | p99 | 1,719.500 us | 1,478.166 us | 1,652.750 us | +11.8% |
+| Put transaction | p99.9 | 6,412.000 us | 3,362.208 us | 2,136.333 us | -36.5% |
+| Get | p50 | 366.167 us | 392.125 us | 487.417 us | +24.3% |
+| Get | p99 | 1,313.833 us | 777.084 us | 925.166 us | +19.1% |
+| Get | p99.9 | 4,884.917 us | 1,872.125 us | 1,099.375 us | -41.3% |
+| Exist | p50 | 345.459 us | 304.791 us | 282.708 us | -7.2% |
+| Exist | p99 | 1,117.750 us | 711.709 us | 656.084 us | -7.8% |
+| Exist | p99.9 | 4,459.667 us | 1,677.167 us | 820.791 us | -51.1% |
+
+fixed-rate 吞吐相同，因为三个版本都完整跟上目标；当前版本的三轮中位数为
+599,414 item/s，scheduled-late request 中位数为 316。相对阶段一初版，当前版本用
+shard-local collector gate、atomic segment state、lock-free extent owner snapshot 和
+版本内嵌的 immutable replica snapshot 继续收掉 owner-thread 内无意义的同步。结果不是
+所有分位单向改善：Put/Get p50 与 p99 回退，但三类 p99.9 分别下降 36.5%/41.3%/51.1%，
+Exist p50/p99 也分别下降 7.2%/7.8%。相对 PR #24 baseline，当前三类 p99.9 下降
+66.7%/77.5%/81.6%。每轮结束时各 shard 的 published object 最大/最小差仍约 0%–5.6%。
+
+额外的 1,200 batch QPS/类单轮压力点用于找容量方向：baseline、阶段一初版和当前版本
+都在 10 秒内完成目标，当前版本为 1,198,815 item/s，scheduled-late request 从阶段一
+初版的 1,871 降到 44。当前 Put/Get/Exist p99 分别为 716/419/373 us。这个压力点仍是
+未绑核桌面环境的单轮结果，不适合外推稳定尾延迟。这说明当前 M5 上的阶段一实现
+显著改善中高负载尾延迟和 collector/allocator 争用，同时把这一压力点吞吐恢复到
+baseline 水平，但尚未证明提高了极限吞吐；不能把它外推为 Issue #25 使用的
+Ryzen 9700X、16 client workers/segment、PR #3147 open-loop workload 验收结果。该验收
+仍需在原 Linux 机器上做 30 秒 factor sweep、三轮最大通过点和 5 分钟稳定性测试。
+
+### End-to-end Compio shard runtime（2026-08-27）
+
+最初的 Compio prototype 把连接放在一组 Compio worker、metadata 放在另一组 owner
+thread，RPC 必须经历跨线程 decode → mailbox → oneshot → encode；它并不是 thread-per-core
+shared nothing。当前实现删除这组双 runtime：每个 fixed-owner shard thread 自己运行 Compio
+runtime，并同时承载 listener accept、connection driver、`ObjectManager`、local
+`SegmentPool`/allocator 和 reconciler。原生 Compio framer 复用连接读写 buffer，不经过
+Tokio compatibility adapter，也不为每个 RPC spawn task。
+
+在与上节相同的 Apple M5、8 shard、599.4K item/s workload 下，使用最终 shared-nothing
+代码和保存的 Tokio transport binary 交错各跑三轮。下表取中位数：
+
+| 操作 | Compio p50 / p99 / p99.9 | Tokio p50 / p99 / p99.9 | Compio 相对 Tokio |
+| --- | ---: | ---: | ---: |
+| Put transaction | 1,172.125 / 1,715.334 / 2,090.750 us | 1,158.583 / 1,676.750 / 2,070.834 us | +1.2% / +2.3% / +1.0% |
+| Get | 591.875 / 1,009.125 / 1,194.250 us | 487.959 / 913.458 / 1,175.667 us | +21.3% / +10.5% / +1.6% |
+| Exist | 366.959 / 668.833 / 880.000 us | 301.416 / 652.791 / 893.667 us | +21.7% / +2.5% / -1.5% |
+
+两者中位吞吐同为 599,413 item/s；scheduled-late request 为 416 vs 412，最大 scheduler
+lag 中位数为 1.810 ms vs 2.949 ms。相对错误的双线程池 Compio prototype，当前 Put/Get/
+Exist p99.9 分别下降 76.4%/81.7%/85.3%，异常长尾已消失；但 macOS polling backend 下
+Get/Exist p50 仍比 Tokio 高约 21%，所以这组结果证明的是架构修正和尾延迟恢复，不是
+Compio 的绝对性能领先。Linux production 会使用 io_uring backend，仍需在 Issue #25 的
+Ryzen 9700X 环境做同口径三轮和 5 分钟稳定性验证，不能从 macOS 结果外推收益。
+
 ## Production Master 最大吞吐与 1 秒 p99 边界（2026-08-27）
 
 这一组使用 Mooncake

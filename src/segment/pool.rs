@@ -4,6 +4,7 @@ mod resource;
 
 use self::catalog::Catalog;
 use self::entry::SegmentEntry;
+use self::resource::TransferableExtent;
 use super::config::{
     MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE, MIN_ALLOCATOR_NODES_PER_SEGMENT, SegmentPoolConfig,
 };
@@ -21,7 +22,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -31,6 +32,47 @@ pub struct SegmentPool {
     catalog: RwLock<Catalog>,
     direct_capacity_epoch: AtomicU64,
     invalidation_epoch: AtomicU64,
+    topology_sink: OnceLock<SegmentTopologySink>,
+}
+
+type SegmentTopologySink = Arc<dyn Fn(SegmentTopologyEvent) + Send + Sync>;
+
+#[derive(Clone, Debug)]
+pub(crate) enum SegmentTopologyEvent {
+    Attach {
+        spec: SegmentSpec,
+        state: crate::segment::stats::SegmentState,
+    },
+    ReportLocalSsdCapacity {
+        owner: ClientId,
+        id: SegmentId,
+        capacity_bytes: u64,
+    },
+    SetLocalSsdOffloadEnabled {
+        owner: ClientId,
+        id: SegmentId,
+        enabled: bool,
+    },
+    Quiesce {
+        owner: ClientId,
+        id: SegmentId,
+    },
+    Reactivate {
+        owner: ClientId,
+        ids: Vec<SegmentId>,
+    },
+    Remove {
+        owner: ClientId,
+        id: SegmentId,
+    },
+    InvalidateOwners {
+        owners: Vec<ClientId>,
+    },
+}
+
+pub(crate) struct SegmentExtentTransfer {
+    segment: SegmentId,
+    extent: TransferableExtent,
 }
 
 /// Metadata and runtime-state handle for one logical segment.
@@ -278,9 +320,17 @@ impl SegmentPool {
         let max_nodes = config.max_allocator_nodes_per_segment;
         if !(MIN_ALLOCATOR_NODES_PER_SEGMENT..MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE)
             .contains(&max_nodes)
+            || config.allocator_shards == 0
+            || usize::try_from(max_nodes).unwrap_or(usize::MAX)
+                / (MIN_ALLOCATOR_NODES_PER_SEGMENT as usize)
+                < config.allocator_shards
+            || config
+                .allocator_shard_index
+                .is_some_and(|index| index >= config.allocator_shards)
         {
             return Err(PoolConfigError {
                 max_allocator_nodes_per_segment: max_nodes,
+                allocator_shards: config.allocator_shards,
             });
         }
 
@@ -291,14 +341,59 @@ impl SegmentPool {
             catalog: RwLock::new(Catalog::new(pool_id)),
             direct_capacity_epoch: AtomicU64::new(0),
             invalidation_epoch: AtomicU64::new(0),
+            topology_sink: OnceLock::new(),
         })
+    }
+
+    pub(crate) const fn config(&self) -> SegmentPoolConfig {
+        self.config
+    }
+
+    pub(crate) const fn instance_id(&self) -> u64 {
+        self.pool_id
+    }
+
+    /// Installs the single production topology mirror. Initial state is sent
+    /// before the method returns, and every later mutation is published only
+    /// after the control catalog has committed it.
+    pub(crate) fn install_topology_sink(
+        &self,
+        sink: impl Fn(SegmentTopologyEvent) + Send + Sync + 'static,
+    ) {
+        let sink: SegmentTopologySink = Arc::new(sink);
+        assert!(
+            self.topology_sink.set(sink.clone()).is_ok(),
+            "segment topology sink is installed once"
+        );
+        for event in self.catalog.read().topology_events() {
+            sink(event);
+        }
+    }
+
+    fn publish_topology(&self, event: SegmentTopologyEvent) {
+        if let Some(sink) = self.topology_sink.get() {
+            sink(event);
+        }
     }
 
     pub fn attach(&self, spec: SegmentSpec) -> Result<AttachOutcome, AttachError> {
         validate_spec(&spec)?;
-        self.update_direct_catalog(|catalog| {
-            catalog.attach(spec, self.config.max_allocator_nodes_per_segment)
-        })
+        let event_spec = spec.clone();
+        let outcome = self.update_direct_catalog(|catalog| {
+            catalog.attach(
+                spec,
+                self.config.max_allocator_nodes_per_segment,
+                self.config.allocator_shards,
+                self.config.allocator_shard_index,
+            )
+        })?;
+        if outcome.is_new() {
+            self.publish_topology(SegmentTopologyEvent::Attach {
+                spec: event_spec,
+                state: crate::segment::stats::SegmentState::Accepting,
+            });
+        }
+        Ok(outcome)
     }
 
     /// Attaches a new segment without publishing it to accepting snapshots.
@@ -307,15 +402,28 @@ impl SegmentPool {
         validate_spec(&spec)?;
         let owner = spec.identity().owner();
         let id = spec.identity().id();
-        self.update_direct_catalog(|catalog| {
-            let outcome = catalog.attach(spec, self.config.max_allocator_nodes_per_segment)?;
+        let event_spec = spec.clone();
+        let outcome = self.update_direct_catalog(|catalog| {
+            let outcome = catalog.attach(
+                spec,
+                self.config.max_allocator_nodes_per_segment,
+                self.config.allocator_shards,
+                self.config.allocator_shard_index,
+            )?;
             if outcome.is_new() {
                 catalog
                     .quiesce(owner, id)
                     .expect("a newly attached segment remains owned while catalog-locked");
             }
             Ok(outcome)
-        })
+        })?;
+        if outcome.is_new() {
+            self.publish_topology(SegmentTopologyEvent::Attach {
+                spec: event_spec,
+                state: crate::segment::stats::SegmentState::Quiesced,
+            });
+        }
+        Ok(outcome)
     }
 
     pub fn snapshot(&self) -> PoolSnapshot {
@@ -348,6 +456,16 @@ impl SegmentPool {
     /// placement-state transition cannot create a false memory-pressure spike.
     pub fn space_for(&self, replica_class: ReplicaClass) -> ReplicaClassSpaceStats {
         self.catalog.read().space_for(replica_class)
+    }
+
+    pub(crate) fn space_for_shard(
+        &self,
+        replica_class: ReplicaClass,
+        allocator_shard: usize,
+    ) -> ReplicaClassSpaceStats {
+        self.catalog
+            .read()
+            .space_for_shard(replica_class, Some(allocator_shard))
     }
 
     /// Cheap change token for callers that cache accepting capacities.
@@ -387,10 +505,20 @@ impl SegmentPool {
         candidate: &DirectCandidate,
         bytes: u64,
     ) -> Result<Reservation, ReserveError> {
+        self.reserve_for_shard(candidate, 0, bytes)
+    }
+
+    #[inline]
+    pub(crate) fn reserve_for_shard(
+        &self,
+        candidate: &DirectCandidate,
+        allocator_shard: usize,
+        bytes: u64,
+    ) -> Result<Reservation, ReserveError> {
         if candidate.pool_id != self.pool_id {
             return Err(ReserveError::ForeignCandidate);
         }
-        candidate.entry.reserve(bytes)
+        candidate.entry.reserve(allocator_shard, bytes)
     }
 
     pub fn reserve_on(&self, id: SegmentId, bytes: u64) -> Result<Reservation, ReserveError> {
@@ -404,6 +532,25 @@ impl SegmentPool {
         self.reserve(&candidate, bytes)
     }
 
+    pub(crate) fn take_empty_extent(
+        &self,
+        replica_class: ReplicaClass,
+        allocator_shard: usize,
+        minimum_bytes: u64,
+    ) -> Option<SegmentExtentTransfer> {
+        self.catalog
+            .read()
+            .take_empty_extent(replica_class, allocator_shard, minimum_bytes)
+            .map(|(segment, extent)| SegmentExtentTransfer { segment, extent })
+    }
+
+    pub(crate) fn add_extent(&self, allocator_shard: usize, transfer: SegmentExtentTransfer) {
+        self.catalog
+            .read()
+            .add_extent(transfer.segment, allocator_shard, transfer.extent);
+        self.direct_capacity_epoch.fetch_add(1, Ordering::Release);
+    }
+
     pub fn report_local_ssd_capacity(
         &self,
         owner: ClientId,
@@ -412,7 +559,13 @@ impl SegmentPool {
     ) -> Result<(), LocalSsdError> {
         self.catalog
             .read()
-            .report_local_ssd_capacity(owner, id, capacity_bytes)
+            .report_local_ssd_capacity(owner, id, capacity_bytes)?;
+        self.publish_topology(SegmentTopologyEvent::ReportLocalSsdCapacity {
+            owner,
+            id,
+            capacity_bytes,
+        });
+        Ok(())
     }
 
     pub fn set_local_ssd_offload_enabled(
@@ -423,7 +576,13 @@ impl SegmentPool {
     ) -> Result<(), LocalSsdError> {
         self.catalog
             .write()
-            .set_local_ssd_offload_enabled(owner, id, enabled)
+            .set_local_ssd_offload_enabled(owner, id, enabled)?;
+        self.publish_topology(SegmentTopologyEvent::SetLocalSsdOffloadEnabled {
+            owner,
+            id,
+            enabled,
+        });
+        Ok(())
     }
 
     pub fn admit_offload(
@@ -438,11 +597,18 @@ impl SegmentPool {
     }
 
     pub fn quiesce(&self, owner: ClientId, id: SegmentId) -> Result<(), SegmentStateError> {
-        self.update_direct_catalog(|catalog| catalog.quiesce(owner, id))
+        self.update_direct_catalog(|catalog| catalog.quiesce(owner, id))?;
+        self.publish_topology(SegmentTopologyEvent::Quiesce { owner, id });
+        Ok(())
     }
 
     pub fn reactivate(&self, owner: ClientId, id: SegmentId) -> Result<(), SegmentStateError> {
-        self.update_direct_catalog(|catalog| catalog.reactivate(owner, id))
+        self.update_direct_catalog(|catalog| catalog.reactivate(owner, id))?;
+        self.publish_topology(SegmentTopologyEvent::Reactivate {
+            owner,
+            ids: vec![id],
+        });
+        Ok(())
     }
 
     /// Validates ownership for the whole batch before publishing any segment.
@@ -454,12 +620,18 @@ impl SegmentPool {
         if ids.is_empty() {
             return Ok(());
         }
-        self.update_direct_catalog(|catalog| catalog.reactivate_many(owner, ids))
+        self.update_direct_catalog(|catalog| catalog.reactivate_many(owner, ids))?;
+        self.publish_topology(SegmentTopologyEvent::Reactivate {
+            owner,
+            ids: ids.to_vec(),
+        });
+        Ok(())
     }
 
     pub fn remove(&self, owner: ClientId, id: SegmentId) -> Result<(), SegmentStateError> {
         self.update_direct_catalog(|catalog| catalog.remove(owner, id))?;
         self.invalidation_epoch.fetch_add(1, Ordering::Release);
+        self.publish_topology(SegmentTopologyEvent::Remove { owner, id });
         Ok(())
     }
 
@@ -474,10 +646,15 @@ impl SegmentPool {
     /// Invalidates many owners under one catalog lock and publishes one new
     /// placement snapshot. Duplicate and already-cleaned owners are ignored.
     pub fn invalidate_owners(&self, owners: impl IntoIterator<Item = ClientId>) -> usize {
-        let invalidated = self.catalog.write().invalidate_owners(owners);
+        let owners = owners.into_iter().collect::<Vec<_>>();
+        let invalidated = self
+            .catalog
+            .write()
+            .invalidate_owners(owners.iter().copied());
         if invalidated != 0 {
             self.direct_capacity_epoch.fetch_add(1, Ordering::Release);
             self.invalidation_epoch.fetch_add(1, Ordering::Release);
+            self.publish_topology(SegmentTopologyEvent::InvalidateOwners { owners });
         }
         invalidated
     }

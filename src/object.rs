@@ -44,6 +44,7 @@ pub use manager::{
 };
 pub use reclamation::ReclaimFilter;
 pub use replica::{DirectReplica, LocalSsdReplica, ReplicaId, ReplicaLease, ReplicaSet};
+pub(crate) use replica::{ReplicaSnapshot, ReplicaSnapshotSet};
 pub use tenant::{
     ResolvedTenant, TenantAdminError, TenantCatalog, TenantConfig, TenantConfigError,
     TenantGetError, TenantId, TenantIdError, TenantObjectError, TenantObjectManager,

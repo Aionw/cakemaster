@@ -82,6 +82,16 @@ impl WriteAdmission {
         }
     }
 
+    /// Rebuilds an admission from a copied owner identity after an actor
+    /// boundary. The receiving shard is responsible for fencing inactive
+    /// session generations before using it.
+    pub(crate) const fn from_owner(owner: WriteOwner) -> Self {
+        Self {
+            owner,
+            session_guard: None,
+        }
+    }
+
     pub const fn owner(&self) -> WriteOwner {
         self.owner
     }

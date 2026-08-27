@@ -18,6 +18,7 @@ struct SharedAllocator {
     state: Mutex<AllocatorState>,
     quantum_shift: u32,
     managed_capacity: u64,
+    base_offset: u64,
     /// Conservative upper bound for the largest request the binning algorithm
     /// can currently satisfy. A stale high value only takes the slow path;
     /// allocation failures tighten it while frees raise it as needed.
@@ -58,7 +59,12 @@ pub(crate) struct AllocatorStats {
 }
 
 impl ByteAllocator {
+    #[cfg(test)]
     pub(crate) fn new(capacity: u64, max_allocator_nodes: u32) -> Self {
+        Self::new_at(0, capacity, max_allocator_nodes)
+    }
+
+    pub(crate) fn new_at(base_offset: u64, capacity: u64, max_allocator_nodes: u32) -> Self {
         debug_assert_ne!(capacity, 0);
         debug_assert!(max_allocator_nodes >= 3);
         debug_assert!(max_allocator_nodes < u32::MAX - 1);
@@ -82,6 +88,7 @@ impl ByteAllocator {
                 }),
                 quantum_shift,
                 managed_capacity,
+                base_offset,
                 largest_free_region_hint: AtomicU64::new(
                     u64::from(initial_report.largest_free_region) << quantum_shift,
                 ),
@@ -136,7 +143,11 @@ impl ByteAllocator {
         Some(OffsetAllocationHandle {
             owner: self.shared.clone(),
             allocation: Some(allocation),
-            offset: u64::from(allocation.offset) << self.shared.quantum_shift,
+            offset: self
+                .shared
+                .base_offset
+                .checked_add(u64::from(allocation.offset) << self.shared.quantum_shift)
+                .expect("allocator shard offsets fit in the mounted resource"),
             requested_bytes,
             reserved_bytes,
         })

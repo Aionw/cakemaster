@@ -423,7 +423,12 @@ impl WriteClaim {
         ));
         let reserved_bytes = pending.record().reserved_bytes();
 
-        let _stage = catalog.collector.pending.stage_gate.read();
+        let _stage = catalog
+            .collector
+            .pending
+            .stage_gate
+            .as_ref()
+            .map(RwLock::read);
         let mut control = slot.control.lock();
         let Some(active) = control.active.as_mut() else {
             return Err(StageError::ClaimLost);

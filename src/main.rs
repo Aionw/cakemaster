@@ -13,8 +13,6 @@ use clap::{CommandFactory, Parser};
 use logging::{LoggingConfig, LoggingOverrides};
 use mimalloc::MiMalloc;
 use std::error::Error;
-use std::future::Future;
-use std::io;
 use std::num::NonZeroUsize;
 
 #[global_allocator]
@@ -72,6 +70,15 @@ struct Cli {
     )]
     object_collection_budget_per_step: NonZeroUsize,
 
+    /// Fixed owner shards for catalog, eviction state, and segment allocator arenas.
+    #[arg(
+        long,
+        default_value_t = default_metadata_shards(),
+        value_name = "COUNT",
+        help_heading = "Server options"
+    )]
+    metadata_shards: NonZeroUsize,
+
     /// Emit one structured info log for each completed RPC request.
     #[arg(long, help_heading = "Server options")]
     access_log: bool,
@@ -96,13 +103,17 @@ impl Cli {
             .with_listen_addr(self.listen)
             .with_segment_pool(SegmentPoolConfig::new(self.max_allocator_nodes_per_segment))
             .with_object_catalog(ObjectCatalogConfig::new(self.expected_objects.get()))
+            .with_metadata_shards(self.metadata_shards.get())
             .with_reconcile(reconcile)
             .with_access_log(self.access_log)
     }
 }
 
-#[tokio::main]
-async fn main() {
+fn default_metadata_shards() -> NonZeroUsize {
+    std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
+}
+
+fn main() {
     let cli = Cli::parse();
     let server = cli.server_config();
     let logging = match LoggingConfig::resolve(cli.logging) {
@@ -113,7 +124,10 @@ async fn main() {
         eprintln!("{error}");
         std::process::exit(1);
     }
-    if let Err(error) = run(server).await {
+    let result = compio::runtime::Runtime::new()
+        .map_err(|error| -> Box<dyn Error> { Box::new(error) })
+        .and_then(|runtime| runtime.block_on(run(server)));
+    if let Err(error) = result {
         log::error!(error:% = error; "cakemaster exited with an error");
         eprintln!("error: {error}");
         log::logger().flush();
@@ -127,26 +141,25 @@ async fn run(config: MooncakeServerConfig) -> Result<(), Box<dyn Error>> {
     let local_addr = bound.local_addr()?;
     log::info!(listen_addr:% = local_addr; "cakemaster is ready");
     println!("cakemaster_ready={local_addr}");
-    bound.run_until(shutdown_signal()?).await?;
+    bound.run_until(shutdown_signal()).await?;
     log::info!("cakemaster stopped");
     Ok(())
 }
 
 #[cfg(unix)]
-fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
-    use tokio::signal::unix::{SignalKind, signal};
-
-    let mut terminate = signal(SignalKind::terminate())?;
-    Ok(async move {
-        tokio::select! {
-            result = tokio::signal::ctrl_c() => {
-                if let Err(error) = result {
-                    log::error!(error:% = error; "failed to listen for Ctrl-C");
-                }
+async fn shutdown_signal() {
+    tokio::select! {
+        result = compio::signal::ctrl_c() => {
+            if let Err(error) = result {
+                log::error!(error:% = error; "failed to listen for Ctrl-C");
             }
-            _ = terminate.recv() => {}
         }
-    })
+        result = compio::signal::unix::signal(15) => {
+            if let Err(error) = result {
+                log::error!(error:% = error; "failed to listen for SIGTERM");
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -166,6 +179,7 @@ mod tests {
             DEFAULT_OBJECT_COLLECTION_BUDGET.max_candidates()
         );
         assert_eq!(cli.expected_objects.get(), DEFAULT_EXPECTED_OBJECTS);
+        assert_eq!(cli.metadata_shards, default_metadata_shards());
     }
 
     #[test]
@@ -220,13 +234,17 @@ mod tests {
     fn expected_objects_rejects_zero() {
         assert!(Cli::try_parse_from(["cakemaster", "--expected-objects", "0"]).is_err());
     }
+
+    #[test]
+    fn metadata_shards_configure_fixed_owner_workers() {
+        let cli = Cli::try_parse_from(["cakemaster", "--metadata-shards", "4"]).unwrap();
+        assert_eq!(cli.server_config().metadata_shards(), 4);
+    }
 }
 
 #[cfg(not(unix))]
-fn shutdown_signal() -> io::Result<impl Future<Output = ()>> {
-    Ok(async {
-        if let Err(error) = tokio::signal::ctrl_c().await {
-            log::error!(error:% = error; "failed to listen for Ctrl-C");
-        }
-    })
+async fn shutdown_signal() {
+    if let Err(error) = compio::signal::ctrl_c().await {
+        log::error!(error:% = error; "failed to listen for Ctrl-C");
+    }
 }

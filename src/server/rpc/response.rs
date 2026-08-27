@@ -6,8 +6,8 @@ use crate::mooncake::{
     ReplicaDescriptor, ReplicaStatus,
 };
 use crate::object::error::{LookupError, ObjectManagerError, ObjectRemoveError};
-use crate::object::{AllocatedReplica, ReplicaLease, TenantObjectError};
-use crate::segment::{ReservationDescriptor, ReservationDescriptorRef};
+use crate::object::{AllocatedReplica, ReplicaId, TenantObjectError};
+use crate::segment::ReservationDescriptor;
 
 pub(super) fn started_replica_descriptor(
     replica: &AllocatedReplica,
@@ -19,31 +19,14 @@ pub(super) fn started_replica_descriptor(
     })
 }
 
-pub(super) fn replica_descriptor(
-    replica: &ReplicaLease,
+pub(super) fn owned_replica_descriptor(
+    id: ReplicaId,
+    descriptor: &ReservationDescriptor,
     status: ReplicaStatus,
 ) -> Result<ReplicaDescriptor, ErrorCode> {
-    let Some(direct) = replica.direct() else {
-        return Err(ErrorCode::InternalError);
-    };
-    let descriptor = direct.descriptor();
-    let buffer_descriptor = buffer_descriptor(
-        descriptor.region().base(),
-        descriptor.region().size(),
-        descriptor.transport().protocol().as_str(),
-        descriptor.transport().endpoint(),
-    );
-    let descriptor_variant = match descriptor {
-        ReservationDescriptorRef::Memory(_) => {
-            DescriptorVariant::Memory(MemoryDescriptor { buffer_descriptor })
-        }
-        ReservationDescriptorRef::Nof(_) => {
-            DescriptorVariant::NofSsd(NoFDescriptor { buffer_descriptor })
-        }
-    };
     Ok(ReplicaDescriptor {
-        id: u64::from(replica.id().get()),
-        descriptor_variant,
+        id: u64::from(id.get()),
+        descriptor_variant: owned_descriptor_variant(descriptor)?,
         status,
     })
 }

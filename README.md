@@ -1,6 +1,6 @@
 # cakemaster
 
-Cakemaster workspace 包含高并发 object catalog、异构 segment/placement 核心库，以及基于 Tokio 的 yalantinglibs `coro_rpc` v0 兼容实现，可让 Rust 与 C++ `coro_rpc` 客户端/服务端通过 TCP 直接互调。
+Cakemaster workspace 包含高并发 object catalog、异构 segment/placement 核心库，以及 yalantinglibs `coro_rpc` v0 兼容实现，可让 Rust 与 C++ `coro_rpc` 客户端/服务端通过 TCP 直接互调。production server 使用 shard-local Compio runtime，Rust client 和通用 reference server 保留 Tokio transport。
 
 兼容基线为 `alibaba/yalantinglibs` 的 `c1cef74057b139944c982d840c09c9940f26e08e` 提交。协议实现依据该版本的 [`coro_rpc_protocol.hpp`](https://github.com/alibaba/yalantinglibs/blob/c1cef74057b139944c982d840c09c9940f26e08e/include/ylt/coro_rpc/impl/protocol/coro_rpc_protocol.hpp) 和 [`struct_pack`](https://alibaba.github.io/yalantinglibs/en/struct_pack/struct_pack_layout.html)。
 
@@ -78,8 +78,8 @@ cargo run --release -- \
 ```
 
 不传参数时默认监听 `127.0.0.1:50051`；也可传 `--listen 127.0.0.1:0` 让系统选择
-测试端口。每个 direct-memory allocator 默认预分配 128K 个 offset metadata node；
-`--max-allocator-nodes-per-segment` 应按同时存活的 slice 数量加上空闲区间余量配置，
+测试端口。每个 direct-memory segment 默认预分配总计 128K 个 offset metadata node，
+并平均分配给各 allocator extent；`--max-allocator-nodes-per-segment` 应按同时存活的 slice 数量加上空闲区间余量配置，
 它限制的是分配区间数量而非 segment 字节容量。object catalog 默认以 64K 个 slot
 作为初始容量提示；`--expected-objects` 应覆盖峰值 indexed object（包括 grace period 内
 尚未删除的空 slot），避免运行中并发 hash table 扩容造成尾延迟尖峰。该参数不是对象数量
@@ -88,12 +88,26 @@ cargo run --release -- \
 `--object-collection-budget-per-step` 同时调整这两个上限。更大的预算能更快收敛
 watermark eviction，但单步占用 collector 的时间也可能增加；allocation-failure 请求路径
 仍使用独立的小预算，因此应结合目标负载的成功率和 RPC 尾延迟调优，而不是越大越好。
+
+production binary 默认按可用 CPU 数启动 fixed-owner metadata shard；可用
+`--metadata-shards` 显式覆盖。每个 shard thread 同时运行自己的 Compio runtime、accept loop、
+连接 driver、`ObjectManager` 和后台 reconcile task；不存在独立网络 worker pool。RPC 入口按
+稳定的 tenant/namespace/key hash 把 batch 分组，每个远端 owner 每批只接收一条消息，入口等待各 shard 返回后
+按原始下标恢复结果顺序。每个 owner thread 独占自己的 `ObjectManager`、`SegmentPool`、
+catalog/collector/eviction 状态和 allocator extent，shard 之间不共享可变 metadata 或
+allocator。低频 client/segment lifecycle 由 coordinator 生成 topology/fence 消息并同步广播；
+容量再平衡也不是共享 owner 原子切换，而是 donor shard 取出一个完全空闲的 extent，随消息
+转移给 borrower shard。有活跃 allocation 的 extent 不允许转移。
+shard-local collector 不创建跨线程 step/stage gate，segment 状态和 allocator extent owner
+快照也不依赖共享 mutex。Get 返回版本内嵌的 immutable replica snapshot，只含 descriptor
+所需的值和弱 liveness observer；它不会把 `ObjectVersion` 或 reservation lease 带出 owner
+thread，wire descriptor 也在承载该连接的 shard runtime 内生成。
 RPC access 日志默认关闭；传
 `--access-log` 后，每个完成的请求会以 info 级别
 记录来源地址、路由名/function ID、sequence、结果、请求/响应大小和耗时。通用库调用方也可
 使用 `ServerConfig::default().with_access_log(true)` 开启。binary 在同一个 composition
-root 中只构建一次 `SegmentPool`、内存态
-`ObjectManager`、`MasterClock` 和 `ObjectCatalogRpcService`，并从 service 派生共享
+root 中只构建一次 control-plane `SegmentPool`、`ShardedObjectManager`、`MasterClock` 和
+`ObjectCatalogRpcService`，并从 service 派生共享
 `ClientManager`、clock、deadline `Notify` 和 memory-pressure `Notify` 的
 `MasterReconciler`。production manager 使用内部固定的 90%/80% 高低水位驱动有界 Memory eviction；
 水位、物理容量/used、live/retired/debt accounting、allocation-failure 有限重试与诊断详见
@@ -279,7 +293,9 @@ server.serve("127.0.0.1:9000").await?;
 
 ## 运行结构
 
-服务端只为每条 TCP 连接创建一个 Tokio task。该 task 内的 `ServerConnection` 本身实现 `Future`，并持有：
+`coro-rpc` 通用 Tokio reference server 只为每条 TCP 连接创建一个 task。production
+Cakemaster 复用同一个 `ServerConnection` driver，但把连接 task 直接放进 shard-local
+Compio runtime。该 driver 本身实现 `Future`，并持有：
 
 - `Framed<TcpStream, ServerCodec>`：同一个 owner 负责双向协议 I/O
 - 按 function ID 查找 typed handler 的轻量路由器

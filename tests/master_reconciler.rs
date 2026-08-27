@@ -121,7 +121,8 @@ async fn one_step_closes_client_segment_and_object_lifecycles() {
     tokio::time::advance(Duration::from_millis(10)).await;
     let report = service
         .reconciler(MasterReconcileConfig::default())
-        .reconcile_once();
+        .reconcile_once()
+        .await;
     let cleanup = report.client_cleanup.unwrap();
     assert_eq!(cleanup.completed_sessions, 1);
     assert_eq!(cleanup.revoked_pending_writes, 1);
@@ -172,7 +173,7 @@ async fn object_collection_budget_bounds_each_reconcile_step() {
     let reconciler = service.reconciler(config);
     tokio::time::advance(Duration::from_millis(10)).await;
 
-    let first = reconciler.reconcile_once();
+    let first = reconciler.reconcile_once().await;
     assert_eq!(first.client_cleanup.unwrap().invalidated_segments, 1);
     assert_eq!(first.object_collection.catalog.invalidated_published, 1);
     assert_eq!(manager.catalog().stats().published_objects, 2);
@@ -180,6 +181,7 @@ async fn object_collection_budget_bounds_each_reconcile_step() {
     assert_eq!(
         reconciler
             .reconcile_once()
+            .await
             .object_collection
             .catalog
             .invalidated_published,
@@ -189,6 +191,7 @@ async fn object_collection_budget_bounds_each_reconcile_step() {
     assert_eq!(
         reconciler
             .reconcile_once()
+            .await
             .object_collection
             .catalog
             .invalidated_published,
@@ -233,7 +236,8 @@ async fn reconciler_expires_soft_pins_with_the_collection_budget() {
             MasterReconcileConfig::new(Duration::from_millis(100), CollectBudget::new(1, 0, 0))
                 .unwrap(),
         )
-        .reconcile_once();
+        .reconcile_once()
+        .await;
     assert_eq!(report.object_collection.catalog.scanned_soft_pins, 1);
     assert_eq!(report.object_collection.catalog.expired_soft_pins, 1);
     assert!(
@@ -287,7 +291,7 @@ async fn rpc_and_background_collection_converge_without_duplicate_retirement() {
         tokio::spawn(async move {
             start.wait().await;
             for _ in 0..512 {
-                let _ = reconciler.reconcile_once();
+                let _ = reconciler.reconcile_once().await;
                 tokio::task::yield_now().await;
             }
         })
@@ -315,7 +319,7 @@ async fn rpc_and_background_collection_converge_without_duplicate_retirement() {
         if stats.published_objects == 0 && stats.retired_candidates == 0 {
             break;
         }
-        let _ = reconciler.reconcile_once();
+        let _ = reconciler.reconcile_once().await;
     }
     assert_eq!(manager.catalog().stats().published_objects, 0);
     assert_eq!(manager.catalog().stats().retired_candidates, 0);
@@ -475,7 +479,8 @@ async fn client_expiry_cancels_same_step_graceful_work_before_object_collection(
     tokio::time::advance(Duration::from_millis(10)).await;
     let report = service
         .reconciler(MasterReconcileConfig::default())
-        .reconcile_once();
+        .reconcile_once()
+        .await;
     assert_eq!(report.client_cleanup.unwrap().completed_sessions, 1);
     assert_eq!(report.graceful_unmount.completed, 0);
     assert_eq!(report.graceful_unmount.stale_or_cancelled, 1);
@@ -522,7 +527,8 @@ async fn tenant_service_builds_a_reconciler_for_its_backend() {
 
     let report = service
         .reconciler(MasterReconcileConfig::default())
-        .reconcile_once();
+        .reconcile_once()
+        .await;
     assert_eq!(report.client_cleanup.unwrap().completed_sessions, 1);
     assert_eq!(report.object_collection.catalog.invalidated_published, 1);
     assert!(!report.object_collection.catalog.busy);

@@ -2,11 +2,11 @@ use super::descriptor::{
     MemoryRegion, RangeDescriptorRef, ReservationDescriptor, ReservationDescriptorRef,
 };
 use super::identity::SegmentId;
-use super::lifetime::SegmentLease;
+use super::lifetime::{SegmentLease, SegmentLiveness};
 use super::offset_allocator::OffsetAllocationHandle;
 use super::spec::{ReplicaClass, SegmentSpec};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 pub struct Reservation {
     pub(super) allocation: OffsetAllocationHandle,
@@ -28,6 +28,14 @@ impl Reservation {
     /// is still logically valid.
     pub fn is_live(&self) -> bool {
         self.segment_lease.is_live()
+    }
+
+    pub(crate) fn liveness(&self) -> SegmentLiveness {
+        self.segment_lease.observer()
+    }
+
+    pub(crate) fn segment_observer(&self) -> Weak<SegmentSpec> {
+        Arc::downgrade(&self.segment)
     }
 
     pub const fn offset(&self) -> u64 {

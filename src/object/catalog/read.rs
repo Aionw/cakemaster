@@ -27,7 +27,12 @@ impl ObjectCatalog {
                 self.inner.config.lease_ttl_ticks,
                 self.inner.config.lease_refresh_ticks,
             );
-            let has_live_replica = version.record().replicas.read().has_live();
+            let has_live_replica = version
+                .record()
+                .replicas
+                .snapshot()
+                .iter()
+                .any(ReplicaSnapshot::is_live);
             if committed_points_to(&slot, &version) && has_live_replica {
                 return Ok(ObjectRead {
                     object: ObjectHandle { version },
@@ -74,7 +79,16 @@ impl ObjectHandle {
     }
 
     pub fn is_live(&self) -> bool {
-        self.version.record().replicas.read().has_live()
+        self.version
+            .record()
+            .replicas
+            .snapshot()
+            .iter()
+            .any(ReplicaSnapshot::is_live)
+    }
+
+    pub(crate) fn replica_snapshot(&self) -> ReplicaSnapshotSet {
+        self.version.record().replicas.snapshot()
     }
 
     pub fn owner(&self) -> WriteOwner {

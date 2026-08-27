@@ -6,7 +6,10 @@ use super::diagnostics::ObjectCatalogStats;
 use super::error::{LookupError, ObjectCatalogConfigError, RemoveError, StageError};
 use super::identity::{NamespaceId, ObjectIdentity, ObjectLookup};
 use super::reclamation::{CatalogTick, CollectBudget, CollectReport, ReclaimFilter, ReclaimTarget};
-use super::replica::{ReplicaLease, ReplicaPartition, ReplicaReclaimBatch, ReplicaSet};
+use super::replica::{
+    ReplicaLease, ReplicaPartition, ReplicaReclaimBatch, ReplicaSet, ReplicaSnapshot,
+    ReplicaSnapshotSet,
+};
 use super::tenant::{QuotaReservationGuard, TenantQuotaCharge};
 use super::write::{ObjectCommit, TransactionId, VersionId, WriteAdmission, WriteMode, WriteOwner};
 use arc_swap::ArcSwapOption;
@@ -58,7 +61,7 @@ struct CollectorState {
     pending: PendingQueue,
     retired: SegQueue<RetiredObject>,
     empty_slots: SegQueue<EmptySlotCandidate>,
-    step_gate: Mutex<()>,
+    step_gate: Option<Mutex<()>>,
     reclaim: ReclaimDebt,
     liveness: LivenessSweep,
 }
@@ -72,7 +75,7 @@ struct EvictionQueues {
 /// The queue and gate form one producer/cleanup synchronization boundary.
 struct PendingQueue {
     candidates: SegQueue<PendingCandidate>,
-    stage_gate: RwLock<()>,
+    stage_gate: Option<RwLock<()>>,
 }
 
 /// Explicit global reclaim debt. Memory watermark and allocation pressure are
@@ -135,6 +138,7 @@ struct ObjectRecord {
 
 struct ReplicaStorage {
     set: RwLock<ReplicaSet>,
+    snapshot: ReplicaSnapshotSet,
     reserved_bytes: AtomicU64,
 }
 
@@ -236,7 +240,7 @@ impl ObjectCatalog {
                 config,
                 index: CatalogIndex::new(config.expected_objects),
                 lifecycle: LifecycleCounters::new(),
-                collector: CollectorState::new(),
+                collector: CollectorState::new(config.shard_local),
             }),
         })
     }
@@ -424,13 +428,13 @@ impl LifecycleCounters {
 }
 
 impl CollectorState {
-    fn new() -> Self {
+    fn new(shard_local: bool) -> Self {
         Self {
             eviction: EvictionQueues::new(),
-            pending: PendingQueue::new(),
+            pending: PendingQueue::new(shard_local),
             retired: SegQueue::new(),
             empty_slots: SegQueue::new(),
-            step_gate: Mutex::new(()),
+            step_gate: (!shard_local).then(|| Mutex::new(())),
             reclaim: ReclaimDebt::new(),
             liveness: LivenessSweep::new(),
         }
@@ -448,10 +452,10 @@ impl EvictionQueues {
 }
 
 impl PendingQueue {
-    fn new() -> Self {
+    fn new(shard_local: bool) -> Self {
         Self {
             candidates: SegQueue::new(),
-            stage_gate: RwLock::new(()),
+            stage_gate: (!shard_local).then(|| RwLock::new(())),
         }
     }
 }
@@ -563,4 +567,21 @@ fn atomic_saturating_sub(value: &AtomicU64, amount: u64) {
     let _ = value.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
         Some(current.saturating_sub(amount))
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shard_local_catalog_omits_cross_thread_collector_gates() {
+        let local =
+            ObjectCatalog::with_config(ObjectCatalogConfig::new(8).split_for_shards(2)).unwrap();
+        assert!(local.inner.collector.step_gate.is_none());
+        assert!(local.inner.collector.pending.stage_gate.is_none());
+
+        let concurrent = ObjectCatalog::with_config(ObjectCatalogConfig::new(8)).unwrap();
+        assert!(concurrent.inner.collector.step_gate.is_some());
+        assert!(concurrent.inner.collector.pending.stage_gate.is_some());
+    }
 }

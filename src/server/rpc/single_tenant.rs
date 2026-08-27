@@ -1,15 +1,18 @@
 //! Single-tenant RPC backend adapter.
 
-use super::backend::{ObjectBatchBackend, mutation_maintenance_budget};
+use super::backend::{
+    ObjectBatchBackend, ObjectReadSnapshot, mutation_maintenance_budget, snapshot_object_read,
+};
 use super::response::{map_lookup_error, map_manager_error, map_remove_error};
 use crate::mooncake::{ErrorCode, ExpectedBool, ExpectedVoid};
 use crate::object::reclamation::CatalogTick;
 use crate::object::{
-    NamespaceId, ObjectIdentity, ObjectLookup, ObjectManager, ObjectRead, ReplicaSelector,
-    StartedPut, TenantPutRequest, WriteAdmission, WriteOwner,
+    NamespaceId, ObjectIdentity, ObjectLookup, ObjectManager, ReplicaSelector, StartedPut,
+    TenantPutRequest, WriteAdmission, WriteOwner,
 };
 use regex::Regex;
 
+#[async_trait::async_trait]
 impl ObjectBatchBackend for ObjectManager {
     type Tenant = ();
 
@@ -17,10 +20,10 @@ impl ObjectBatchBackend for ObjectManager {
         Ok(())
     }
 
-    fn exists_batch(
+    async fn exists_batch(
         &self,
-        _tenant: &Self::Tenant,
-        keys: &[String],
+        _tenant: Self::Tenant,
+        keys: Vec<String>,
         now: CatalogTick,
     ) -> Vec<ExpectedBool> {
         keys.iter()
@@ -34,23 +37,24 @@ impl ObjectBatchBackend for ObjectManager {
             .collect()
     }
 
-    fn get_batch(
+    async fn get_batch(
         &self,
-        _tenant: &Self::Tenant,
-        keys: &[String],
+        _tenant: Self::Tenant,
+        keys: Vec<String>,
         now: CatalogTick,
-    ) -> Vec<Result<ObjectRead, ErrorCode>> {
+    ) -> Vec<Result<ObjectReadSnapshot, ErrorCode>> {
         keys.iter()
             .map(|key| {
                 ObjectManager::get(self, ObjectLookup::new(NamespaceId::DEFAULT, key), now)
                     .map_err(map_lookup_error)
+                    .and_then(snapshot_object_read)
             })
             .collect()
     }
 
-    fn start_put_batch(
+    async fn start_put_batch(
         &self,
-        _tenant: &Self::Tenant,
+        _tenant: Self::Tenant,
         admission: WriteAdmission,
         requests: Vec<TenantPutRequest>,
         now: CatalogTick,
@@ -71,9 +75,9 @@ impl ObjectBatchBackend for ObjectManager {
             .collect()
     }
 
-    fn start_upsert_batch(
+    async fn start_upsert_batch(
         &self,
-        _tenant: &Self::Tenant,
+        _tenant: Self::Tenant,
         admission: WriteAdmission,
         requests: Vec<TenantPutRequest>,
         now: CatalogTick,
@@ -94,10 +98,10 @@ impl ObjectBatchBackend for ObjectManager {
             .collect()
     }
 
-    fn finish_put_batch(
+    async fn finish_put_batch(
         &self,
-        _tenant: &Self::Tenant,
-        keys: &[&str],
+        _tenant: Self::Tenant,
+        keys: Vec<String>,
         owner: WriteOwner,
         selector: ReplicaSelector,
         now: CatalogTick,
@@ -107,7 +111,7 @@ impl ObjectBatchBackend for ObjectManager {
             .map(|key| {
                 ObjectManager::finish_put_at(
                     self,
-                    &ObjectIdentity::new(NamespaceId::DEFAULT, *key),
+                    &ObjectIdentity::new(NamespaceId::DEFAULT, key.as_str()),
                     owner,
                     selector,
                     now,
@@ -119,10 +123,10 @@ impl ObjectBatchBackend for ObjectManager {
         results
     }
 
-    fn revoke_put_batch(
+    async fn revoke_put_batch(
         &self,
-        _tenant: &Self::Tenant,
-        keys: &[String],
+        _tenant: Self::Tenant,
+        keys: Vec<String>,
         owner: WriteOwner,
         selector: ReplicaSelector,
         now: CatalogTick,
@@ -144,10 +148,10 @@ impl ObjectBatchBackend for ObjectManager {
         results
     }
 
-    fn remove_batch(
+    async fn remove_batch(
         &self,
-        _tenant: &Self::Tenant,
-        keys: &[String],
+        _tenant: Self::Tenant,
+        keys: Vec<String>,
         now: CatalogTick,
         force: bool,
     ) -> Vec<ExpectedVoid> {
@@ -165,20 +169,25 @@ impl ObjectBatchBackend for ObjectManager {
         results
     }
 
-    fn remove_matching(
+    async fn remove_matching(
         &self,
-        _tenant: &Self::Tenant,
-        pattern: Option<&Regex>,
+        _tenant: Self::Tenant,
+        pattern: Option<Regex>,
         now: CatalogTick,
         force: bool,
     ) -> Result<usize, ErrorCode> {
-        let removed =
-            ObjectManager::remove_matching(self, NamespaceId::DEFAULT, pattern, now, force);
+        let removed = ObjectManager::remove_matching(
+            self,
+            NamespaceId::DEFAULT,
+            pattern.as_ref(),
+            now,
+            force,
+        );
         let _ = ObjectManager::maintenance(self, now, mutation_maintenance_budget(removed));
         Ok(removed)
     }
 
-    fn remove_all(
+    async fn remove_all(
         &self,
         _tenant_id: &str,
         now: CatalogTick,
