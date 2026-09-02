@@ -15,6 +15,12 @@ impl SegmentPoolConfig {
             max_allocator_nodes_per_segment,
         }
     }
+
+    /// Returns the fixed metadata-node budget created for each direct-memory
+    /// allocator.
+    pub const fn max_allocator_nodes_per_segment(self) -> u32 {
+        self.max_allocator_nodes_per_segment
+    }
 }
 
 impl Default for SegmentPoolConfig {

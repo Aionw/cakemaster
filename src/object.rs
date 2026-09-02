@@ -28,8 +28,9 @@ pub use catalog::{
     WriteTransaction,
 };
 pub use config::{
-    DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS, DEFAULT_MAX_SOFT_PIN_TTL_TICKS,
-    DEFAULT_SOFT_PIN_TTL_TICKS, ObjectCatalogConfig, ObjectPinRequest, SoftPinAction,
+    DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS, DEFAULT_EXPECTED_OBJECTS,
+    DEFAULT_MAX_SOFT_PIN_TTL_TICKS, DEFAULT_SOFT_PIN_TTL_TICKS, ObjectCatalogConfig,
+    ObjectPinRequest, SoftPinAction,
 };
 pub use content::{ObjectContent, ObjectKind};
 pub use eviction::{

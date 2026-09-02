@@ -285,7 +285,10 @@ tenant feature：
 
 `cakemaster --listen ADDRESS` 目前会构造并共享 `SegmentPool`、内存态
 `ObjectManager`、`MasterClock`、`ObjectCatalogRpcService` 和 `MasterReconciler`，支持随机
-端口 bind、Ctrl-C/SIGTERM shutdown，并在退出前 join server connections 与 reconciler。
+端口 bind、通过 `--max-allocator-nodes-per-segment` 配置每个 direct-memory allocator
+的 metadata node 预算、通过 `--expected-objects` 配置 object index 容量提示、通过
+`--object-collection-budget-per-step` 配置后台 candidate/reclaim 预算、Ctrl-C/SIGTERM
+shutdown，并在退出前 join server connections 与 reconciler。
 上游 production master 还具备：
 
 - JSON/YAML/gflags 配置和完整参数校验；

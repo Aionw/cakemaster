@@ -2,6 +2,8 @@
 
 use super::error::ObjectCatalogConfigError;
 
+/// Conservative default capacity hint for the in-memory object index.
+pub const DEFAULT_EXPECTED_OBJECTS: usize = 64 * 1024;
 /// Upstream-compatible default soft-pin lifetime (30 minutes).
 pub const DEFAULT_SOFT_PIN_TTL_TICKS: u64 = 30 * 60 * 1_000;
 /// Upstream-compatible maximum request-level soft-pin lifetime (24 hours).
@@ -207,6 +209,6 @@ impl ObjectCatalogConfig {
 
 impl Default for ObjectCatalogConfig {
     fn default() -> Self {
-        Self::new(64 * 1024)
+        Self::new(DEFAULT_EXPECTED_OBJECTS)
     }
 }

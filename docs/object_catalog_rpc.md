@@ -104,7 +104,18 @@ cargo run --release -- \
 ```
 
 `--listen` 必须是明确的 socket address；默认是保守的 loopback
-`127.0.0.1:50051`。逐请求 access 日志默认关闭，可通过 `--access-log` 开启；开启后会
+`127.0.0.1:50051`。`--max-allocator-nodes-per-segment` 默认 128K，控制每个
+direct-memory allocator 预分配的区间 metadata node 数；应按最大同时存活 slice 数和
+碎片余量设置，并不改变 segment 声明的字节容量。
+`--expected-objects` 默认 64K，是 object index 的初始容量提示而非数量硬上限；应覆盖
+峰值 indexed object，并计入 grace period 内保留的空 slot。配置偏小会允许并发 hash
+table 在请求路径上扩容，形成孤立的尾延迟尖峰。
+`--object-collection-budget-per-step` 默认 256，同时控制每个后台 reconcile step 的
+candidate scan 和 retired-object reclaim 上限；增大它可以提高 watermark 收敛速度，
+但也会扩大单步 collector 占用时间，应以目标负载下的成功率和 RPC 尾延迟共同调优，
+并非越大越好。allocation-failure 请求路径仍保留独立的 64/64 预算，不受该参数影响。
+逐请求 access 日志默认关闭，可通过
+`--access-log` 开启；开启后会
 以 info 级别记录来源、路由、sequence、结果、请求/响应大小和耗时。Unix 同时监听
 Ctrl-C 和 SIGTERM，其他 Tokio 支持的平台监听
 Ctrl-C。当前默认沿用 core 已验证配置：64K expected objects、64K clients、10s client
