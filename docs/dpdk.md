@@ -161,7 +161,9 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-本机完整测试通过。Rust 1.98 的严格 Clippy 在原有 `upstream_golden.rs` 的
+提交前基于最新 main 的完整测试矩阵、计数和原始日志见
+[`dpdk_validation.md`](dpdk_validation.md)（all-features 191 项、默认功能 187 项通过）。
+Rust 1.98 的严格 Clippy 在原有 `upstream_golden.rs` 的
 `chunks_exact_to_as_chunks` lint 处失败；仅豁免该既有 lint 后，workspace all-targets/all-features
 检查通过。native correctness probe 另行真实运行，不用 kernel socket mock 冒充 DPDK。
 

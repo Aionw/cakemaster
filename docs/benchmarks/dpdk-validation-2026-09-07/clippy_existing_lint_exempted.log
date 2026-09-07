@@ -1,0 +1,4 @@
+    Checking coro-rpc v0.1.0 (/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/crates/coro-rpc)
+   Compiling coro-rpc-codegen v0.1.0 (/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/crates/coro-rpc-codegen)
+   Compiling cakemaster v0.1.0 (/home/aione/.herdr/worktrees/cakemaster/feat-dpdk)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.26s

@@ -1,0 +1,393 @@
+   Compiling coro-rpc v0.1.0 (/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/crates/coro-rpc)
+   Compiling cakemaster v0.1.0 (/home/aione/.herdr/worktrees/cakemaster/feat-dpdk)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.21s
+     Running unittests src/lib.rs (target/debug/deps/cakemaster-ce6e8d32550476ec)
+
+running 11 tests
+test segment::offset_allocator::tests::scales_large_segments_with_a_power_of_two_quantum ... ok
+test server::rpc::observability::tests::business_error_severity_separates_faults_pressure_and_client_rejections ... ok
+test server::rpc::observability::tests::display_option_uses_a_stable_missing_value ... ok
+test segment::offset_allocator::tests::failed_request_hint_is_raised_after_a_free ... ok
+test server::rpc::request::tests::put_template_normalizes_a_supported_memory_request ... ok
+test server::rpc::request::tests::put_template_distinguishes_nof_and_rejects_unsupported_shapes ... ok
+test server::rpc::request::tests::replica_selector_rejects_unsupported_disk_requests ... ok
+test segment::offset_allocator::tests::batch_release_groups_handles_by_allocator_and_coalesces ... ok
+test segment::offset_allocator::tests::handles_release_and_coalesce_on_drop ... ok
+test client::manager::tests::claimed_old_job_cannot_remove_same_session_reuse ... ok
+test client::manager::tests::claimed_old_job_cannot_cross_a_new_client_generation ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/main.rs (target/debug/deps/cakemaster-cb2789328a396f98)
+
+running 8 tests
+test logging::tests::rejects_empty_logging_values_owned_by_cakemaster ... ok
+test logging::tests::filter_sources_follow_cli_environment_and_default_precedence ... ok
+test tests::expected_objects_rejects_zero ... ok
+test tests::object_collection_budget_rejects_zero ... ok
+test tests::allocator_node_limit_accepts_an_explicit_count ... ok
+test tests::object_collection_budget_configures_background_candidates_and_reclaims ... ok
+test tests::expected_objects_configures_the_catalog_capacity_hint ... ok
+test tests::capacity_tuning_options_use_production_defaults ... ok
+
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/client_cleanup_benchmark.rs (target/debug/deps/client_cleanup_benchmark-4f5f8136fdc11021)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/mooncake_benchmark.rs (target/debug/deps/mooncake_benchmark-5af341194b2cdbdf)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_catalog_benchmark.rs (target/debug/deps/object_catalog_benchmark-daf1e4e0e1fb7911)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_catalog_evict_benchmark.rs (target/debug/deps/object_catalog_evict_benchmark-ec97f7c1831494a0)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_catalog_rpc_benchmark_server.rs (target/debug/deps/object_catalog_rpc_benchmark_server-bb1ca3bc29d3f992)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/object_catalog_watermark_benchmark.rs (target/debug/deps/object_catalog_watermark_benchmark-b17de55a5dc8f47e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/segment_pool_benchmark.rs (target/debug/deps/segment_pool_benchmark-84420bdd800a00da)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/tenant_quota_benchmark.rs (target/debug/deps/tenant_quota_benchmark-2f2017a31801eac6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/client_lifecycle.rs (target/debug/deps/client_lifecycle-1da1db84cb30a2e1)
+
+running 9 tests
+test capacity_counts_fenced_entries_until_cleanup_finishes ... ok
+test cleanup_budget_leaves_remaining_due_clients_for_later_rounds ... ok
+test drain_is_exclusive_and_finishing_allows_a_new_generation ... ok
+test dropped_cleanup_claim_is_retried_by_due_cleanup_scan ... ok
+test rejects_invalid_configuration_and_nil_activation ... ok
+test heartbeat_deadline_is_monotonic_and_old_heap_record_is_reordered ... ok
+test repeated_activation_reuses_generation_and_refreshes_deadline ... ok
+test unknown_heartbeat_requests_remount_without_allocating_state ... ok
+test heartbeat_at_deadline_fences_session_until_cleanup_finishes ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/client_lifecycle_rpc.rs (target/debug/deps/client_lifecycle_rpc-f159a022ed536aa4)
+
+running 3 tests
+test ping_remount_and_expiry_follow_client_session_state ... ok
+test tcp_unmount_prunes_only_the_target_replica ... ok
+test tcp_mount_unmount_and_graceful_unmount_follow_segment_lifecycle ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/client_manager.rs (target/debug/deps/client_manager-e56c9eb71b9f761b)
+
+running 15 tests
+test graceful_unmount_quiesces_now_and_invalidates_at_the_earliest_deadline ... ok
+test fenced_write_admission_cannot_reach_pending ... ok
+test activation_failure_restores_existing_quiesced_segments ... ok
+test batch_drain_revokes_only_the_target_sessions ... ok
+test heartbeat_and_remount_follow_the_public_session_contract ... ok
+test expiry_fences_remount_until_cleanup_finishes ... ok
+test first_mount_activation_failure_removes_the_new_attachment ... ok
+test segment_unmount_immediately_changes_object_read_liveness ... ok
+test cleanup_revokes_pending_writes_for_the_exact_session ... ok
+test unexpected_graceful_transition_is_retried_after_100_ticks ... ok
+test cancelled_graceful_job_cannot_remove_a_reused_segment_id ... ok
+test failed_remount_rolls_back_new_segments ... ok
+test mount_segment_establishes_a_session_and_appends_atomically ... ok
+test cleanup_step_invalidates_segments_and_allows_a_new_session ... ok
+test unmount_segment_only_removes_the_target_and_keeps_the_session_active ... ok
+
+test result: ok. 15 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/client_task_queue.rs (target/debug/deps/client_task_queue-4edb91d30acc686c)
+
+running 1 test
+test invalid_capacity_and_batch_size_are_rejected ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/generated_end_to_end.rs (target/debug/deps/generated_end_to_end-e0c3b02a37b840d5)
+
+running 4 tests
+test generated_enum_rejects_unknown_discriminants ... ok
+test generated_union_rejects_unknown_variant_indices ... ok
+test generated_thrift_models_use_struct_pack_wire_types ... ok
+test generated_client_and_server_share_one_contract ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/master_reconciler.rs (target/debug/deps/master_reconciler-1bf71ccf92a8ab2e)
+
+running 9 tests
+test reconcile_config_validates_interval_and_preserves_budget ... ok
+test reconciler_expires_soft_pins_with_the_collection_budget ... ok
+test object_collection_budget_bounds_each_reconcile_step ... ok
+test one_step_closes_client_segment_and_object_lifecycles ... ok
+test client_expiry_cancels_same_step_graceful_work_before_object_collection ... ok
+test tenant_service_builds_a_reconciler_for_its_backend ... ok
+test graceful_deadline_wakes_before_the_periodic_interval ... ok
+test periodic_reconcile_waits_for_the_first_tick_and_skips_missed_ticks ... ok
+test rpc_and_background_collection_converge_without_duplicate_retirement ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/memory_eviction.rs (target/debug/deps/memory_eviction-4e8db0d13f5a1866)
+
+running 14 tests
+test watermarks_and_failure_limits_are_strictly_validated ... ok
+test best_effort_failure_requests_only_one_replica_of_reclaim ... ok
+test aggregate_space_deduplicates_cxl_and_keeps_quiesced_capacity ... ok
+test allocation_failure_does_not_retry_without_observed_reclaim_progress ... ok
+test nof_allocation_failure_does_not_issue_memory_reclaim_debt ... ok
+test allocation_failure_retry_reclaims_around_an_active_mvcc_upsert ... ok
+test active_cycle_runs_in_bounded_steps_until_physical_usage_reaches_low ... ok
+test retired_pin_remains_used_and_covers_inflight_debt_without_duplicate_eviction ... ok
+test mvcc_upsert_keeps_the_committed_replacement_while_an_old_reader_delays_reclaim ... ok
+test concurrent_allocators_and_bounded_collection_converge_without_debt_oscillation ... ok
+test allocation_failure_runs_one_bounded_collection_and_retries_after_progress ... ok
+test allocation_failure_wakes_the_owned_reconciler_and_shutdown_joins_it ... ok
+test capacity_growth_cancels_stale_watermark_debt_before_retiring_objects ... ok
+test memory_watermark_never_retires_nof_objects ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/mooncake_wire.rs (target/debug/deps/mooncake_wire-0f0cc3587f1bb7ba)
+
+running 5 tests
+test mooncake_put_end_bytes_match_cpp_struct_pack ... ok
+test mooncake_bootstrap_response_bytes_match_cpp_struct_pack ... ok
+test latest_mooncake_put_start_bytes_decode_with_soft_pin_action ... ok
+test mooncake_rpc_routes_match_wrapped_master_service ... ok
+test mooncake_rpc_schema_matches_yalantinglibs_metadata ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/object_catalog.rs (target/debug/deps/object_catalog-f5f3f19d782a810e)
+
+running 12 tests
+test dropped_claim_reopens_the_stable_slot ... ok
+test rejects_inconsistent_lease_configuration_with_context ... ok
+test soft_pin_configuration_matches_upstream_defaults_and_validates_bounds ... ok
+test replica_set_preserves_inline_and_multiple_replica_views ... ok
+test pending_object_reclamation_releases_local_ssd_capacity ... ok
+test replica_set_preserves_nof_reservations_as_nof_replicas ... ok
+test reclamation_promotes_recent_objects_and_defers_pinned_resources ... ok
+test pending_expiration_has_no_future_deadline_head_of_line_blocking ... ok
+test publish_lookup_remove_and_reclaim_preserve_lease_and_ownership ... ok
+test pending_timeout_reclaims_memory_without_a_batch_pause ... ok
+test invalidated_segment_replicas_cannot_be_staged_or_published ... ok
+test invalid_staging_rolls_back_claim_and_reservation_by_raii ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/object_manager.rs (target/debug/deps/object_manager-a3c868066b923a91)
+
+running 23 tests
+test get_racing_upsert_observes_complete_versions ... ok
+test invalidated_pending_put_is_retired_before_its_timeout ... ok
+test pin_requests_validate_and_commit_at_finish_time ... ok
+test manager_revoke_and_timeout_release_reservations_for_reuse ... ok
+test completed_writes_leave_no_timeout_backlog_after_one_bounded_step ... ok
+test invalidated_pending_put_cannot_publish_but_can_be_revoked ... ok
+test dropping_an_upsert_claim_rechecks_an_invalidated_base ... ok
+test manager_owns_the_complete_pending_to_published_lifecycle ... ok
+test remove_honors_lease_unless_forced ... ok
+test cxl_segment_invalidation_keeps_the_surviving_replica ... ok
+test bounded_liveness_scan_does_not_skip_objects_promoted_between_generations ... ok
+test concurrent_start_for_one_key_has_one_winner ... ok
+test published_objects_become_invisible_and_are_retired_after_segment_invalidation ... ok
+test allocator_policy_is_selected_by_the_normalized_plan ... ok
+test same_size_upsert_uses_a_fresh_version_and_keeps_the_old_version_readable ... ok
+test upsert_pin_changes_commit_atomically_and_rollback_preserves_metadata ... ok
+test upsert_revoke_and_failed_reallocation_restore_the_published_version ... ok
+test size_changing_upsert_commits_new_generation_and_reclaims_old_allocation ... ok
+test stale_upsert_timeout_is_fenced_by_transaction_id ... ok
+test eviction_obeys_hard_and_soft_pin_policy_and_expiry_scan_is_bounded ... ok
+test segment_invalidation_prunes_only_stale_published_replicas ... ok
+test pruning_waits_for_live_replica_views_before_releasing_resources ... ok
+test segment_invalidation_racing_maintenance_still_retires_published_objects ... ok
+
+test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+
+     Running tests/observability.rs (target/debug/deps/observability-80d5227c0fc91bbe)
+
+running 1 test
+test production_logs_correlate_transport_and_business_failures ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/production_runtime.rs (target/debug/deps/production_runtime-973f732d3e803972)
+
+running 3 tests
+test production_composition_shares_managers_clock_and_reconciler_state ... ok
+test shutdown_does_not_run_a_late_graceful_deadline ... ok
+test cakemaster_handles_ping_segment_and_object_rpcs_then_joins ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/rpc.rs (target/debug/deps/rpc-5252f9080ef465ba)
+
+running 5 tests
+test bootstrap_rpcs_support_memory_only_client_initialization ... ok
+test single_put_routes_drive_start_finish_and_revoke ... ok
+test multi_tenant_rpc_resolves_once_per_batch_and_maps_tenant_errors ... ok
+test generated_mooncake_rpc_drives_the_real_object_manager ... ok
+test upsert_and_remove_routes_drive_transactional_catalog_semantics ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/segment_pool.rs (target/debug/deps/segment_pool-f6a3514723776e2e)
+
+running 17 tests
+test attach_is_idempotent_but_rejects_conflicts_and_overlaps ... ok
+test local_ssd_heartbeat_toggle_updates_only_the_offload_snapshot ... ok
+test protocol_is_typed_in_core_and_extensible_at_the_wire_boundary ... ok
+test candidates_cannot_cross_pool_boundaries ... ok
+test cxl_logical_segments_share_one_physical_arena ... ok
+test batch_owner_invalidation_deduplicates_owners_and_updates_placement_once ... ok
+test local_ssd_uses_heartbeat_capacity_and_two_phase_offload_leases ... ok
+test accepting_capacity_deduplicates_shared_resources_and_separates_classes ... ok
+test reservations_observe_pool_shutdown_as_incarnation_invalidation ... ok
+test reservation_owns_the_range_and_releases_it_on_drop ... ok
+test requests_and_segments_expose_semantic_groups ... ok
+test quiesced_attach_stays_hidden_until_atomic_batch_reactivation ... ok
+test owner_invalidation_is_intent_level_idempotent_and_does_not_wait_for_allocations ... ok
+test nof_uses_namespace_offsets_and_an_independent_replica_class ... ok
+test remove_invalidates_mount_incarnation_without_waiting_for_resource_handles ... ok
+test exact_placement_enforces_failure_domains_and_rolls_back_partial_work ... ok
+test high_concurrency_reserve_drop_preserves_allocator_invariants ... ok
+
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/tenant_object_manager.rs (target/debug/deps/tenant_object_manager-2f68a1a00e933175)
+
+running 16 tests
+test deleted_tenant_handles_stay_stale_after_reregistration ... ok
+test batch_duplicate_keys_preserve_order_for_insert_and_upsert ... ok
+test batch_admission_is_atomic_per_resource_class ... ok
+test oversubscribed_requested_quotas_are_scaled_deterministically ... ok
+test quota_shrink_reclaims_only_the_target_tenant_and_does_not_cancel_pending_puts ... ok
+test tenant_upsert_reserves_a_fresh_version_and_accounts_replacement_until_reclaim ... ok
+test single_mode_collapses_external_tenant_ids_without_quota ... ok
+test revoke_returns_reserved_quota_and_unknown_tenants_are_rejected ... ok
+test retiring_quota_is_released_only_after_the_last_read_handle ... ok
+test tenants_isolate_keys_and_charge_actual_logical_replica_bytes ... ok
+test accepting_capacity_changes_recompute_effective_quota_and_trigger_reclaim ... ok
+test pending_timeout_returns_reserved_quota ... ok
+test best_effort_actual_replica_growth_rechecks_quota_and_rolls_back_placement ... ok
+test resolved_tenant_handles_cannot_cross_manager_boundaries ... ok
+test pruning_one_replica_releases_only_its_committed_tenant_charge ... ok
+test memory_and_nof_quotas_are_admitted_and_accounted_independently ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/lib.rs (target/debug/deps/coro_rpc-e0e30f69e81f8e5e)
+
+running 10 tests
+test hash::tests::matches_upstream_function_ids ... ok
+test protocol::tests::codec_rejects_oversized_and_incomplete_frames ... ok
+test protocol::tests::request_codec_buffers_fragmented_frames ... ok
+test protocol::tests::request_header_golden_bytes ... ok
+test protocol::tests::response_codec_decodes_pipelined_frames ... ok
+test protocol::tests::response_header_golden_bytes ... ok
+test server::tests::failure_details_decode_standard_and_extended_codes ... ok
+test struct_pack::tests::hashes_match_upstream ... ok
+test struct_pack::tests::round_trips_reflected_struct ... ok
+test struct_pack::tests::uses_two_byte_lengths_at_256 ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/access_log.rs (target/debug/deps/access_log-bdd8f713514c9de7)
+
+running 1 test
+test access_log_is_disabled_by_default_and_records_completed_requests_when_enabled ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/end_to_end.rs (target/debug/deps/end_to_end-086cc3651bcc3492)
+
+running 3 tests
+test shutdown_cancels_handlers_and_waits_for_connections ... ok
+test tokio_client_and_server_support_pipeline_errors_and_attachments ... ok
+test timeout_cancellation_releases_client_dispatch_capacity ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/external_transport.rs (target/debug/deps/external_transport-e6f4c6f1ac9f0ed8)
+
+running 2 tests
+test dropping_external_connection_closes_transport ... ok
+test external_stream_preserves_pipeline_errors_attachments_and_partial_io ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/upstream_golden.rs (target/debug/deps/upstream_golden-0bb74d29840345af)
+
+running 4 tests
+test accepts_upstream_debug_type_metadata ... ok
+test upstream_type_literals_and_hashes_match ... ok
+test large_container_metadata_matches_upstream ... ok
+test rust_encoding_matches_upstream_release_build ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/benchmark.rs (target/debug/examples/benchmark-dbf47a54b420ce9d)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests examples/fstack_probe.rs (target/debug/examples/fstack_probe-599c021ee4ffc22b)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/lib.rs (target/debug/deps/coro_rpc_codegen-db9f2a610cd94aec)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/codegen.rs (target/debug/deps/codegen-6f745f37b3e70a7a)
+
+running 11 tests
+test rejects_duplicate_enum_values ... ok
+test rejects_contracts_that_struct_pack_cannot_represent ... ok
+test rejects_container_types_that_cannot_use_rust_btree_collections ... ok
+test rejects_malformed_expected_unions ... ok
+test rejects_non_contiguous_union_field_ids ... ok
+test rejects_union_field_modifiers ... ok
+test reports_thrift_syntax_errors_before_rust_generation ... ok
+test generates_typed_client_server_and_struct_pack_models ... ok
+test generates_i32_backed_struct_pack_enums ... ok
+test generates_struct_pack_variants_from_thrift_unions ... ok
+test generates_unsigned_u8_enums_and_expected_business_types ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

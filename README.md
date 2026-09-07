@@ -389,7 +389,8 @@ DPDK** 服务端后端；默认 production server 仍使用 Tokio TCP，不需�
 
 本机已完成 AF_PACKET 软件 PMD 的真实 TCP 互通及三轮性能对照；这不是物理网卡
 kernel-bypass 测量。接入限制、构建命令、隔离测试脚本、原始数据及性能结果见
-[`docs/dpdk.md`](docs/dpdk.md)。暂未把此实验后端接入 production composition。
+[`docs/dpdk.md`](docs/dpdk.md)。提交前测试矩阵与原始日志见
+[`docs/dpdk_validation.md`](docs/dpdk_validation.md)。暂未把此实验后端接入 production composition。
 
 ## Tokio ClientTaskQueue
 
