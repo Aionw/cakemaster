@@ -1,0 +1,29 @@
+diff --git a/lib/ff_init.c b/lib/ff_init.c
+--- a/lib/ff_init.c
++++ b/lib/ff_init.c
+@@ -27,6 +27,7 @@
+  */
+ 
+ #include <stdlib.h>
++#include <string.h>
+ 
+ #include "ff_api.h"
+ #include "ff_config.h"
+@@ -40,8 +41,16 @@ ff_init(int argc, char * const argv[])
+     ret = ff_load_config(argc, argv);
+     if (ret < 0)
+         exit(1);
+ 
+-    ret = ff_dpdk_init(dpdk_argc, (char **)&dpdk_argv);
++    /* rte_eal_init/getopt reorder argv and can duplicate argv[0]. Keep the
++     * owning array intact for ff_unload_config (otherwise shutdown double-frees
++     * an argument). Only the pointer array is borrowed by EAL. */
++    char **eal_argv = calloc((size_t)dpdk_argc + 1, sizeof(*eal_argv));
++    if (eal_argv == NULL)
++        exit(1);
++    memcpy(eal_argv, dpdk_argv, (size_t)dpdk_argc * sizeof(*eal_argv));
++    ret = ff_dpdk_init(dpdk_argc, eal_argv);
++    free(eal_argv);
+     if (ret < 0)
+         exit(1);
+ 

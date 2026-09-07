@@ -1,0 +1,22 @@
+[
+  {
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 32,
+    "kind": "stat",
+    "iterations": 3000000,
+    "wall_s": 5.013032624032348,
+    "server_cpu_s": 4.53,
+    "client": "client=rust operation=exists batch_size=16 iterations=3000000 pipeline=32 elapsed_s=5.012203 qps=598539 item_qps=9576627 us_per_completion=1.671"
+  },
+  {
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 32,
+    "kind": "record",
+    "iterations": 3000000,
+    "wall_s": 4.986303668003529,
+    "server_cpu_s": 4.460000000000001,
+    "client": "client=rust operation=exists batch_size=16 iterations=3000000 pipeline=32 elapsed_s=4.985347 qps=601764 item_qps=9628216 us_per_completion=1.662"
+  }
+]

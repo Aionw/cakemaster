@@ -402,6 +402,24 @@ fn main() -> Result<(), Box<dyn Error>> {
             let threads = parse_or(arguments.next(), 1_usize)?;
             runtime(threads)?.block_on(run_server(&address))
         }
+        #[cfg(all(feature = "dpdk", target_os = "linux"))]
+        Some("server-dpdk") => {
+            let library = arguments.next().ok_or("missing F-Stack shared library")?;
+            let ini = arguments.next().ok_or("missing F-Stack INI")?;
+            let address = arguments
+                .next()
+                .ok_or("missing IPv4 listen address")?
+                .parse()?;
+            let server =
+                WrappedMasterServiceServer::new(BenchmarkMasterService).into_rpc_server()?;
+            // SAFETY: the explicit CLI path must be the trusted library built by
+            // interop/fstack/build.sh; no other code initializes or calls DPDK.
+            let backend = unsafe { coro_rpc::fstack::FStack::load(library)? };
+            backend.run(coro_rpc::fstack::Config::new(ini), server, address, async {
+                let _ = tokio::signal::ctrl_c().await;
+            })?;
+            Ok(())
+        }
         Some("client") => {
             let address = arguments
                 .next()
@@ -827,6 +845,7 @@ fn print_usage() {
     eprintln!(
         "usage: mooncake_benchmark server [address] [threads] | \
          client [address] [single-exists|single-get|exists|get|put-start|put-end|put-revoke] \
-         [batch-size] [iterations] [pipeline] [warmup]"
+         [batch-size] [iterations] [pipeline] [warmup] | \
+         server-dpdk <library.so> <config.ini> <IPv4:port> (feature dpdk)"
     );
 }

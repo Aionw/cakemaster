@@ -1,0 +1,17 @@
+{
+  "path": "veth / AF_PACKET software PMD, NOT physical NIC kernel bypass",
+  "kernel": "Linux-7.2.2-1-cachyos-x86_64-with-glibc2.44",
+  "server_cpu": 2,
+  "client_cpu": 4,
+  "rounds": 3,
+  "iterations": 300000,
+  "warmup": 30000,
+  "pipelines": [
+    1,
+    32,
+    256
+  ],
+  "library": "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18) (Arch Linux rust 1:1.98.0-1.1)",
+  "lscpu": "CPU CORE SOCKET ONLINE\n  0    0      0     \u662f\n  1    1      0     \u662f\n  2    2      0     \u662f\n  3    3      0     \u662f\n  4    4      0     \u662f\n  5    5      0     \u662f\n  6    6      0     \u662f\n  7    7      0     \u662f\n  8    0      0     \u662f\n  9    1      0     \u662f\n 10    2      0     \u662f\n 11    3      0     \u662f\n 12    4      0     \u662f\n 13    5      0     \u662f\n 14    6      0     \u662f\n 15    7      0     \u662f\n"
+}

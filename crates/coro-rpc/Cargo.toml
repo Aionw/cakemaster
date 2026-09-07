@@ -5,8 +5,14 @@ edition = "2024"
 description = "Tokio implementation of the yalantinglibs coro_rpc v0 wire protocol"
 license = "Apache-2.0"
 
+[features]
+# Native F-Stack/DPDK is loaded explicitly at runtime; normal builds need no SDK.
+dpdk = ["dep:libc", "dep:libloading"]
+
 [dependencies]
 bytes = "1"
+libc = { version = "0.2", optional = true }
+libloading = { version = "0.8", optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
 log.workspace = true
 md-5 = "0.11"

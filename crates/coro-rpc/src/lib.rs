@@ -6,6 +6,8 @@
 
 mod client;
 mod error;
+#[cfg(all(feature = "dpdk", target_os = "linux"))]
+pub mod fstack;
 mod hash;
 mod method;
 pub mod protocol;
@@ -18,8 +20,8 @@ pub use error::{RemoteError, RpcError, RpcErrorCode};
 pub use hash::function_id;
 pub use method::{RpcMethod, RpcNoArgsMethod};
 pub use server::{
-    BoundRpcServer, RegisterError, RequestContext, RpcFailure, RpcResponse, RpcServer,
-    ServerConfig, current_request_context,
+    BoundRpcServer, RegisterError, RequestContext, RpcConnectionHandler, RpcFailure, RpcResponse,
+    RpcServer, ServerConfig, current_request_context,
 };
 pub use struct_pack::{ByteString, StructPack, StructPackError};
 pub use tokio::net::ToSocketAddrs;

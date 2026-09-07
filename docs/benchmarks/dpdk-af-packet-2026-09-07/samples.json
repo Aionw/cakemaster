@@ -1,0 +1,488 @@
+[
+  {
+    "round": 0,
+    "backend": "kernel",
+    "workload": "add",
+    "pipeline": 1,
+    "qps": 229529.0,
+    "raw": "client=rust iterations=300000 pipeline=1 elapsed_s=1.307024 qps=229529 us_per_completion=4.357",
+    "server_cpu_pct_including_warmup": 36.580243456496376
+  },
+  {
+    "round": 0,
+    "backend": "kernel",
+    "workload": "add",
+    "pipeline": 32,
+    "qps": 1254251.0,
+    "raw": "client=rust iterations=300000 pipeline=32 elapsed_s=0.239186 qps=1254251 us_per_completion=0.797",
+    "server_cpu_pct_including_warmup": 30.218714260502587
+  },
+  {
+    "round": 0,
+    "backend": "kernel",
+    "workload": "add",
+    "pipeline": 256,
+    "qps": 1614279.0,
+    "raw": "client=rust iterations=300000 pipeline=256 elapsed_s=0.185841 qps=1614279 us_per_completion=0.619",
+    "server_cpu_pct_including_warmup": 33.86732362272436
+  },
+  {
+    "round": 0,
+    "backend": "kernel",
+    "workload": "get",
+    "pipeline": 1,
+    "qps": 119593.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=1 elapsed_s=2.508516 qps=119593 item_qps=1913482 us_per_completion=8.362",
+    "server_cpu_pct_including_warmup": 37.32137835314752
+  },
+  {
+    "round": 0,
+    "backend": "kernel",
+    "workload": "get",
+    "pipeline": 32,
+    "qps": 235367.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=32 elapsed_s=1.274606 qps=235367 item_qps=3765869 us_per_completion=4.249",
+    "server_cpu_pct_including_warmup": 42.0839500746808
+  },
+  {
+    "round": 0,
+    "backend": "kernel",
+    "workload": "get",
+    "pipeline": 256,
+    "qps": 265347.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=256 elapsed_s=1.130595 qps=265347 item_qps=4245554 us_per_completion=3.769",
+    "server_cpu_pct_including_warmup": 43.31420670729688
+  },
+  {
+    "round": 0,
+    "backend": "kernel",
+    "workload": "exists",
+    "pipeline": 1,
+    "qps": 167089.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=1 elapsed_s=1.795451 qps=167089 item_qps=2673423 us_per_completion=5.985",
+    "server_cpu_pct_including_warmup": 38.20421893171095
+  },
+  {
+    "round": 0,
+    "backend": "kernel",
+    "workload": "exists",
+    "pipeline": 32,
+    "qps": 661194.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=32 elapsed_s=0.453724 qps=661194 item_qps=10579108 us_per_completion=1.512",
+    "server_cpu_pct_including_warmup": 47.9367061012044
+  },
+  {
+    "round": 0,
+    "backend": "kernel",
+    "workload": "exists",
+    "pipeline": 256,
+    "qps": 757567.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=256 elapsed_s=0.396005 qps=757567 item_qps=12121069 us_per_completion=1.320",
+    "server_cpu_pct_including_warmup": 50.5305316461649
+  },
+  {
+    "round": 0,
+    "backend": "dpdk-af-packet",
+    "workload": "add",
+    "pipeline": 1,
+    "qps": 170889.0,
+    "raw": "client=rust iterations=300000 pipeline=1 elapsed_s=1.755528 qps=170889 us_per_completion=5.852",
+    "server_cpu_pct_including_warmup": 82.30579576994394
+  },
+  {
+    "round": 0,
+    "backend": "dpdk-af-packet",
+    "workload": "add",
+    "pipeline": 32,
+    "qps": 1173832.0,
+    "raw": "client=rust iterations=300000 pipeline=32 elapsed_s=0.255573 qps=1173832 us_per_completion=0.852",
+    "server_cpu_pct_including_warmup": 95.77857116169483
+  },
+  {
+    "round": 0,
+    "backend": "dpdk-af-packet",
+    "workload": "add",
+    "pipeline": 256,
+    "qps": 1562280.0,
+    "raw": "client=rust iterations=300000 pipeline=256 elapsed_s=0.192027 qps=1562280 us_per_completion=0.640",
+    "server_cpu_pct_including_warmup": 94.0924019737302
+  },
+  {
+    "round": 0,
+    "backend": "dpdk-af-packet",
+    "workload": "get",
+    "pipeline": 1,
+    "qps": 112216.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=1 elapsed_s=2.673409 qps=112216 item_qps=1795460 us_per_completion=8.911",
+    "server_cpu_pct_including_warmup": 87.66647683777502
+  },
+  {
+    "round": 0,
+    "backend": "dpdk-af-packet",
+    "workload": "get",
+    "pipeline": 32,
+    "qps": 217821.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=32 elapsed_s=1.377277 qps=217821 item_qps=3485138 us_per_completion=4.591",
+    "server_cpu_pct_including_warmup": 89.66109802850768
+  },
+  {
+    "round": 0,
+    "backend": "dpdk-af-packet",
+    "workload": "get",
+    "pipeline": 256,
+    "qps": 265198.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=256 elapsed_s=1.131231 qps=265198 item_qps=4243165 us_per_completion=3.771",
+    "server_cpu_pct_including_warmup": 89.12518607011738
+  },
+  {
+    "round": 0,
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 1,
+    "qps": 155885.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=1 elapsed_s=1.924501 qps=155885 item_qps=2494152 us_per_completion=6.415",
+    "server_cpu_pct_including_warmup": 83.11506294610052
+  },
+  {
+    "round": 0,
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 32,
+    "qps": 510248.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=32 elapsed_s=0.587950 qps=510248 item_qps=8163966 us_per_completion=1.960",
+    "server_cpu_pct_including_warmup": 92.59334906574696
+  },
+  {
+    "round": 0,
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 256,
+    "qps": 618964.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=256 elapsed_s=0.484681 qps=618964 item_qps=9903418 us_per_completion=1.616",
+    "server_cpu_pct_including_warmup": 89.73686856656259
+  },
+  {
+    "round": 1,
+    "backend": "dpdk-af-packet",
+    "workload": "add",
+    "pipeline": 1,
+    "qps": 170148.0,
+    "raw": "client=rust iterations=300000 pipeline=1 elapsed_s=1.763174 qps=170148 us_per_completion=5.877",
+    "server_cpu_pct_including_warmup": 82.43616615341415
+  },
+  {
+    "round": 1,
+    "backend": "dpdk-af-packet",
+    "workload": "add",
+    "pipeline": 32,
+    "qps": 1212888.0,
+    "raw": "client=rust iterations=300000 pipeline=32 elapsed_s=0.247344 qps=1212888 us_per_completion=0.824",
+    "server_cpu_pct_including_warmup": 95.10624731430003
+  },
+  {
+    "round": 1,
+    "backend": "dpdk-af-packet",
+    "workload": "add",
+    "pipeline": 256,
+    "qps": 1572606.0,
+    "raw": "client=rust iterations=300000 pipeline=256 elapsed_s=0.190766 qps=1572606 us_per_completion=0.636",
+    "server_cpu_pct_including_warmup": 94.54018251090397
+  },
+  {
+    "round": 1,
+    "backend": "dpdk-af-packet",
+    "workload": "get",
+    "pipeline": 1,
+    "qps": 110648.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=1 elapsed_s=2.711305 qps=110648 item_qps=1770365 us_per_completion=9.038",
+    "server_cpu_pct_including_warmup": 87.83831056939836
+  },
+  {
+    "round": 1,
+    "backend": "dpdk-af-packet",
+    "workload": "get",
+    "pipeline": 32,
+    "qps": 217869.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=32 elapsed_s=1.376974 qps=217869 item_qps=3485904 us_per_completion=4.590",
+    "server_cpu_pct_including_warmup": 90.19817688848444
+  },
+  {
+    "round": 1,
+    "backend": "dpdk-af-packet",
+    "workload": "get",
+    "pipeline": 256,
+    "qps": 265178.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=256 elapsed_s=1.131314 qps=265178 item_qps=4242853 us_per_completion=3.771",
+    "server_cpu_pct_including_warmup": 89.09348956481624
+  },
+  {
+    "round": 1,
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 1,
+    "qps": 154929.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=1 elapsed_s=1.936367 qps=154929 item_qps=2478868 us_per_completion=6.455",
+    "server_cpu_pct_including_warmup": 83.04291349476085
+  },
+  {
+    "round": 1,
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 32,
+    "qps": 510583.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=32 elapsed_s=0.587563 qps=510583 item_qps=8169333 us_per_completion=1.959",
+    "server_cpu_pct_including_warmup": 91.12826435198863
+  },
+  {
+    "round": 1,
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 256,
+    "qps": 615925.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=256 elapsed_s=0.487072 qps=615925 item_qps=9854808 us_per_completion=1.624",
+    "server_cpu_pct_including_warmup": 93.07391173496885
+  },
+  {
+    "round": 1,
+    "backend": "kernel",
+    "workload": "add",
+    "pipeline": 1,
+    "qps": 228061.0,
+    "raw": "client=rust iterations=300000 pipeline=1 elapsed_s=1.315435 qps=228061 us_per_completion=4.385",
+    "server_cpu_pct_including_warmup": 36.56344315018791
+  },
+  {
+    "round": 1,
+    "backend": "kernel",
+    "workload": "add",
+    "pipeline": 32,
+    "qps": 1240517.0,
+    "raw": "client=rust iterations=300000 pipeline=32 elapsed_s=0.241835 qps=1240517 us_per_completion=0.806",
+    "server_cpu_pct_including_warmup": 30.02875865714739
+  },
+  {
+    "round": 1,
+    "backend": "kernel",
+    "workload": "add",
+    "pipeline": 256,
+    "qps": 1322596.0,
+    "raw": "client=rust iterations=300000 pipeline=256 elapsed_s=0.226827 qps=1322596 us_per_completion=0.756",
+    "server_cpu_pct_including_warmup": 28.49180955308188
+  },
+  {
+    "round": 1,
+    "backend": "kernel",
+    "workload": "get",
+    "pipeline": 1,
+    "qps": 122579.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=1 elapsed_s=2.447397 qps=122579 item_qps=1961267 us_per_completion=8.158",
+    "server_cpu_pct_including_warmup": 37.779123903512215
+  },
+  {
+    "round": 1,
+    "backend": "kernel",
+    "workload": "get",
+    "pipeline": 32,
+    "qps": 243080.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=32 elapsed_s=1.234161 qps=243080 item_qps=3889282 us_per_completion=4.114",
+    "server_cpu_pct_including_warmup": 43.43580130213535
+  },
+  {
+    "round": 1,
+    "backend": "kernel",
+    "workload": "get",
+    "pipeline": 256,
+    "qps": 266853.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=256 elapsed_s=1.124215 qps=266853 item_qps=4269646 us_per_completion=3.747",
+    "server_cpu_pct_including_warmup": 42.79953765700988
+  },
+  {
+    "round": 1,
+    "backend": "kernel",
+    "workload": "exists",
+    "pipeline": 1,
+    "qps": 168137.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=1 elapsed_s=1.784254 qps=168137 item_qps=2690200 us_per_completion=5.948",
+    "server_cpu_pct_including_warmup": 38.173233860212264
+  },
+  {
+    "round": 1,
+    "backend": "kernel",
+    "workload": "exists",
+    "pipeline": 32,
+    "qps": 664947.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=32 elapsed_s=0.451164 qps=664947 item_qps=10639156 us_per_completion=1.504",
+    "server_cpu_pct_including_warmup": 48.24512644631658
+  },
+  {
+    "round": 1,
+    "backend": "kernel",
+    "workload": "exists",
+    "pipeline": 256,
+    "qps": 771130.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=256 elapsed_s=0.389040 qps=771130 item_qps=12338077 us_per_completion=1.297",
+    "server_cpu_pct_including_warmup": 53.67176565027541
+  },
+  {
+    "round": 2,
+    "backend": "kernel",
+    "workload": "add",
+    "pipeline": 1,
+    "qps": 236631.0,
+    "raw": "client=rust iterations=300000 pipeline=1 elapsed_s=1.267795 qps=236631 us_per_completion=4.226",
+    "server_cpu_pct_including_warmup": 36.457465323045426
+  },
+  {
+    "round": 2,
+    "backend": "kernel",
+    "workload": "add",
+    "pipeline": 32,
+    "qps": 1267689.0,
+    "raw": "client=rust iterations=300000 pipeline=32 elapsed_s=0.236651 qps=1267689 us_per_completion=0.789",
+    "server_cpu_pct_including_warmup": 26.76749805060859
+  },
+  {
+    "round": 2,
+    "backend": "kernel",
+    "workload": "add",
+    "pipeline": 256,
+    "qps": 1390776.0,
+    "raw": "client=rust iterations=300000 pipeline=256 elapsed_s=0.215707 qps=1390776 us_per_completion=0.719",
+    "server_cpu_pct_including_warmup": 29.777658182238117
+  },
+  {
+    "round": 2,
+    "backend": "kernel",
+    "workload": "get",
+    "pipeline": 1,
+    "qps": 122362.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=1 elapsed_s=2.451746 qps=122362 item_qps=1957788 us_per_completion=8.172",
+    "server_cpu_pct_including_warmup": 38.16316447697896
+  },
+  {
+    "round": 2,
+    "backend": "kernel",
+    "workload": "get",
+    "pipeline": 32,
+    "qps": 245499.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=32 elapsed_s=1.222002 qps=245499 item_qps=3927980 us_per_completion=4.073",
+    "server_cpu_pct_including_warmup": 43.86855869077626
+  },
+  {
+    "round": 2,
+    "backend": "kernel",
+    "workload": "get",
+    "pipeline": 256,
+    "qps": 269856.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=256 elapsed_s=1.111703 qps=269856 item_qps=4317700 us_per_completion=3.706",
+    "server_cpu_pct_including_warmup": 44.059431195914
+  },
+  {
+    "round": 2,
+    "backend": "kernel",
+    "workload": "exists",
+    "pipeline": 1,
+    "qps": 168730.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=1 elapsed_s=1.777993 qps=168730 item_qps=2699673 us_per_completion=5.927",
+    "server_cpu_pct_including_warmup": 38.31131151753674
+  },
+  {
+    "round": 2,
+    "backend": "kernel",
+    "workload": "exists",
+    "pipeline": 32,
+    "qps": 663397.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=32 elapsed_s=0.452218 qps=663397 item_qps=10614346 us_per_completion=1.507",
+    "server_cpu_pct_including_warmup": 50.15915237178351
+  },
+  {
+    "round": 2,
+    "backend": "kernel",
+    "workload": "exists",
+    "pipeline": 256,
+    "qps": 775140.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=256 elapsed_s=0.387027 qps=775140 item_qps=12402237 us_per_completion=1.290",
+    "server_cpu_pct_including_warmup": 51.560649340499886
+  },
+  {
+    "round": 2,
+    "backend": "dpdk-af-packet",
+    "workload": "add",
+    "pipeline": 1,
+    "qps": 171612.0,
+    "raw": "client=rust iterations=300000 pipeline=1 elapsed_s=1.748132 qps=171612 us_per_completion=5.827",
+    "server_cpu_pct_including_warmup": 82.09650437884524
+  },
+  {
+    "round": 2,
+    "backend": "dpdk-af-packet",
+    "workload": "add",
+    "pipeline": 32,
+    "qps": 1220669.0,
+    "raw": "client=rust iterations=300000 pipeline=32 elapsed_s=0.245767 qps=1220669 us_per_completion=0.819",
+    "server_cpu_pct_including_warmup": 95.56487667732657
+  },
+  {
+    "round": 2,
+    "backend": "dpdk-af-packet",
+    "workload": "add",
+    "pipeline": 256,
+    "qps": 1558318.0,
+    "raw": "client=rust iterations=300000 pipeline=256 elapsed_s=0.192515 qps=1558318 us_per_completion=0.642",
+    "server_cpu_pct_including_warmup": 93.7667405825649
+  },
+  {
+    "round": 2,
+    "backend": "dpdk-af-packet",
+    "workload": "get",
+    "pipeline": 1,
+    "qps": 111066.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=1 elapsed_s=2.701104 qps=111066 item_qps=1777051 us_per_completion=9.004",
+    "server_cpu_pct_including_warmup": 87.44460523778099
+  },
+  {
+    "round": 2,
+    "backend": "dpdk-af-packet",
+    "workload": "get",
+    "pipeline": 32,
+    "qps": 217685.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=32 elapsed_s=1.378136 qps=217685 item_qps=3482965 us_per_completion=4.594",
+    "server_cpu_pct_including_warmup": 90.29169558797373
+  },
+  {
+    "round": 2,
+    "backend": "dpdk-af-packet",
+    "workload": "get",
+    "pipeline": 256,
+    "qps": 264491.0,
+    "raw": "client=rust operation=get batch_size=16 iterations=300000 pipeline=256 elapsed_s=1.134253 qps=264491 item_qps=4231860 us_per_completion=3.781",
+    "server_cpu_pct_including_warmup": 88.87517545437696
+  },
+  {
+    "round": 2,
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 1,
+    "qps": 155698.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=1 elapsed_s=1.926807 qps=155698 item_qps=2491167 us_per_completion=6.423",
+    "server_cpu_pct_including_warmup": 83.45889940750848
+  },
+  {
+    "round": 2,
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 32,
+    "qps": 509505.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=32 elapsed_s=0.588806 qps=509505 item_qps=8152085 us_per_completion=1.963",
+    "server_cpu_pct_including_warmup": 91.00529670104999
+  },
+  {
+    "round": 2,
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 256,
+    "qps": 620362.0,
+    "raw": "client=rust operation=exists batch_size=16 iterations=300000 pipeline=256 elapsed_s=0.483589 qps=620362 item_qps=9925786 us_per_completion=1.612",
+    "server_cpu_pct_including_warmup": 91.85141811965104
+  }
+]
