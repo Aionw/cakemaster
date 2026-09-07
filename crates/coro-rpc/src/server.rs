@@ -14,7 +14,8 @@ use bytes::Bytes;
 use futures_util::stream::FuturesUnordered;
 use futures_util::{FutureExt, Sink, Stream};
 use thiserror::Error;
-use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::{TcpListener, ToSocketAddrs};
 use tokio_util::codec::Framed;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -433,6 +434,17 @@ impl RpcServer {
         Ok(self)
     }
 
+    /// Freeze the route registry for use with externally accepted byte streams.
+    ///
+    /// The transport owner is responsible for socket options, task scheduling,
+    /// connection limits and shutdown. Non-Send streams may run on a local executor.
+    pub fn into_connection_handler(self) -> RpcConnectionHandler {
+        RpcConnectionHandler {
+            config: self.config,
+            routes: Arc::new(self.routes),
+        }
+    }
+
     pub async fn bind(self, address: impl ToSocketAddrs) -> io::Result<BoundRpcServer> {
         let listener = TcpListener::bind(address).await?;
         Ok(BoundRpcServer {
@@ -444,6 +456,32 @@ impl RpcServer {
 
     pub async fn serve(self, address: impl ToSocketAddrs) -> io::Result<()> {
         self.bind(address).await?.run().await
+    }
+}
+
+/// A shared route registry that runs the same RPC driver over any async byte stream.
+#[derive(Clone)]
+pub struct RpcConnectionHandler {
+    config: ServerConfig,
+    routes: Arc<HashMap<u32, Route>>,
+}
+
+impl RpcConnectionHandler {
+    pub fn config(&self) -> &ServerConfig {
+        &self.config
+    }
+
+    /// Drive a connection until EOF/error. Dropping the future closes the stream
+    /// and cancels its handlers, just like shutdown of the TCP server.
+    pub fn serve<S>(
+        &self,
+        stream: S,
+        peer_addr: SocketAddr,
+    ) -> impl Future<Output = Result<(), FrameError>> + use<S>
+    where
+        S: AsyncRead + AsyncWrite + Unpin,
+    {
+        ServerConnection::new(stream, peer_addr, self.routes.clone(), &self.config)
     }
 }
 
@@ -721,8 +759,8 @@ impl Service<RequestFrame> for RpcService {
     }
 }
 
-struct ServerConnection {
-    transport: Framed<TcpStream, ServerCodec>,
+struct ServerConnection<S> {
+    transport: Framed<S, ServerCodec>,
     service: RpcService,
     in_flight: FuturesUnordered<ResponseFuture>,
     pending_responses: VecDeque<ResponseFrame>,
@@ -731,9 +769,9 @@ struct ServerConnection {
     read_closed: bool,
 }
 
-impl ServerConnection {
+impl<S> ServerConnection<S> {
     fn new(
-        stream: TcpStream,
+        stream: S,
         peer_addr: SocketAddr,
         routes: Arc<HashMap<u32, Route>>,
         config: &ServerConfig,
@@ -760,7 +798,7 @@ impl ServerConnection {
     }
 }
 
-impl Future for ServerConnection {
+impl<S: AsyncRead + AsyncWrite + Unpin> Future for ServerConnection<S> {
     type Output = Result<(), FrameError>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {

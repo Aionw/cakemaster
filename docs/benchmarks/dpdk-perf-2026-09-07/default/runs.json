@@ -1,0 +1,202 @@
+[
+  {
+    "backend": "kernel",
+    "workload": "add",
+    "pipeline": 1,
+    "kind": "stat",
+    "iterations": 1000000,
+    "wall_s": 7.2684165890095755,
+    "server_cpu_s": 3.25,
+    "client": "client=rust iterations=1000000 pipeline=1 elapsed_s=7.267501 qps=137599 us_per_completion=7.268"
+  },
+  {
+    "backend": "kernel",
+    "workload": "add",
+    "pipeline": 1,
+    "kind": "record",
+    "iterations": 1000000,
+    "wall_s": 5.385920653003268,
+    "server_cpu_s": 2.3499999999999996,
+    "client": "client=rust iterations=1000000 pipeline=1 elapsed_s=5.385076 qps=185698 us_per_completion=5.385"
+  },
+  {
+    "backend": "kernel",
+    "workload": "exists",
+    "pipeline": 32,
+    "kind": "stat",
+    "iterations": 3000000,
+    "wall_s": 4.632159036002122,
+    "server_cpu_s": 2.35,
+    "client": "client=rust operation=exists batch_size=16 iterations=3000000 pipeline=32 elapsed_s=4.631184 qps=647783 item_qps=10364521 us_per_completion=1.544"
+  },
+  {
+    "backend": "kernel",
+    "workload": "exists",
+    "pipeline": 32,
+    "kind": "record",
+    "iterations": 3000000,
+    "wall_s": 4.581719034933485,
+    "server_cpu_s": 2.29,
+    "client": "client=rust operation=exists batch_size=16 iterations=3000000 pipeline=32 elapsed_s=4.580754 qps=654914 item_qps=10478623 us_per_completion=1.527"
+  },
+  {
+    "backend": "kernel",
+    "workload": "exists",
+    "pipeline": 256,
+    "kind": "stat",
+    "iterations": 3000000,
+    "wall_s": 4.104981440934353,
+    "server_cpu_s": 2.02,
+    "client": "client=rust operation=exists batch_size=16 iterations=3000000 pipeline=256 elapsed_s=4.104135 qps=730970 item_qps=11695523 us_per_completion=1.368"
+  },
+  {
+    "backend": "kernel",
+    "workload": "exists",
+    "pipeline": 256,
+    "kind": "record",
+    "iterations": 3000000,
+    "wall_s": 4.153244815999642,
+    "server_cpu_s": 2.04,
+    "client": "client=rust operation=exists batch_size=16 iterations=3000000 pipeline=256 elapsed_s=4.152369 qps=722479 item_qps=11559667 us_per_completion=1.384"
+  },
+  {
+    "backend": "kernel",
+    "workload": "get",
+    "pipeline": 32,
+    "kind": "stat",
+    "iterations": 1000000,
+    "wall_s": 4.1115565380314365,
+    "server_cpu_s": 1.85,
+    "client": "client=rust operation=get batch_size=16 iterations=1000000 pipeline=32 elapsed_s=4.110593 qps=243274 item_qps=3892382 us_per_completion=4.111"
+  },
+  {
+    "backend": "kernel",
+    "workload": "get",
+    "pipeline": 32,
+    "kind": "record",
+    "iterations": 1000000,
+    "wall_s": 4.10459602298215,
+    "server_cpu_s": 1.8199999999999998,
+    "client": "client=rust operation=get batch_size=16 iterations=1000000 pipeline=32 elapsed_s=4.103659 qps=243685 item_qps=3898960 us_per_completion=4.104"
+  },
+  {
+    "backend": "kernel",
+    "workload": "idle",
+    "pipeline": 0,
+    "kind": "stat",
+    "iterations": 0,
+    "wall_s": 3.000078186043538,
+    "server_cpu_s": 0.0,
+    "client": "idle, no client connections"
+  },
+  {
+    "backend": "kernel",
+    "workload": "idle",
+    "pipeline": 0,
+    "kind": "record",
+    "iterations": 0,
+    "wall_s": 3.00007532897871,
+    "server_cpu_s": 0.0,
+    "client": "idle, no client connections"
+  },
+  {
+    "backend": "dpdk-af-packet",
+    "workload": "add",
+    "pipeline": 1,
+    "kind": "stat",
+    "iterations": 1000000,
+    "wall_s": 5.845917430939153,
+    "server_cpu_s": 4.82,
+    "client": "client=rust iterations=1000000 pipeline=1 elapsed_s=5.844927 qps=171089 us_per_completion=5.845"
+  },
+  {
+    "backend": "dpdk-af-packet",
+    "workload": "add",
+    "pipeline": 1,
+    "kind": "record",
+    "iterations": 1000000,
+    "wall_s": 5.857724105939269,
+    "server_cpu_s": 4.829999999999999,
+    "client": "client=rust iterations=1000000 pipeline=1 elapsed_s=5.856663 qps=170746 us_per_completion=5.857"
+  },
+  {
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 32,
+    "kind": "stat",
+    "iterations": 3000000,
+    "wall_s": 5.835555667988956,
+    "server_cpu_s": 5.32,
+    "client": "client=rust operation=exists batch_size=16 iterations=3000000 pipeline=32 elapsed_s=5.834591 qps=514175 item_qps=8226798 us_per_completion=1.945"
+  },
+  {
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 32,
+    "kind": "record",
+    "iterations": 3000000,
+    "wall_s": 5.845268090022728,
+    "server_cpu_s": 5.309999999999999,
+    "client": "client=rust operation=exists batch_size=16 iterations=3000000 pipeline=32 elapsed_s=5.844422 qps=513310 item_qps=8212960 us_per_completion=1.948"
+  },
+  {
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 256,
+    "kind": "stat",
+    "iterations": 3000000,
+    "wall_s": 4.837001765961759,
+    "server_cpu_s": 4.45,
+    "client": "client=rust operation=exists batch_size=16 iterations=3000000 pipeline=256 elapsed_s=4.836036 qps=620343 item_qps=9925485 us_per_completion=1.612"
+  },
+  {
+    "backend": "dpdk-af-packet",
+    "workload": "exists",
+    "pipeline": 256,
+    "kind": "record",
+    "iterations": 3000000,
+    "wall_s": 4.860730579006486,
+    "server_cpu_s": 4.48,
+    "client": "client=rust operation=exists batch_size=16 iterations=3000000 pipeline=256 elapsed_s=4.859474 qps=617351 item_qps=9877612 us_per_completion=1.620"
+  },
+  {
+    "backend": "dpdk-af-packet",
+    "workload": "get",
+    "pipeline": 32,
+    "kind": "stat",
+    "iterations": 1000000,
+    "wall_s": 4.739991111913696,
+    "server_cpu_s": 4.3,
+    "client": "client=rust operation=get batch_size=16 iterations=1000000 pipeline=32 elapsed_s=4.739056 qps=211013 item_qps=3376200 us_per_completion=4.739"
+  },
+  {
+    "backend": "dpdk-af-packet",
+    "workload": "get",
+    "pipeline": 32,
+    "kind": "record",
+    "iterations": 1000000,
+    "wall_s": 4.6864578879904,
+    "server_cpu_s": 4.2299999999999995,
+    "client": "client=rust operation=get batch_size=16 iterations=1000000 pipeline=32 elapsed_s=4.685547 qps=213422 item_qps=3414756 us_per_completion=4.686"
+  },
+  {
+    "backend": "dpdk-af-packet",
+    "workload": "idle",
+    "pipeline": 0,
+    "kind": "stat",
+    "iterations": 0,
+    "wall_s": 3.0000689439475536,
+    "server_cpu_s": 3.0,
+    "client": "idle, no client connections"
+  },
+  {
+    "backend": "dpdk-af-packet",
+    "workload": "idle",
+    "pipeline": 0,
+    "kind": "record",
+    "iterations": 0,
+    "wall_s": 3.000074051087722,
+    "server_cpu_s": 3.0,
+    "client": "idle, no client connections"
+  }
+]

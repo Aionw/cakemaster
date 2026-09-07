@@ -15,6 +15,32 @@ fn main() -> Result<(), Box<dyn Error>> {
             let threads = parse_or(arguments.next(), 1_usize)?;
             runtime(threads)?.block_on(run_server(&address))
         }
+        #[cfg(all(feature = "dpdk", target_os = "linux"))]
+        Some("server-dpdk") => {
+            let library = arguments.next().ok_or("missing F-Stack shared library")?;
+            let ini = arguments.next().ok_or("missing F-Stack INI")?;
+            let address = arguments
+                .next()
+                .ok_or("missing IPv4 listen address")?
+                .parse()?;
+            let seconds = parse_or(arguments.next(), 0_u64)?;
+            let mut server = RpcServer::new();
+            server.register(
+                RpcMethod::<(i32, i32), i32>::new("add"),
+                |(left, right)| async move { Ok(left + right) },
+            )?;
+            // SAFETY: this explicit CLI path must be the trusted library built by
+            // interop/fstack/build.sh. No other code initializes or calls DPDK.
+            let backend = unsafe { coro_rpc::fstack::FStack::load(library)? };
+            backend.run(coro_rpc::fstack::Config::new(ini), server, address, async {
+                if seconds == 0 {
+                    let _ = tokio::signal::ctrl_c().await;
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
+                }
+            })?;
+            Ok(())
+        }
         Some("client") => {
             let address = arguments
                 .next()
@@ -27,7 +53,8 @@ fn main() -> Result<(), Box<dyn Error>> {
         _ => {
             eprintln!(
                 "usage: benchmark server [address] [threads] | \
-                 client [address] [iterations] [pipeline] [warmup]"
+                 client [address] [iterations] [pipeline] [warmup] | \
+                 server-dpdk <library.so> <config.ini> <IPv4:port> [seconds] (feature dpdk)"
             );
             Ok(())
         }

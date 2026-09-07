@@ -380,6 +380,18 @@ g++ -std=c++20 -O3 -DNDEBUG \
 命令见
 [`docs/object_catalog_mooncake_benchmark.md`](docs/object_catalog_mooncake_benchmark.md)。
 
+## 实验性 F-Stack / DPDK TCP 后端
+
+`--features dpdk` 提供 Linux/IPv4、单 polling core 的可选 **F-Stack（FreeBSD TCP）+
+DPDK** 服务端后端；默认 production server 仍使用 Tokio TCP，不需要 native SDK。
+`RpcServer::into_connection_handler()` 让两种传输复用同一套 framing、路由和 handler driver。
+`benchmark` example 和 `mooncake_benchmark` 支持 `server-dpdk`，现有 TCP client 无需修改。
+
+本机已完成 AF_PACKET 软件 PMD 的真实 TCP 互通及三轮性能对照；这不是物理网卡
+kernel-bypass 测量。接入限制、构建命令、隔离测试脚本、原始数据及性能结果见
+[`docs/dpdk.md`](docs/dpdk.md)。提交前测试矩阵与原始日志见
+[`docs/dpdk_validation.md`](docs/dpdk_validation.md)。暂未把此实验后端接入 production composition。
+
 ## Tokio ClientTaskQueue
 
 [`ClientTaskQueue`](src/server/client_task_queue.rs) 是 Master 侧的

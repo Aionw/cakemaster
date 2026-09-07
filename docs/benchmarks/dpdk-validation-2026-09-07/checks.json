@@ -1,0 +1,203 @@
+{
+  "started_at": "2026-09-07T19:30:36.100736+08:00",
+  "implementation_commit": "e6a5351e62d41003726a448be4acf466dc04b68b",
+  "base_commit": "6edcf65a2ea4ec84ddf0726d4702c4e2569acd45",
+  "checks": [
+    {
+      "name": "workspace_all_features",
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--all-targets",
+        "--all-features"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 2.426,
+      "tests": {
+        "passed": 191,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "name": "workspace_default_features",
+      "command": [
+        "cargo",
+        "test",
+        "--workspace",
+        "--all-targets"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 5.982,
+      "tests": {
+        "passed": 187,
+        "failed": 0,
+        "ignored": 0
+      }
+    },
+    {
+      "name": "rustfmt",
+      "command": [
+        "cargo",
+        "fmt",
+        "--all",
+        "--check"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 0.164
+    },
+    {
+      "name": "clippy_strict",
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings"
+      ],
+      "exit_code": 101,
+      "elapsed_s": 0.615,
+      "diagnostic_tail": "    Checking coro-rpc v0.1.0 (/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/crates/coro-rpc)\n   Compiling coro-rpc-codegen v0.1.0 (/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/crates/coro-rpc-codegen)\nerror: using `chunks_exact` with a constant chunk size\n  --> crates/coro-rpc/tests/upstream_golden.rs:24:10\n   |\n24 |         .chunks_exact(2)\n   |          ^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks::<2>().0.iter()`\n   |\n   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.98.0/index.html#chunks_exact_to_as_chunks\n   = note: `-D clippy::chunks-exact-to-as-chunks` implied by `-D warnings`\n   = help: to override `-D warnings` add `#[allow(clippy::chunks_exact_to_as_chunks)]`\n\nerror: could not compile `coro-rpc` (test \"upstream_golden\") due to 1 previous error\nwarning: build failed, waiting for other jobs to finish..."
+    },
+    {
+      "name": "clippy_existing_lint_exempted",
+      "command": [
+        "cargo",
+        "clippy",
+        "--workspace",
+        "--all-targets",
+        "--all-features",
+        "--",
+        "-D",
+        "warnings",
+        "-A",
+        "clippy::chunks_exact_to_as_chunks"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 1.317
+    },
+    {
+      "name": "release_examples",
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "-p",
+        "coro-rpc",
+        "--features",
+        "dpdk",
+        "--examples"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 1.37
+    },
+    {
+      "name": "release_mooncake_benchmark",
+      "command": [
+        "cargo",
+        "build",
+        "--release",
+        "--features",
+        "dpdk",
+        "--bin",
+        "mooncake_benchmark"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 3.771
+    },
+    {
+      "name": "native_shim",
+      "command": [
+        "env",
+        "FF_PATH=/home/aione/.cache/cakemaster-dpdk/f-stack",
+        "PKG_CONFIG_PATH=/home/aione/.cache/cakemaster-dpdk/install/lib/pkgconfig",
+        "bash",
+        "interop/fstack/build.sh",
+        "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 0.364
+    },
+    {
+      "name": "native_probe",
+      "command": [
+        "env",
+        "PROBE_ONLY=1",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "bash",
+        "interop/fstack/compare.sh",
+        "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so",
+        "/home/aione/.cache/cakemaster-dpdk/pr-validation-20260907/native-probe"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 1.316
+    },
+    {
+      "name": "perf_script_smoke",
+      "command": [
+        "env",
+        "LC_ALL=C",
+        "PYTHONDONTWRITEBYTECODE=1",
+        "PROFILE_CASES=add-p1",
+        "PROFILE_BACKENDS=kernel,dpdk-af-packet",
+        "PROFILE_ITERATIONS=10000",
+        "bash",
+        "interop/fstack/compare.sh",
+        "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so",
+        "/home/aione/.cache/cakemaster-dpdk/pr-validation-20260907/perf-smoke",
+        "profile"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 3.87
+    },
+    {
+      "name": "shell_syntax",
+      "command": [
+        "bash",
+        "-n",
+        "interop/fstack/build.sh",
+        "interop/fstack/compare.sh"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 0.001
+    },
+    {
+      "name": "c_format",
+      "command": [
+        "clang-format",
+        "--dry-run",
+        "--Werror",
+        "--style={BasedOnStyle: LLVM, IndentWidth: 4}",
+        "interop/fstack/shim.c"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 0.007
+    },
+    {
+      "name": "diff_check",
+      "command": [
+        "git",
+        "diff",
+        "--check"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 0.001
+    },
+    {
+      "name": "full_pr_diff_check",
+      "command": [
+        "git",
+        "diff",
+        "origin/main",
+        "--check"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 0.003,
+      "note": "Perf/log text trailing whitespace normalized without changing tokens; unified patch context whitespace declared in .gitattributes."
+    }
+  ]
+}

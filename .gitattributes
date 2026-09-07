@@ -1,0 +1,2 @@
+# Unified patches require a single space on empty context lines.
+interop/fstack/*.patch whitespace=-blank-at-eol,-blank-at-eof

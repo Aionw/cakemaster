@@ -1,0 +1,475 @@
+{
+  "note": "Only server GLIBC_TUNABLES changes; default/tcache4096 order alternated across three rounds; no perf during QPS comparison.",
+  "environments": [
+    {
+      "config": "default",
+      "round": 0,
+      "environment": {
+        "path": "veth / AF_PACKET software PMD, NOT physical NIC kernel bypass",
+        "kernel": "Linux-7.2.2-1-cachyos-x86_64-with-glibc2.44",
+        "server_cpu": 2,
+        "client_cpu": 4,
+        "rounds": 1,
+        "iterations": 1000000,
+        "warmup": 30000,
+        "pipelines": [
+          32,
+          256
+        ],
+        "library": "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so",
+        "workloads": [
+          "exists"
+        ],
+        "server_glibc_tunables": "",
+        "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18) (Arch Linux rust 1:1.98.0-1.1)",
+        "lscpu": "CPU CORE SOCKET ONLINE\n  0    0      0    yes\n  1    1      0    yes\n  2    2      0    yes\n  3    3      0    yes\n  4    4      0    yes\n  5    5      0    yes\n  6    6      0    yes\n  7    7      0    yes\n  8    0      0    yes\n  9    1      0    yes\n 10    2      0    yes\n 11    3      0    yes\n 12    4      0    yes\n 13    5      0    yes\n 14    6      0    yes\n 15    7      0    yes\n",
+        "cpu_info": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD Ryzen 7 9700X 8-Core Processor\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      2\nCore(s) per socket:                      8\nSocket(s):                               1\nStepping:                                0\nMicrocode version:                       0xb404035\nFrequency boost:                         enabled\nCPU(s) scaling MHz:                      35%\nCPU max MHz:                             5582.3008\nCPU min MHz:                             605.3100\nBogoMIPS:                                7599.98\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good amd_lbr_v2 nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpuid_fault cpb cat_l3 cdp_l3 hw_pstate ssbd mba perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk avx_vnni avx512_bf16 clzero irperf xsaveerptr rdpru wbnoinvd cppc arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif x2avic v_spec_ctrl vnmi avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid bus_lock_detect movdiri movdir64b overflow_recov succor smca fsrm avx512_vp2intersect flush_l1d amd_lbr_pmc_freeze\nVirtualization:                          AMD-V\nL1d cache:                               384 KiB (8 instances)\nL1i cache:                               256 KiB (8 instances)\nL2 cache:                                8 MiB (8 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Mitigation; IBPB on VMEXIT only\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; STIBP always-on; PBRSB-eIBRS Not affected; BHI Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB on VMEXIT\n",
+        "fstack_revision": "34065f1396c7695408066c4bccc9dc98c02f60dc + eal-argv.patch",
+        "dpdk_version": "24.11.6 (bundled)",
+        "sha256": {
+          "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so": "e6937e4de65f6c14b655ba4b42c2db5def0dad627861f3a1b8bf46cac0c14632",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/examples/benchmark": "8e9e2d38ae09c6a29f61fafd82f0dc564e4e86ced6a41e19c5e69a315569350f",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/mooncake_benchmark": "ccf0dd5dc031840c00e1556ea7607fd038c56c4a5b39ac1b4ace17adf5cabedb",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/examples/fstack_probe": "11d86eea2d89357e1a926737dff2a03ccb5d8a196211a6bc36ce88d6709a97f8"
+        }
+      }
+    },
+    {
+      "config": "default",
+      "round": 1,
+      "environment": {
+        "path": "veth / AF_PACKET software PMD, NOT physical NIC kernel bypass",
+        "kernel": "Linux-7.2.2-1-cachyos-x86_64-with-glibc2.44",
+        "server_cpu": 2,
+        "client_cpu": 4,
+        "rounds": 1,
+        "iterations": 1000000,
+        "warmup": 30000,
+        "pipelines": [
+          32,
+          256
+        ],
+        "library": "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so",
+        "workloads": [
+          "exists"
+        ],
+        "server_glibc_tunables": "",
+        "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18) (Arch Linux rust 1:1.98.0-1.1)",
+        "lscpu": "CPU CORE SOCKET ONLINE\n  0    0      0    yes\n  1    1      0    yes\n  2    2      0    yes\n  3    3      0    yes\n  4    4      0    yes\n  5    5      0    yes\n  6    6      0    yes\n  7    7      0    yes\n  8    0      0    yes\n  9    1      0    yes\n 10    2      0    yes\n 11    3      0    yes\n 12    4      0    yes\n 13    5      0    yes\n 14    6      0    yes\n 15    7      0    yes\n",
+        "cpu_info": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD Ryzen 7 9700X 8-Core Processor\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      2\nCore(s) per socket:                      8\nSocket(s):                               1\nStepping:                                0\nMicrocode version:                       0xb404035\nFrequency boost:                         enabled\nCPU(s) scaling MHz:                      57%\nCPU max MHz:                             5582.3008\nCPU min MHz:                             605.3100\nBogoMIPS:                                7599.98\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good amd_lbr_v2 nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpuid_fault cpb cat_l3 cdp_l3 hw_pstate ssbd mba perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk avx_vnni avx512_bf16 clzero irperf xsaveerptr rdpru wbnoinvd cppc arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif x2avic v_spec_ctrl vnmi avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid bus_lock_detect movdiri movdir64b overflow_recov succor smca fsrm avx512_vp2intersect flush_l1d amd_lbr_pmc_freeze\nVirtualization:                          AMD-V\nL1d cache:                               384 KiB (8 instances)\nL1i cache:                               256 KiB (8 instances)\nL2 cache:                                8 MiB (8 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Mitigation; IBPB on VMEXIT only\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; STIBP always-on; PBRSB-eIBRS Not affected; BHI Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB on VMEXIT\n",
+        "fstack_revision": "34065f1396c7695408066c4bccc9dc98c02f60dc + eal-argv.patch",
+        "dpdk_version": "24.11.6 (bundled)",
+        "sha256": {
+          "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so": "e6937e4de65f6c14b655ba4b42c2db5def0dad627861f3a1b8bf46cac0c14632",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/examples/benchmark": "8e9e2d38ae09c6a29f61fafd82f0dc564e4e86ced6a41e19c5e69a315569350f",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/mooncake_benchmark": "ccf0dd5dc031840c00e1556ea7607fd038c56c4a5b39ac1b4ace17adf5cabedb",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/examples/fstack_probe": "11d86eea2d89357e1a926737dff2a03ccb5d8a196211a6bc36ce88d6709a97f8"
+        }
+      }
+    },
+    {
+      "config": "default",
+      "round": 2,
+      "environment": {
+        "path": "veth / AF_PACKET software PMD, NOT physical NIC kernel bypass",
+        "kernel": "Linux-7.2.2-1-cachyos-x86_64-with-glibc2.44",
+        "server_cpu": 2,
+        "client_cpu": 4,
+        "rounds": 1,
+        "iterations": 1000000,
+        "warmup": 30000,
+        "pipelines": [
+          32,
+          256
+        ],
+        "library": "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so",
+        "workloads": [
+          "exists"
+        ],
+        "server_glibc_tunables": "",
+        "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18) (Arch Linux rust 1:1.98.0-1.1)",
+        "lscpu": "CPU CORE SOCKET ONLINE\n  0    0      0    yes\n  1    1      0    yes\n  2    2      0    yes\n  3    3      0    yes\n  4    4      0    yes\n  5    5      0    yes\n  6    6      0    yes\n  7    7      0    yes\n  8    0      0    yes\n  9    1      0    yes\n 10    2      0    yes\n 11    3      0    yes\n 12    4      0    yes\n 13    5      0    yes\n 14    6      0    yes\n 15    7      0    yes\n",
+        "cpu_info": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD Ryzen 7 9700X 8-Core Processor\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      2\nCore(s) per socket:                      8\nSocket(s):                               1\nStepping:                                0\nMicrocode version:                       0xb404035\nFrequency boost:                         enabled\nCPU(s) scaling MHz:                      32%\nCPU max MHz:                             5582.3008\nCPU min MHz:                             605.3100\nBogoMIPS:                                7599.98\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good amd_lbr_v2 nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpuid_fault cpb cat_l3 cdp_l3 hw_pstate ssbd mba perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk avx_vnni avx512_bf16 clzero irperf xsaveerptr rdpru wbnoinvd cppc arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif x2avic v_spec_ctrl vnmi avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid bus_lock_detect movdiri movdir64b overflow_recov succor smca fsrm avx512_vp2intersect flush_l1d amd_lbr_pmc_freeze\nVirtualization:                          AMD-V\nL1d cache:                               384 KiB (8 instances)\nL1i cache:                               256 KiB (8 instances)\nL2 cache:                                8 MiB (8 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Mitigation; IBPB on VMEXIT only\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; STIBP always-on; PBRSB-eIBRS Not affected; BHI Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB on VMEXIT\n",
+        "fstack_revision": "34065f1396c7695408066c4bccc9dc98c02f60dc + eal-argv.patch",
+        "dpdk_version": "24.11.6 (bundled)",
+        "sha256": {
+          "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so": "e6937e4de65f6c14b655ba4b42c2db5def0dad627861f3a1b8bf46cac0c14632",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/examples/benchmark": "8e9e2d38ae09c6a29f61fafd82f0dc564e4e86ced6a41e19c5e69a315569350f",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/mooncake_benchmark": "ccf0dd5dc031840c00e1556ea7607fd038c56c4a5b39ac1b4ace17adf5cabedb",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/examples/fstack_probe": "11d86eea2d89357e1a926737dff2a03ccb5d8a196211a6bc36ce88d6709a97f8"
+        }
+      }
+    },
+    {
+      "config": "tcache4096",
+      "round": 0,
+      "environment": {
+        "path": "veth / AF_PACKET software PMD, NOT physical NIC kernel bypass",
+        "kernel": "Linux-7.2.2-1-cachyos-x86_64-with-glibc2.44",
+        "server_cpu": 2,
+        "client_cpu": 4,
+        "rounds": 1,
+        "iterations": 1000000,
+        "warmup": 30000,
+        "pipelines": [
+          32,
+          256
+        ],
+        "library": "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so",
+        "workloads": [
+          "exists"
+        ],
+        "server_glibc_tunables": "glibc.malloc.tcache_count=4096",
+        "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18) (Arch Linux rust 1:1.98.0-1.1)",
+        "lscpu": "CPU CORE SOCKET ONLINE\n  0    0      0    yes\n  1    1      0    yes\n  2    2      0    yes\n  3    3      0    yes\n  4    4      0    yes\n  5    5      0    yes\n  6    6      0    yes\n  7    7      0    yes\n  8    0      0    yes\n  9    1      0    yes\n 10    2      0    yes\n 11    3      0    yes\n 12    4      0    yes\n 13    5      0    yes\n 14    6      0    yes\n 15    7      0    yes\n",
+        "cpu_info": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD Ryzen 7 9700X 8-Core Processor\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      2\nCore(s) per socket:                      8\nSocket(s):                               1\nStepping:                                0\nMicrocode version:                       0xb404035\nFrequency boost:                         enabled\nCPU(s) scaling MHz:                      45%\nCPU max MHz:                             5582.3008\nCPU min MHz:                             605.3100\nBogoMIPS:                                7599.98\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good amd_lbr_v2 nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpuid_fault cpb cat_l3 cdp_l3 hw_pstate ssbd mba perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk avx_vnni avx512_bf16 clzero irperf xsaveerptr rdpru wbnoinvd cppc arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif x2avic v_spec_ctrl vnmi avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid bus_lock_detect movdiri movdir64b overflow_recov succor smca fsrm avx512_vp2intersect flush_l1d amd_lbr_pmc_freeze\nVirtualization:                          AMD-V\nL1d cache:                               384 KiB (8 instances)\nL1i cache:                               256 KiB (8 instances)\nL2 cache:                                8 MiB (8 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Mitigation; IBPB on VMEXIT only\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; STIBP always-on; PBRSB-eIBRS Not affected; BHI Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB on VMEXIT\n",
+        "fstack_revision": "34065f1396c7695408066c4bccc9dc98c02f60dc + eal-argv.patch",
+        "dpdk_version": "24.11.6 (bundled)",
+        "sha256": {
+          "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so": "e6937e4de65f6c14b655ba4b42c2db5def0dad627861f3a1b8bf46cac0c14632",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/examples/benchmark": "8e9e2d38ae09c6a29f61fafd82f0dc564e4e86ced6a41e19c5e69a315569350f",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/mooncake_benchmark": "ccf0dd5dc031840c00e1556ea7607fd038c56c4a5b39ac1b4ace17adf5cabedb",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/examples/fstack_probe": "11d86eea2d89357e1a926737dff2a03ccb5d8a196211a6bc36ce88d6709a97f8"
+        }
+      }
+    },
+    {
+      "config": "tcache4096",
+      "round": 1,
+      "environment": {
+        "path": "veth / AF_PACKET software PMD, NOT physical NIC kernel bypass",
+        "kernel": "Linux-7.2.2-1-cachyos-x86_64-with-glibc2.44",
+        "server_cpu": 2,
+        "client_cpu": 4,
+        "rounds": 1,
+        "iterations": 1000000,
+        "warmup": 30000,
+        "pipelines": [
+          32,
+          256
+        ],
+        "library": "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so",
+        "workloads": [
+          "exists"
+        ],
+        "server_glibc_tunables": "glibc.malloc.tcache_count=4096",
+        "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18) (Arch Linux rust 1:1.98.0-1.1)",
+        "lscpu": "CPU CORE SOCKET ONLINE\n  0    0      0    yes\n  1    1      0    yes\n  2    2      0    yes\n  3    3      0    yes\n  4    4      0    yes\n  5    5      0    yes\n  6    6      0    yes\n  7    7      0    yes\n  8    0      0    yes\n  9    1      0    yes\n 10    2      0    yes\n 11    3      0    yes\n 12    4      0    yes\n 13    5      0    yes\n 14    6      0    yes\n 15    7      0    yes\n",
+        "cpu_info": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD Ryzen 7 9700X 8-Core Processor\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      2\nCore(s) per socket:                      8\nSocket(s):                               1\nStepping:                                0\nMicrocode version:                       0xb404035\nFrequency boost:                         enabled\nCPU(s) scaling MHz:                      47%\nCPU max MHz:                             5582.3008\nCPU min MHz:                             605.3100\nBogoMIPS:                                7599.98\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good amd_lbr_v2 nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpuid_fault cpb cat_l3 cdp_l3 hw_pstate ssbd mba perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk avx_vnni avx512_bf16 clzero irperf xsaveerptr rdpru wbnoinvd cppc arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif x2avic v_spec_ctrl vnmi avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid bus_lock_detect movdiri movdir64b overflow_recov succor smca fsrm avx512_vp2intersect flush_l1d amd_lbr_pmc_freeze\nVirtualization:                          AMD-V\nL1d cache:                               384 KiB (8 instances)\nL1i cache:                               256 KiB (8 instances)\nL2 cache:                                8 MiB (8 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Mitigation; IBPB on VMEXIT only\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; STIBP always-on; PBRSB-eIBRS Not affected; BHI Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB on VMEXIT\n",
+        "fstack_revision": "34065f1396c7695408066c4bccc9dc98c02f60dc + eal-argv.patch",
+        "dpdk_version": "24.11.6 (bundled)",
+        "sha256": {
+          "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so": "e6937e4de65f6c14b655ba4b42c2db5def0dad627861f3a1b8bf46cac0c14632",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/examples/benchmark": "8e9e2d38ae09c6a29f61fafd82f0dc564e4e86ced6a41e19c5e69a315569350f",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/mooncake_benchmark": "ccf0dd5dc031840c00e1556ea7607fd038c56c4a5b39ac1b4ace17adf5cabedb",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/examples/fstack_probe": "11d86eea2d89357e1a926737dff2a03ccb5d8a196211a6bc36ce88d6709a97f8"
+        }
+      }
+    },
+    {
+      "config": "tcache4096",
+      "round": 2,
+      "environment": {
+        "path": "veth / AF_PACKET software PMD, NOT physical NIC kernel bypass",
+        "kernel": "Linux-7.2.2-1-cachyos-x86_64-with-glibc2.44",
+        "server_cpu": 2,
+        "client_cpu": 4,
+        "rounds": 1,
+        "iterations": 1000000,
+        "warmup": 30000,
+        "pipelines": [
+          32,
+          256
+        ],
+        "library": "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so",
+        "workloads": [
+          "exists"
+        ],
+        "server_glibc_tunables": "glibc.malloc.tcache_count=4096",
+        "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18) (Arch Linux rust 1:1.98.0-1.1)",
+        "lscpu": "CPU CORE SOCKET ONLINE\n  0    0      0    yes\n  1    1      0    yes\n  2    2      0    yes\n  3    3      0    yes\n  4    4      0    yes\n  5    5      0    yes\n  6    6      0    yes\n  7    7      0    yes\n  8    0      0    yes\n  9    1      0    yes\n 10    2      0    yes\n 11    3      0    yes\n 12    4      0    yes\n 13    5      0    yes\n 14    6      0    yes\n 15    7      0    yes\n",
+        "cpu_info": "Architecture:                            x86_64\nCPU op-mode(s):                          32-bit, 64-bit\nAddress sizes:                           48 bits physical, 48 bits virtual\nByte Order:                              Little Endian\nCPU(s):                                  16\nOn-line CPU(s) list:                     0-15\nVendor ID:                               AuthenticAMD\nModel name:                              AMD Ryzen 7 9700X 8-Core Processor\nCPU family:                              26\nModel:                                   68\nThread(s) per core:                      2\nCore(s) per socket:                      8\nSocket(s):                               1\nStepping:                                0\nMicrocode version:                       0xb404035\nFrequency boost:                         enabled\nCPU(s) scaling MHz:                      52%\nCPU max MHz:                             5582.3008\nCPU min MHz:                             605.3100\nBogoMIPS:                                7599.98\nFlags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good amd_lbr_v2 nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 sse4_1 sse4_2 movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpuid_fault cpb cat_l3 cdp_l3 hw_pstate ssbd mba perfmon_v2 ibrs ibpb stibp ibrs_enhanced vmmcall fsgsbase tsc_adjust bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a avx512f avx512dq rdseed adx smap avx512ifma clflushopt clwb avx512cd sha_ni avx512bw avx512vl xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk avx_vnni avx512_bf16 clzero irperf xsaveerptr rdpru wbnoinvd cppc arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif x2avic v_spec_ctrl vnmi avx512vbmi umip pku ospke avx512_vbmi2 gfni vaes vpclmulqdq avx512_vnni avx512_bitalg avx512_vpopcntdq rdpid bus_lock_detect movdiri movdir64b overflow_recov succor smca fsrm avx512_vp2intersect flush_l1d amd_lbr_pmc_freeze\nVirtualization:                          AMD-V\nL1d cache:                               384 KiB (8 instances)\nL1i cache:                               256 KiB (8 instances)\nL2 cache:                                8 MiB (8 instances)\nL3 cache:                                32 MiB (1 instance)\nNUMA node(s):                            1\nNUMA node0 CPU(s):                       0-15\nVulnerability Gather data sampling:      Not affected\nVulnerability Ghostwrite:                Not affected\nVulnerability Indirect target selection: Not affected\nVulnerability Itlb multihit:             Not affected\nVulnerability L1tf:                      Not affected\nVulnerability Mds:                       Not affected\nVulnerability Meltdown:                  Not affected\nVulnerability Mmio stale data:           Not affected\nVulnerability Old microcode:             Not affected\nVulnerability Reg file data sampling:    Not affected\nVulnerability Retbleed:                  Not affected\nVulnerability Spec rstack overflow:      Mitigation; IBPB on VMEXIT only\nVulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl\nVulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization\nVulnerability Spectre v2:                Mitigation; Enhanced / Automatic IBRS; IBPB conditional; STIBP always-on; PBRSB-eIBRS Not affected; BHI Not affected\nVulnerability Srbds:                     Not affected\nVulnerability Tsa:                       Not affected\nVulnerability Tsx async abort:           Not affected\nVulnerability Vmscape:                   Mitigation; IBPB on VMEXIT\n",
+        "fstack_revision": "34065f1396c7695408066c4bccc9dc98c02f60dc + eal-argv.patch",
+        "dpdk_version": "24.11.6 (bundled)",
+        "sha256": {
+          "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so": "e6937e4de65f6c14b655ba4b42c2db5def0dad627861f3a1b8bf46cac0c14632",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/examples/benchmark": "8e9e2d38ae09c6a29f61fafd82f0dc564e4e86ced6a41e19c5e69a315569350f",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/mooncake_benchmark": "ccf0dd5dc031840c00e1556ea7607fd038c56c4a5b39ac1b4ace17adf5cabedb",
+          "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/examples/fstack_probe": "11d86eea2d89357e1a926737dff2a03ccb5d8a196211a6bc36ce88d6709a97f8"
+        }
+      }
+    }
+  ],
+  "samples": [
+    {
+      "round": 0,
+      "backend": "kernel",
+      "workload": "exists",
+      "pipeline": 32,
+      "qps": 665353.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=32 elapsed_s=1.502961 qps=665353 item_qps=10645651 us_per_completion=1.503",
+      "server_cpu_pct_including_warmup": 49.38153200276469,
+      "experiment": "default"
+    },
+    {
+      "round": 0,
+      "backend": "kernel",
+      "workload": "exists",
+      "pipeline": 256,
+      "qps": 769420.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=256 elapsed_s=1.299680 qps=769420 item_qps=12310718 us_per_completion=1.300",
+      "server_cpu_pct_including_warmup": 51.52896190595153,
+      "experiment": "default"
+    },
+    {
+      "round": 0,
+      "backend": "dpdk-af-packet",
+      "workload": "exists",
+      "pipeline": 32,
+      "qps": 513267.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=32 elapsed_s=1.948305 qps=513267 item_qps=8212267 us_per_completion=1.948",
+      "server_cpu_pct_including_warmup": 91.63813169353311,
+      "experiment": "default"
+    },
+    {
+      "round": 0,
+      "backend": "dpdk-af-packet",
+      "workload": "exists",
+      "pipeline": 256,
+      "qps": 617447.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=256 elapsed_s=1.619572 qps=617447 item_qps=9879153 us_per_completion=1.620",
+      "server_cpu_pct_including_warmup": 91.65146334981046,
+      "experiment": "default"
+    },
+    {
+      "round": 1,
+      "backend": "kernel",
+      "workload": "exists",
+      "pipeline": 32,
+      "qps": 656645.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=32 elapsed_s=1.522892 qps=656645 item_qps=10506323 us_per_completion=1.523",
+      "server_cpu_pct_including_warmup": 47.50677520295907,
+      "experiment": "default"
+    },
+    {
+      "round": 1,
+      "backend": "kernel",
+      "workload": "exists",
+      "pipeline": 256,
+      "qps": 740233.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=256 elapsed_s=1.350926 qps=740233 item_qps=11843731 us_per_completion=1.351",
+      "server_cpu_pct_including_warmup": 50.329974672984626,
+      "experiment": "default"
+    },
+    {
+      "round": 1,
+      "backend": "dpdk-af-packet",
+      "workload": "exists",
+      "pipeline": 32,
+      "qps": 511067.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=32 elapsed_s=1.956689 qps=511067 item_qps=8177079 us_per_completion=1.957",
+      "server_cpu_pct_including_warmup": 90.77554875631787,
+      "experiment": "default"
+    },
+    {
+      "round": 1,
+      "backend": "dpdk-af-packet",
+      "workload": "exists",
+      "pipeline": 256,
+      "qps": 618757.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=256 elapsed_s=1.616144 qps=618757 item_qps=9900106 us_per_completion=1.616",
+      "server_cpu_pct_including_warmup": 92.44233472754155,
+      "experiment": "default"
+    },
+    {
+      "round": 2,
+      "backend": "kernel",
+      "workload": "exists",
+      "pipeline": 32,
+      "qps": 656216.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=32 elapsed_s=1.523889 qps=656216 item_qps=10499454 us_per_completion=1.524",
+      "server_cpu_pct_including_warmup": 48.77934151534865,
+      "experiment": "default"
+    },
+    {
+      "round": 2,
+      "backend": "kernel",
+      "workload": "exists",
+      "pipeline": 256,
+      "qps": 779524.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=256 elapsed_s=1.282834 qps=779524 item_qps=12472387 us_per_completion=1.283",
+      "server_cpu_pct_including_warmup": 52.93580223721785,
+      "experiment": "default"
+    },
+    {
+      "round": 2,
+      "backend": "dpdk-af-packet",
+      "workload": "exists",
+      "pipeline": 32,
+      "qps": 516239.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=32 elapsed_s=1.937086 qps=516239 item_qps=8259831 us_per_completion=1.937",
+      "server_cpu_pct_including_warmup": 90.64379523017037,
+      "experiment": "default"
+    },
+    {
+      "round": 2,
+      "backend": "dpdk-af-packet",
+      "workload": "exists",
+      "pipeline": 256,
+      "qps": 618908.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=256 elapsed_s=1.615748 qps=618908 item_qps=9902533 us_per_completion=1.616",
+      "server_cpu_pct_including_warmup": 91.86455791074415,
+      "experiment": "default"
+    },
+    {
+      "round": 0,
+      "backend": "kernel",
+      "workload": "exists",
+      "pipeline": 32,
+      "qps": 718717.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=32 elapsed_s=1.391368 qps=718717 item_qps=11499472 us_per_completion=1.391",
+      "server_cpu_pct_including_warmup": 44.62977603554857,
+      "experiment": "tcache4096"
+    },
+    {
+      "round": 0,
+      "backend": "kernel",
+      "workload": "exists",
+      "pipeline": 256,
+      "qps": 835677.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=256 elapsed_s=1.196635 qps=835677 item_qps=13370828 us_per_completion=1.197",
+      "server_cpu_pct_including_warmup": 47.083268932432695,
+      "experiment": "tcache4096"
+    },
+    {
+      "round": 0,
+      "backend": "dpdk-af-packet",
+      "workload": "exists",
+      "pipeline": 32,
+      "qps": 597928.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=32 elapsed_s=1.672443 qps=597928 item_qps=9566842 us_per_completion=1.672",
+      "server_cpu_pct_including_warmup": 89.7757819741975,
+      "experiment": "tcache4096"
+    },
+    {
+      "round": 0,
+      "backend": "dpdk-af-packet",
+      "workload": "exists",
+      "pipeline": 256,
+      "qps": 751818.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=256 elapsed_s=1.330110 qps=751818 item_qps=12029084 us_per_completion=1.330",
+      "server_cpu_pct_including_warmup": 88.99270034351969,
+      "experiment": "tcache4096"
+    },
+    {
+      "round": 1,
+      "backend": "kernel",
+      "workload": "exists",
+      "pipeline": 32,
+      "qps": 721583.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=32 elapsed_s=1.385842 qps=721583 item_qps=11545331 us_per_completion=1.386",
+      "server_cpu_pct_including_warmup": 45.44256291876944,
+      "experiment": "tcache4096"
+    },
+    {
+      "round": 1,
+      "backend": "kernel",
+      "workload": "exists",
+      "pipeline": 256,
+      "qps": 856141.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=256 elapsed_s=1.168031 qps=856141 item_qps=13698263 us_per_completion=1.168",
+      "server_cpu_pct_including_warmup": 48.19256129618034,
+      "experiment": "tcache4096"
+    },
+    {
+      "round": 1,
+      "backend": "dpdk-af-packet",
+      "workload": "exists",
+      "pipeline": 32,
+      "qps": 598732.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=32 elapsed_s=1.670196 qps=598732 item_qps=9579712 us_per_completion=1.670",
+      "server_cpu_pct_including_warmup": 89.48127174527264,
+      "experiment": "tcache4096"
+    },
+    {
+      "round": 1,
+      "backend": "dpdk-af-packet",
+      "workload": "exists",
+      "pipeline": 256,
+      "qps": 754179.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=256 elapsed_s=1.325946 qps=754179 item_qps=12066859 us_per_completion=1.326",
+      "server_cpu_pct_including_warmup": 88.5397686943179,
+      "experiment": "tcache4096"
+    },
+    {
+      "round": 2,
+      "backend": "kernel",
+      "workload": "exists",
+      "pipeline": 32,
+      "qps": 709430.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=32 elapsed_s=1.409582 qps=709430 item_qps=11350880 us_per_completion=1.410",
+      "server_cpu_pct_including_warmup": 44.74504680913519,
+      "experiment": "tcache4096"
+    },
+    {
+      "round": 2,
+      "backend": "kernel",
+      "workload": "exists",
+      "pipeline": 256,
+      "qps": 858948.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=256 elapsed_s=1.164215 qps=858948 item_qps=13743166 us_per_completion=1.164",
+      "server_cpu_pct_including_warmup": 49.18095164430248,
+      "experiment": "tcache4096"
+    },
+    {
+      "round": 2,
+      "backend": "dpdk-af-packet",
+      "workload": "exists",
+      "pipeline": 32,
+      "qps": 599156.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=32 elapsed_s=1.669016 qps=599156 item_qps=9586489 us_per_completion=1.669",
+      "server_cpu_pct_including_warmup": 88.94418191835098,
+      "experiment": "tcache4096"
+    },
+    {
+      "round": 2,
+      "backend": "dpdk-af-packet",
+      "workload": "exists",
+      "pipeline": 256,
+      "qps": 753829.0,
+      "raw": "client=rust operation=exists batch_size=16 iterations=1000000 pipeline=256 elapsed_s=1.326560 qps=753829 item_qps=12061269 us_per_completion=1.327",
+      "server_cpu_pct_including_warmup": 89.20409742927357,
+      "experiment": "tcache4096"
+    }
+  ],
+  "summary": [
+    {
+      "pipeline": 32,
+      "backend": "kernel",
+      "default": 656645.0,
+      "tcache4096": 718717.0,
+      "change_pct": 9.452900730227132
+    },
+    {
+      "pipeline": 32,
+      "backend": "dpdk-af-packet",
+      "default": 513267.0,
+      "tcache4096": 598732.0,
+      "change_pct": 16.65117765217714
+    },
+    {
+      "pipeline": 256,
+      "backend": "kernel",
+      "default": 769420.0,
+      "tcache4096": 856141.0,
+      "change_pct": 11.27095734449326
+    },
+    {
+      "pipeline": 256,
+      "backend": "dpdk-af-packet",
+      "default": 618757.0,
+      "tcache4096": 753829.0,
+      "change_pct": 21.829571221012458
+    }
+  ]
+}

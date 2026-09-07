@@ -1,0 +1,65 @@
+[
+  {
+    "workload": "add",
+    "pipeline": 1,
+    "kernel": 229529.0,
+    "dpdk-af-packet": 170889.0,
+    "change_pct": -25.54796997329314
+  },
+  {
+    "workload": "add",
+    "pipeline": 32,
+    "kernel": 1254251.0,
+    "dpdk-af-packet": 1212888.0,
+    "change_pct": -3.2978247575644715
+  },
+  {
+    "workload": "add",
+    "pipeline": 256,
+    "kernel": 1390776.0,
+    "dpdk-af-packet": 1562280.0,
+    "change_pct": 12.331532899618637
+  },
+  {
+    "workload": "get",
+    "pipeline": 1,
+    "kernel": 122362.0,
+    "dpdk-af-packet": 111066.0,
+    "change_pct": -9.231624197054645
+  },
+  {
+    "workload": "get",
+    "pipeline": 32,
+    "kernel": 243080.0,
+    "dpdk-af-packet": 217821.0,
+    "change_pct": -10.39122922494652
+  },
+  {
+    "workload": "get",
+    "pipeline": 256,
+    "kernel": 266853.0,
+    "dpdk-af-packet": 265178.0,
+    "change_pct": -0.6276864041251162
+  },
+  {
+    "workload": "exists",
+    "pipeline": 1,
+    "kernel": 168137.0,
+    "dpdk-af-packet": 155698.0,
+    "change_pct": -7.398133664809059
+  },
+  {
+    "workload": "exists",
+    "pipeline": 32,
+    "kernel": 663397.0,
+    "dpdk-af-packet": 510248.0,
+    "change_pct": -23.085573193728635
+  },
+  {
+    "workload": "exists",
+    "pipeline": 256,
+    "kernel": 771130.0,
+    "dpdk-af-packet": 618964.0,
+    "change_pct": -19.73285956972236
+  }
+]

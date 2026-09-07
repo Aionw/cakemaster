@@ -1,0 +1,15 @@
+{
+  "scope": "USER SPACE ONLY; no kernel/off-CPU stacks; AF_PACKET software PMD",
+  "perf": "perf version 7.2.1-1",
+  "perf_event_paranoid": "2",
+  "kptr_restrict": "2",
+  "server_cpu": 2,
+  "client_cpu": 4,
+  "perf_cpu": 6,
+  "record": "cycles:u, 997 Hz, DWARF stack 16384; stat is a separate pass",
+  "sha256": {
+    "/home/aione/.cache/cakemaster-dpdk/libcakemaster_fstack.so": "e6937e4de65f6c14b655ba4b42c2db5def0dad627861f3a1b8bf46cac0c14632",
+    "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/examples/benchmark": "8e9e2d38ae09c6a29f61fafd82f0dc564e4e86ced6a41e19c5e69a315569350f",
+    "/home/aione/.herdr/worktrees/cakemaster/feat-dpdk/target/release/mooncake_benchmark": "ccf0dd5dc031840c00e1556ea7607fd038c56c4a5b39ac1b4ace17adf5cabedb"
+  }
+}
