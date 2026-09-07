@@ -186,6 +186,18 @@
       ],
       "exit_code": 0,
       "elapsed_s": 0.001
+    },
+    {
+      "name": "full_pr_diff_check",
+      "command": [
+        "git",
+        "diff",
+        "origin/main",
+        "--check"
+      ],
+      "exit_code": 0,
+      "elapsed_s": 0.003,
+      "note": "Perf/log text trailing whitespace normalized without changing tokens; unified patch context whitespace declared in .gitattributes."
     }
   ]
 }

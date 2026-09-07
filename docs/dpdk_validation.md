@@ -22,7 +22,7 @@ Clippy/native probe 输出也在[同一目录](benchmarks/dpdk-validation-2026-0
 | `interop/fstack/build.sh` | 在已构建的 pinned SDK 上重新构建 shim 成功 |
 | `PROBE_ONLY=1 ... compare.sh` | 真实 F-Stack/AF_PACKET probe 通过 |
 | `... compare.sh ... profile` | kernel/native 两后端的 stat/record 控制和报告生成冒烟通过 |
-| 两个 shell 脚本 `bash -n`、shim 的 clang-format dry-run、`git diff --check` | 通过 |
+| 两个 shell 脚本 `bash -n`、shim 的 clang-format dry-run、PR 全量 `git diff origin/main --check` | 通过 |
 
 严格 Clippy 的诊断为：
 
@@ -32,7 +32,10 @@ error: using `chunks_exact` with a constant chunk size
 clippy::chunks_exact_to_as_chunks
 ```
 
-该文件未被本 PR 修改。未为此变更修改历史 golden test，也没有把严格检查标记为通过；
+入库文本日志/report 仅清理行尾空白和末尾空行，不改变指标、符号或测试输出内容。
+统一 diff 补丁的空 context 行必须保留单个空格，由 `.gitattributes` 为该 patch 单独声明。
+
+`upstream_golden.rs` 未被本 PR 修改。未为此变更修改历史 golden test，也没有把严格检查标记为通过；
 只在另一次诊断运行中豁免此单一 lint。原始失败和豁免后输出均保存。
 
 ## 新增路径的覆盖
