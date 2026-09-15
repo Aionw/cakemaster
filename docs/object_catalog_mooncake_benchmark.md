@@ -1,94 +1,110 @@
-# ObjectCatalog 与 Mooncake 同口径性能对比
+# ObjectCatalog and Mooncake performance comparison under matched conditions
 
-> 2026-08-10 的对比固定在 Mooncake `8c6095c` wire，是历史性能记录。当前
-> `interop/mooncake_benchmark.cpp` 已随主线契约升级到 `5c0724d`；下面先记录基于
-> per-key MVCC `main` 的当前重实现，再保留 PR #19 原实现和更早的历史对比。
+> The 2026-08-10 comparison pins Mooncake `8c6095c` wire and is a historical
+> performance record. Current `interop/mooncake_benchmark.cpp` has moved to
+> `5c0724d` with the mainline contract. Current results for the reimplementation
+> based on per-key MVCC `main` appear first, followed by the original PR #19
+> implementation and earlier historical comparisons.
 
-## Production Master 最大吞吐与 1 秒 p99 边界（2026-08-27）
+## Production Master maximum throughput and the 1-second p99 boundary (2026-08-27)
 
-这一组使用 Mooncake
-[`PR #3147`](https://github.com/kvcache-ai/Mooncake/pull/3147) 的 synthetic master
-workload（提交 `28223ae4a2de0d4aae7e69618e7a60a8f2bb5a5f`）对完整 production
-Master 做固定到达率扫描。Cakemaster 基于 `6337bb6086813624881b091eddcc79a122dbac4e`
-加本次容量调优改动；C++ Mooncake 为
-`cafc50785855f7904c7de7727a6c0baf5c7a3dc8`。两边因 wire 漂移分别使用同一份
-benchmark 源码针对 `5c0724d` 和当前 Mooncake headers 构建，工作负载逻辑完全相同。
+This series uses the synthetic master workload from Mooncake
+[`PR #3147`](https://github.com/kvcache-ai/Mooncake/pull/3147)
+(commit `28223ae4a2de0d4aae7e69618e7a60a8f2bb5a5f`) to sweep fixed arrival rates
+against complete production Masters. Cakemaster is based on
+`6337bb6086813624881b091eddcc79a122dbac4e` plus the capacity-tuning changes in
+this update; C++ Mooncake is `cafc50785855f7904c7de7727a6c0baf5c7a3dc8`.
+Because of wire drift, the same benchmark source was built separately against
+`5c0724d` and current Mooncake headers; workload logic is identical.
 
-本地 benchmark instrumentation 在 PR #3147 原有统计上增加了每类操作的
-avg/p50/p95/p99/p99.9/max，并记录从计划到达时间到操作完成的 `end_to_end` 延迟。
-这里的 SLO 判定使用后者，而不是只看 RPC service time；只要前端 worker queue 持续
-积压，端到端 p99 就会反映出来。
+Local benchmark instrumentation extends PR #3147's original statistics with
+per-operation avg/p50/p95/p99/p99.9/max and `end_to_end` latency from scheduled
+arrival to operation completion. The SLO uses the latter, not just RPC service
+time: sustained frontend worker-queue buildup is reflected in end-to-end p99.
 
-### 环境与 workload
+### Environment and workload
 
-- AMD Ryzen 7 9700X（8C/16T）、46 GiB RAM、Linux 7.1.3；未绑核；
-- Cakemaster 使用 Rust 1.97.1 release build 和 mimalloc；C++ 使用 GCC 16.1.1
-  release build、16 个 RPC thread，并由 `ldd` 确认链接
-  `/usr/lib/libjemalloc.so.2`；
-- 3 个 256 GiB Memory segment，448 KiB value，preferred placement；
-- Exist/Put/Get batch size 分别为 86/45/128；完整 Put transaction 包含
-  `BatchPutStart`、1,152 us commit delay 和 `BatchPutEnd`；
-- 保持 Get 开启；每个 segment 的基准速率为 6.3359 Exist、3.1431 Put transaction、
-  2.0242 Get QPS，再按同一个 factor 放大；
-- fixed open-loop 到达模型、16 个同步 client worker/segment、每个 segment 最多保留
-  1M 个 committed key ID；每档生成 30 秒并等待队列完全排空；
-- Cakemaster 使用 1M allocator node/segment、20M expected object slot 和每步 2,688
-  个 background candidate/reclaim；C++ 关闭 metrics，其他 eviction 参数保持默认。
+- AMD Ryzen 7 9700X (8C/16T), 46 GiB RAM, Linux 7.1.3; no CPU pinning.
+- Cakemaster uses Rust 1.97.1 release builds and mimalloc. C++ uses GCC 16.1.1
+  release builds and 16 RPC threads; `ldd` confirms linkage to
+  `/usr/lib/libjemalloc.so.2`.
+- Three 256 GiB Memory segments, 448 KiB values, preferred placement.
+- Exist/Put/Get batch sizes of 86/45/128. A complete Put transaction includes
+  `BatchPutStart`, a 1,152 us commit delay, and `BatchPutEnd`.
+- Get remains enabled. Baseline per-segment rates are 6.3359 Exist, 3.1431 Put
+  transactions, and 2.0242 Get QPS, all scaled by the same factor.
+- Fixed open-loop arrivals, 16 synchronous client workers per segment, and at
+  most 1M committed key IDs retained per segment. Each level generates traffic
+  for 30 seconds, then waits for the queues to drain completely.
+- Cakemaster uses 1M allocator nodes per segment, 20M expected object slots,
+  and 2,688 background candidates/reclaims per step. C++ disables metrics and
+  keeps other eviction settings at their defaults.
 
-最初的 8 worker/segment 粗扫在约 58K logical task/s 处先撞到 client worker 上限：
-Put commit delay 会占住同步 worker。下表改用 16 worker/segment，避免把 client
-并发限制误报成服务端最大吞吐。10 秒样本也会高估持续容量，因此最大通过点和相邻
-失败点均使用 30 秒窗口；通过点另做两轮相同 workload 复测。
+An initial coarse sweep with 8 workers per segment hit the client-worker limit
+first at about 58K logical tasks/s: the Put commit delay occupies synchronous
+workers. The tables use 16 workers per segment to avoid misreporting client
+concurrency limits as maximum server throughput. Ten-second samples also
+overestimate sustained capacity, so the highest passing and adjacent failing
+levels use 30-second windows. Passing levels were repeated twice with the same
+workload.
 
-### p99 不超过 1 秒的最大通过点
+### Highest passing level with p99 at or below 1 second
 
-`offered logical` 是 client 每秒计划的 Exist/Get/Put transaction 数；`completed
-logical` 用总完成数除以包含 drain 的完整 elapsed time。`actual RPC` 只统计真正调用
-服务端的 RPC：如果 PutStart 没有返回任何 placement，client 不再发送 PutEnd，因此它
-低于假设每个 Put 都执行 Start+End 的目标 business RPC QPS。`committed keys` 和 Put
-key 成功率单列，避免失败快速返回抬高表面吞吐。
+`offered logical` is the scheduled number of Exist/Get/Put transactions per
+second. `completed logical` divides total completions by full elapsed time,
+including drain. `actual RPC` counts only RPCs actually sent to the server: if
+PutStart returns no placement, the client sends no PutEnd, so this is lower
+than the target business RPC QPS assuming Start+End for every Put.
+`committed keys` and Put key success rates are listed separately to avoid fast
+failures inflating apparent throughput.
 
-| 实现 | 最大通过 factor | offered logical/s | completed logical/s | actual RPC/s | committed keys/s | Put key 成功率 |
+| Implementation | Highest passing factor | offered logical/s | completed logical/s | actual RPC/s | committed keys/s | Put key success rate |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Cakemaster | 2,950x | 101,804 | 98,747 | 114,268 | 639,907 | 52.70% |
 | C++ Mooncake + jemalloc | 1,750x | 60,392 | 59,976 | 62,103 | 80,520 | 10.92% |
 
-| 实现 | end-to-end avg | p50 | p95 | p99 | p99.9 | max |
+| Implementation | end-to-end avg | p50 | p95 | p99 | p99.9 | max |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Cakemaster | 152.786 ms | 27.041 ms | 782.756 ms | 928.468 ms | 950.677 ms | 956.479 ms |
 | C++ Mooncake + jemalloc | 148.443 ms | 84.929 ms | 469.574 ms | 663.856 ms | 734.288 ms | 751.560 ms |
 
-对应的服务端操作 p99 如下。Put transaction 包含 commit delay；其余为单次 batch RPC
-service time，不包含 client queue wait。
+Corresponding server-operation p99 values follow. Put transactions include the
+commit delay; other columns measure single-batch RPC service time, excluding
+client queue wait.
 
-| 实现 | Exist | Get | PutStart | PutEnd | Put transaction |
+| Implementation | Exist | Get | PutStart | PutEnd | Put transaction |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Cakemaster | 0.744 ms | 0.794 ms | 1.122 ms | 0.858 ms | 2.611 ms |
 | C++ Mooncake + jemalloc | 6.048 ms | 6.851 ms | 5.847 ms | 0.666 ms | 6.016 ms |
 
-在这个 SLO 限制下，Cakemaster 的 completed logical throughput 是 C++ 的 1.65x，
-actual RPC throughput 是 1.84x。有效提交 key 吞吐是 7.95x，但这部分倍率同时包含
-C++ 在持续 eviction/admission 压力下更低的 Put 成功率，不能解释成纯 RPC 执行性能。
+Under this SLO, Cakemaster reaches 1.65x C++ completed logical throughput and
+1.84x actual RPC throughput. Successfully committed key throughput is 7.95x,
+but that ratio also reflects C++'s lower Put success rate under sustained
+eviction/admission pressure; it is not a pure RPC execution comparison.
 
-相邻档位确认了边界，而不是 client 限速：Cakemaster 3,000x 完成 99,517 logical/s，
-仅 queue dispatch p99 已达 1.185 秒；C++ 1,800x 完成 59,894 logical/s，dispatch
-p99 为 1.101 秒。端到端延迟不会低于 dispatch，因此两档均明确失败。当前扫描精度下
-边界分别为 `[2,950x, 3,000x)` 和 `[1,750x, 1,800x)`。Cakemaster 2,950x 已靠近
-1 秒线；需要为生产抖动留余量时，2,900x 的 30 秒 dispatch p99 为 654 ms。
+Adjacent levels confirm a capacity boundary rather than client rate limiting.
+Cakemaster at 3,000x completes 99,517 logical/s, but queue-dispatch p99 alone
+reaches 1.185 seconds. C++ at 1,800x completes 59,894 logical/s with dispatch p99
+of 1.101 seconds. End-to-end latency cannot be lower than dispatch latency, so
+both fail clearly. At the current sweep resolution, the boundaries are
+`[2,950x, 3,000x)` and `[1,750x, 1,800x)`. Cakemaster at 2,950x is close to the
+1-second line; for production jitter headroom, the 2,900x 30-second sample has
+a dispatch p99 of 654 ms.
 
-通过点的另两轮复测中，Cakemaster completed logical throughput 为
-98,725/98,945 ops/s，dispatch p99 为 904/865 ms；C++ 为
-59,426/59,616 ops/s 和 636/333 ms。重复样本都满足 SLO，但仍应把这些数据视作这台
-未绑核机器的容量基线，不外推成跨硬件固定倍率。
+In the two additional passing-level runs, Cakemaster completed logical throughput
+was 98,725/98,945 ops/s with dispatch p99 of 904/865 ms; C++ measured
+59,426/59,616 ops/s and 636/333 ms. All repeat samples met the SLO, but these
+remain capacity baselines for this unpinned machine, not fixed cross-hardware ratios.
 
-Cakemaster 在 20M `expected-objects` 容量提示下的采样 VmHWM 为 13.2 GiB，C++ 为
-1.79 GiB。该参数会预留 object index 容量，本轮目标是排除运行时扩容对最大吞吐的
-干扰，并未做等内存优化；因此这组数据不能用于声明内存效率。服务端峰值 CPU 采样约为
-709% 和 1,017%。
+With the 20M `expected-objects` capacity hint, Cakemaster's sampled VmHWM was
+13.2 GiB versus C++'s 1.79 GiB. This option reserves object-index capacity; this
+run aimed to remove runtime growth as a maximum-throughput confounder, not to
+optimize for equal memory. These results therefore cannot establish memory
+efficiency. Sampled peak server CPU usage was about 709% and 1,017%, respectively.
 
-### 复现参数
+### Reproduction parameters
 
-Cakemaster server：
+Cakemaster server:
 
 ```bash
 cargo build --release --bin cakemaster
@@ -100,7 +116,7 @@ target/release/cakemaster \
   --log-level off
 ```
 
-C++ server：
+C++ server:
 
 ```bash
 /path/to/Mooncake/build/mooncake-store/src/mooncake_master \
@@ -109,8 +125,8 @@ C++ server：
 ldd /path/to/Mooncake/build/mooncake-store/src/mooncake_master | grep jemalloc
 ```
 
-两个最大通过点分别使用下面的 per-segment QPS；其他参数保留上述 workload 值和 PR
-#3147 默认的 3 个 segment：
+The two highest passing levels use the following per-segment QPS values. Other
+parameters retain the workload values above and PR #3147's default of 3 segments:
 
 ```bash
 # Cakemaster 2,950x
@@ -132,77 +148,91 @@ master_synthetic_bench \
   --max_pending_events_per_segment=1000000
 ```
 
-## 当前 MVCC 实现的 Production 1:1:1 高压闭环（2026-08-17）
+## Current MVCC implementation: production 1:1:1 high-pressure feedback loop (2026-08-17)
 
-当前重实现使用与下一节 PR #19 样本相同的压力参数：115,056,180-byte Memory
-segment、1 KiB 对象、0.90/0.85 high/low watermark，先预填 100K 对象并触达尾部
-50K 热集，再预热 3 秒、测量 10 秒。`BatchPut`、`BatchGet`、`BatchExists` 各有独立
-连接且各限速 300 batch QPS，batch size 为 333。服务端使用 8 个 Tokio worker，三轮
-顺序执行，未绑核；测试机为 Apple M5（10 核）、32 GiB 内存，Rust 1.95.0、Apple
-Clang 21.0.0。
+The current reimplementation uses the same pressure settings as the PR #19 sample
+in the next section: a 115,056,180-byte Memory segment, 1 KiB objects, and
+0.90/0.85 high/low watermarks. It prefills 100K objects, touches the trailing 50K
+hot set, warms up for 3 seconds, then measures for 10 seconds. `BatchPut`,
+`BatchGet`, and `BatchExists` each use an independent connection limited to
+300 batch QPS, with batch size 333. The server uses 8 Tokio workers. Three rounds
+run sequentially without CPU pinning on an Apple M5 (10 cores), 32 GiB RAM,
+Rust 1.95.0, and Apple Clang 21.0.0.
 
-三轮都准确完成每类 3,000 个 logical batch，中位 item rate 为 299,747 ops/s。由于
-这是 900 logical batch QPS 的限速负载，吞吐代表目标完成度而非饱和上限；延迟表给出
-三轮中位数，括号中保留完整范围：
+All three rounds complete exactly 3,000 logical batches per operation, with a
+median item rate of 299,747 ops/s. This rate-limited 900 logical batch QPS workload
+measures target completion rather than saturation capacity. The latency table
+shows three-round medians, with full ranges in parentheses:
 
 | logical batch | p50 | p99 | p99.9 |
 | --- | ---: | ---: | ---: |
-| BatchPut（Start + End） | 903.167 us（785.625–1,123.292） | 2,641.125 us（1,411.125–2,679.667） | 8,911.250 us（2,390.583–11,300.292） |
-| BatchGet | 493.958 us（426.333–680.125） | 2,034.833 us（1,009.500–2,098.958） | 5,868.208 us（1,716.666–8,259.875） |
-| BatchExists | 412.917 us（373.875–528.000） | 1,680.458 us（879.459–1,716.917） | 8,000.625 us（1,661.042–8,479.666） |
+| BatchPut (Start + End) | 903.167 us (785.625–1,123.292) | 2,641.125 us (1,411.125–2,679.667) | 8,911.250 us (2,390.583–11,300.292) |
+| BatchGet | 493.958 us (426.333–680.125) | 2,034.833 us (1,009.500–2,098.958) | 5,868.208 us (1,716.666–8,259.875) |
+| BatchExists | 412.917 us (373.875–528.000) | 1,680.458 us (879.459–1,716.917) | 8,000.625 us (1,661.042–8,479.666) |
 
-每轮 999,000 个 PUT 均成功，`NO_AVAILABLE_HANDLE` 和其他错误均为 0；GET/EXISTS
-也各完成 999,000 个 hit，零 miss/错误。三轮最大物理用量均为 115,055,616 bytes
-（99.9995%），`watermark_triggered=true`。控制器物理回收对象数中位数为 1,297,511，
-对应 1,328,651,264 bytes；退出时三轮的 `retired_bytes` 和显式、allocation、watermark
-debt 均为 0。
+All 999,000 PUTs succeed in each round, with zero `NO_AVAILABLE_HANDLE` or other
+errors. GET/EXISTS each complete 999,000 hits with zero misses/errors. Peak
+physical usage in all three rounds is 115,055,616 bytes (99.9995%), with
+`watermark_triggered=true`. Median physical reclamation by the controller is
+1,297,511 objects, or 1,328,651,264 bytes. At exit, `retired_bytes` and explicit,
+allocation, and watermark debt are all zero in every round.
 
-停止流量后，一轮停在 84.9994% low，另两轮停在 88.8523%/89.4450% hysteresis band。
-后者不是未完成的 debt：持续写入期间上一轮 high-to-low cycle 已结束，最后一段写入在
-低于 high 时停止，因此不会启动新的水位周期。第 2、3 轮分别出现 135/128 次客户端
-调度迟到，最大约 57 ms；对应的尾延迟明显高于无迟到的第 1 轮，所以上表同时保留范围，
-不把桌面环境的三轮样本包装成稳定的尾延迟结论。
+After traffic stops, one round settles at 84.9994% low; the others finish in the
+88.8523%/89.4450% hysteresis band. The latter is not unfinished debt: the previous
+high-to-low cycle completed during sustained writes, and the final writes stopped
+below high, so no new watermark cycle began. Rounds 2 and 3 recorded 135/128
+late client dispatches, with a maximum of about 57 ms. Their tail latency is
+noticeably higher than round 1, which had no late dispatches. Full ranges are
+therefore retained rather than presenting three desktop samples as stable
+tail-latency conclusions.
 
-复现命令与下一节相同。当前结果证明 production composition 在持续 eviction 下能维持
-目标 1:1:1 速率并完成全部写入；若要得到可横向比较的稳定尾延迟，应将 server/client
-固定到不同物理核并增加轮次。
+Reproduction commands are the same as in the next section. These results show
+that production composition sustains the target 1:1:1 rate and completes all
+writes under continuous eviction. Stable, comparable tail-latency measurements
+require pinning server/client to separate physical cores and more rounds.
 
-## PR #19 原实现的 Production 1:1:1 高压闭环（2026-08-17）
+## Original PR #19 implementation: production 1:1:1 high-pressure feedback loop (2026-08-17)
 
-该样本来自基于 `e4ab526` 的 PR #19 原实现。当前
-`object_catalog_rpc_benchmark_server` 同样不再拥有私有 eviction thread，而是直接构造
-production `MooncakeServerComposition`。RPC listener 与 `MasterReconciler` 共用启动、
-pressure wakeup、shutdown 和 join 生命周期；服务退出时若从未越过 high，benchmark 会
-返回失败。
+This sample comes from the original PR #19 implementation based on `e4ab526`.
+The current `object_catalog_rpc_benchmark_server` likewise no longer owns a
+private eviction thread; it directly constructs production
+`MooncakeServerComposition`. The RPC listener and `MasterReconciler` share
+startup, pressure wakeups, shutdown, and join lifecycles. The benchmark fails
+at exit if high was never crossed.
 
-本轮使用 115,056,180-byte Memory segment、1 KiB 对象、0.90/0.85 high/low watermark。
-先成功预填 100K 对象（约 89%）并触达尾部 50K 热集，然后预热 3 秒、测量 10 秒。
-`BatchPut`、`BatchGet`、`BatchExists` 各有独立连接且各限速 300 batch QPS，batch size
-为 333；这等于 900 logical batch QPS、约 299,700 item ops/s。未绑核，以下是一轮
-高压闭环样本，适合记录原实现的策略验证和机器基线，不作为跨硬件或当前 MVCC
-重实现的固定结论。
+This run uses a 115,056,180-byte Memory segment, 1 KiB objects, and 0.90/0.85
+high/low watermarks. It successfully prefills 100K objects (about 89%), touches
+the trailing 50K hot set, warms up for 3 seconds, and measures for 10 seconds.
+`BatchPut`, `BatchGet`, and `BatchExists` each have an independent connection
+limited to 300 batch QPS with batch size 333: 900 logical batch QPS, or about
+299,700 item ops/s. There is no CPU pinning. This single high-pressure sample
+records policy validation and a machine baseline for the original implementation,
+not a fixed conclusion across hardware or for the current MVCC reimplementation.
 
-| logical batch | 完成数 | p50 | p99 | p99.9 |
+| logical batch | Completions | p50 | p99 | p99.9 |
 | --- | ---: | ---: | ---: | ---: |
-| BatchPut（Start + End） | 3,000 | 1,260.430 us | 1,853.818 us | 2,017.554 us |
+| BatchPut (Start + End) | 3,000 | 1,260.430 us | 1,853.818 us | 2,017.554 us |
 | BatchGet | 3,000 | 473.565 us | 1,577.689 us | 1,741.405 us |
 | BatchExists | 3,000 | 279.819 us | 1,416.955 us | 1,492.927 us |
 
-测量窗口三类请求数严格为 3,000:3,000:3,000，实际为 900 logical batch QPS、
-299,761 item ops/s，调度迟到为 0。GET 和 EXISTS 各完成 999,000 个 hit，零 miss/错误。
-PUT 尝试 999,000 个 item，其中 996,216 个成功，2,784 个在接近满容量时有界返回
-`NO_AVAILABLE_HANDLE`，无其他错误；成功率为 99.72%。
+Measurement-window request counts are exactly 3,000:3,000:3,000, delivering
+900 logical batch QPS and 299,761 item ops/s with zero late dispatches. GET and
+EXISTS each complete 999,000 hits with zero misses/errors. Of 999,000 attempted
+PUT items, 996,216 succeed and 2,784 return `NO_AVAILABLE_HANDLE` within bounded
+work near full capacity; there are no other errors. The success rate is 99.72%.
 
-这轮确实触发了水位闭环，而不只是消耗预留 headroom：最大采样用量为
-115,055,616 bytes（99.9995%），`watermark_triggered=true`；控制器累计物理回收
-1,299,737 个对象、1,330,930,688 bytes。停止写压力并继续 reconcile 后，最终用量为
-97,797,120 bytes（84.9994%，不高于 low 的 97,797,753 bytes），此时
-`retired_bytes=0`、两类 debt 均为 0、`settled_to_low=true`。期间记录 12,554 次
-allocation failure wakeup，9,096 次有限重试且全部成功；失败路径仍只执行配置的有限
-collector budget，没有请求路径无界扫描。
+The watermark feedback loop actually triggers rather than merely consuming
+reserved headroom. Maximum sampled usage is 115,055,616 bytes (99.9995%), with
+`watermark_triggered=true`; the controller physically reclaims 1,299,737 objects
+and 1,330,930,688 bytes. After write pressure stops and reconciliation continues,
+final usage is 97,797,120 bytes (84.9994%, no higher than low at 97,797,753 bytes).
+At that point `retired_bytes=0`, both debt categories are zero, and
+`settled_to_low=true`. The run records 12,554 allocation-failure wakeups and
+9,096 bounded retries, all successful. Failure paths still execute only the
+configured finite collector budget, without unbounded request-path scans.
 
-可复现命令（两个终端；client 完成后等待约 3 秒再向 server 发送 Ctrl-C，以打印稳定态
-诊断）：
+Reproduction commands (two terminals; after the client finishes, wait about
+3 seconds before sending Ctrl-C to the server to print settled diagnostics):
 
 ```bash
 g++ -std=c++20 -O3 -DNDEBUG \
@@ -218,48 +248,56 @@ target/release/object_catalog_rpc_benchmark_server \
   127.0.0.1 19094 333 300 10 3 100000 50000 1024
 ```
 
-## Batch RPC 线上比例压测（2026-08-10）
+## Batch RPC load test at production ratios (2026-08-10)
 
-这一组走真实 TCP、Mooncake `WrappedMasterService` wire、真实 catalog、placement、
-OffsetAllocator 和自动高水位淘汰。数据本身不经过 Master；测量的是 metadata plane
-的 RPC、编解码、事务协调、allocator 和 eviction。为了排除 client 实现差异，Rust
-和 C++ server 都由同一个 `-O3` C++ client 驱动。
+This series uses real TCP, Mooncake `WrappedMasterService` wire, a real catalog,
+placement, OffsetAllocator, and automatic high-watermark eviction. Data itself
+does not pass through the Master; measurements cover metadata-plane RPCs,
+encoding/decoding, transaction coordination, allocation, and eviction. The same
+`-O3` C++ client drives both Rust and C++ servers to remove client implementation
+differences.
 
-工作负载按线上量级设置：
+Workload settings reflect production scale:
 
-- `BatchPut`、`BatchGet`、`BatchExists` 各自一条独立连接和限速流，逻辑请求比例
-  1:1:1，每类 150 batch QPS；
-- batch size 为 333，因此每秒新增 `333 * 150 = 49,950` 个 key，总计 450 logical
-  batch QPS、149,850 item ops/s；
-- 一个 logical `BatchPut` 完整包含串行的 `BatchPutStart + BatchPutEnd`，GET/EXISTS
-  各包含一个 RPC；
-- 对象大小 1 KiB，单 Memory segment 为 1,150,561,798 bytes；先成功写入 1M 个
-  key，初始占用恰为 89%；
-- 热集为预填充尾部 500K key，正式启动前由 GET/EXISTS 全量触达；GET 流约每 10 秒
-  覆盖一次热集，与双方 10 秒 lease 一致；
-- 在三条流下预热 10 秒，再测量 30 秒。测量窗口内每类恰好 4,500 batch，PUT 新增
-  1,498,500 key；加上预热后总新增 1,998,000 key，远大于初始剩余空间，因此成功
-  完成必然依赖持续 eviction。
+- `BatchPut`, `BatchGet`, and `BatchExists` each use an independent connection
+  and rate-limited stream, with a 1:1:1 logical request ratio and 150 batch QPS
+  per operation.
+- Batch size is 333, adding `333 * 150 = 49,950` keys per second for a total of
+  450 logical batch QPS and 149,850 item ops/s.
+- One logical `BatchPut` includes serial `BatchPutStart + BatchPutEnd`;
+  GET/EXISTS each consist of one RPC.
+- Objects are 1 KiB, with one 1,150,561,798-byte Memory segment. Successfully
+  prefilling 1M keys produces exactly 89% initial usage.
+- The hot set is the trailing 500K prefilled keys, fully touched by GET/EXISTS
+  before the run. GET covers it about every 10 seconds, matching both sides'
+  10-second leases.
+- All three streams warm up for 10 seconds, then measure for 30 seconds. Each
+  operation completes exactly 4,500 batches in the measurement window; PUT adds
+  1,498,500 keys. Including warmup, 1,998,000 keys are added, far beyond initial
+  free space, so success necessarily depends on sustained eviction.
 
-双方均为 Release 构建、8 个 RPC worker、`high_watermark=0.90`、
-`eviction_ratio=0.05`、10 秒 lease。测试机为 AMD Ryzen 7 9700X（8C/16T），Rust
-1.97.1、GCC 16.1.1；Cakemaster 基于 `dccb3b70582739132b62db90a65a2f0ba9f15724`
-加本次工作树，Mooncake 为 `8c6095c06e20848506cbf91ef4a714924e7b03b1`。测试按实现
-顺序冷启动执行，未绑定 CPU。
+Both use Release builds, 8 RPC workers, `high_watermark=0.90`,
+`eviction_ratio=0.05`, and 10-second leases. Hardware is an AMD Ryzen 7 9700X
+(8C/16T), with Rust 1.97.1 and GCC 16.1.1. Cakemaster is based on
+`dccb3b70582739132b62db90a65a2f0ba9f15724` plus the worktree for this run;
+Mooncake is `8c6095c06e20848506cbf91ef4a714924e7b03b1`. Implementations run
+sequentially from cold starts without CPU pinning.
 
-Rust 完成 3 轮，表中取中位数；C++ 完成 2 轮，表中取两轮中点。第三轮 C++ 因
-执行环境未能批准本地进程启动而没有产生样本，未用失败启动补数。所有有效轮次均
-达到 450 logical batch QPS，PUT start/end 零失败，GET/EXISTS 零 miss/零错误。
+Rust completed 3 rounds, reported as medians. C++ completed 2 rounds, reported
+as their midpoint. A third C++ round produced no sample because the execution
+environment did not approve local process startup; the failed launch was not
+counted as a sample. Every valid round reached 450 logical batch QPS with zero
+PUT start/end failures and zero GET/EXISTS misses/errors.
 
-| logical batch | Rust p50 / p99 / p99.9 | C++ Mooncake p50 / p99 / p99.9 | Rust 相对 C++（越低越好） |
+| logical batch | Rust p50 / p99 / p99.9 | C++ Mooncake p50 / p99 / p99.9 | Rust vs C++ (lower is better) |
 | --- | ---: | ---: | ---: |
-| BatchPut（Start + End） | 1,144.988 / 1,764.960 / 2,243.624 us | 907.538 / 3,467.195 / 9,630.238 us | +26.2% / -49.1% / -76.7% |
+| BatchPut (Start + End) | 1,144.988 / 1,764.960 / 2,243.624 us | 907.538 / 3,467.195 / 9,630.238 us | +26.2% / -49.1% / -76.7% |
 | BatchGet | 479.338 / 1,369.211 / 1,695.677 us | 466.695 / 1,811.577 / 7,761.078 us | +2.7% / -24.4% / -78.2% |
 | BatchExists | 541.390 / 1,151.615 / 1,450.461 us | 351.778 / 1,807.117 / 7,994.771 us | +53.9% / -36.3% / -81.9% |
 
-原始轮次范围如下，避免聚合值掩盖抖动：
+Raw round ranges are retained so aggregation does not hide variability:
 
-| logical batch | 实现 | p50 范围 | p99 范围 | p99.9 范围 |
+| logical batch | Implementation | p50 range | p99 range | p99.9 range |
 | --- | --- | ---: | ---: | ---: |
 | BatchPut | Rust | 1,098.403–1,166.047 us | 1,751.768–1,856.980 us | 2,216.206–2,513.313 us |
 | BatchPut | C++ | 898.277–916.798 us | 3,431.867–3,502.524 us | 9,413.523–9,846.953 us |
@@ -268,18 +306,21 @@ Rust 完成 3 轮，表中取中位数；C++ 完成 2 轮，表中取两轮中�
 | BatchExists | Rust | 300.646–545.454 us | 1,132.894–1,253.671 us | 1,364.077–1,673.612 us |
 | BatchExists | C++ | 338.002–365.553 us | 1,370.170–2,244.064 us | 6,874.585–9,114.957 us |
 
-结论是：在这个线上目标速率而非饱和吞吐测试中，两边 admission 和正确性都满足
-要求。C++ 的 BatchPut/BatchExists 中位延迟更低，BatchGet 中位基本相当；Rust 的
-三类 p99 都更低，p99.9 低约 77%–82%。C++ 两轮分别出现 35/68 次调度迟到，最大
-约 4.1/4.3 ms；Rust 三轮没有调度迟到。由于没有绑核且 C++ 只有两轮，这组数字应
-作为当前机器上的实测基线，不应外推成不同硬件上的固定倍率。
+At this production target rate, rather than saturation throughput, both sides
+meet admission and correctness requirements. C++ has lower BatchPut/BatchExists
+median latency; BatchGet medians are roughly equivalent. Rust has lower p99
+for all three and about 77%–82% lower p99.9. C++ records 35/68 late dispatches
+in its two rounds, with maxima of about 4.1/4.3 ms; Rust records none in three
+rounds. Without CPU pinning and with only two C++ rounds, these numbers are
+measurements on this machine, not fixed ratios for other hardware.
 
-Rust 三轮均触发 40 次 reclaim，回收约 2.01M 个对象，最高水位
-90.036%–90.037%，结束水位 85.94%–86.06%。C++ 在预热和测量中也成功写入远超
-剩余容量的 1.998M 个对象，因而同样实际触发了滚动 eviction，而不是只消耗预留
-headroom。
+Each Rust round triggers 40 reclaims, reclaiming about 2.01M objects, with peak
+watermarks of 90.036%–90.037% and final watermarks of 85.94%–86.06%. C++ also
+successfully writes 1.998M objects during warmup and measurement, far beyond
+remaining capacity, so it too performs rolling eviction rather than only
+consuming reserved headroom.
 
-可复现命令：
+Reproduction commands:
 
 ```bash
 g++ -std=c++20 -O3 -DNDEBUG \
@@ -295,7 +336,7 @@ target/release/object_catalog_rpc_benchmark_server \
 /tmp/mooncake_benchmark mixed-client \
   127.0.0.1 19094 333 150 30 10 1000000 500000 1024
 
-# C++ Mooncake server；master_bench 只负责挂载 segment 并维持心跳
+# C++ Mooncake server; master_bench only mounts segments and maintains heartbeats
 /path/to/Mooncake/build/mooncake-store/src/mooncake_master \
   --rpc_address=127.0.0.1 --rpc_port=19095 --rpc_thread_num=8 \
   --enable_metric_reporting=false --memory_allocator=offset \
@@ -309,132 +350,152 @@ target/release/object_catalog_rpc_benchmark_server \
   127.0.0.1 19095 333 150 30 10 1000000 500000 1024
 ```
 
-当前 Mooncake 提交的
-`mooncake-store/include/ha/snapshot/object/snapshot_object_store.h` 使用 `uint8_t`
-但没有直接包含 `<cstdint>`。本次没有修改其源码，Release 构建只增加了
-`-include cstdint` 作为构建期 workaround；这不会改变被测 Master 的业务路径。
+That Mooncake commit's
+`mooncake-store/include/ha/snapshot/object/snapshot_object_store.h` uses `uint8_t`
+without directly including `<cstdint>`. Its source was not changed for this run;
+the Release build added only `-include cstdint` as a build-time workaround,
+without changing the measured Master's business paths.
 
-上述历史结果使用当时 benchmark server 的独立 Memory-only 压力控制器。当前 server
-已经切换到 production high/low watermark composition；catalog 继续保留按
-tenant/replica class 的 scoped reclaim filter，详见
-[`object_catalog_rpc.md`](object_catalog_rpc.md)。
+These historical results used the benchmark server's then-independent
+Memory-only pressure controller. The current server uses production high/low
+watermark composition. The catalog still retains scoped reclaim filters by
+tenant/replica class; see [object_catalog_rpc.md](object_catalog_rpc.md).
 
-## Direct API 对比（2026-08-07）
+## Direct API comparison (2026-08-07)
 
-测试日期为 2026-08-07。Mooncake 使用提交
-`bdacc80a478cdf574dfd30fbc85ca33d34195a48`，Cakemaster 工作树基于提交
-`765eaf8ff6610649229cc56ba37c1068923ed49d`。测试机为 AMD Ryzen 7 9700X
-（8 核 16 线程），Rust 1.97.1，GCC 16.1.1；双方均使用 Release/O3 构建，
-均为同进程直接调用，不包含 RPC 和数据传输。
+Tests ran on 2026-08-07. Mooncake used commit
+`bdacc80a478cdf574dfd30fbc85ca33d34195a48`; the Cakemaster worktree was based on
+`765eaf8ff6610649229cc56ba37c1068923ed49d`. Hardware was an AMD Ryzen 7 9700X
+(8 cores, 16 threads), with Rust 1.97.1 and GCC 16.1.1. Both used Release/O3
+builds and direct in-process calls, excluding RPC and data transfer.
 
-## 真实高水位自动触发（生产结论）
+## Real automatic high-watermark triggering (production conclusions)
 
-这一组取代手动调用 `BatchEvict(50%)` 作为生产性能结论。双方使用一个
-Memory segment、1 KiB 对象和 OffsetAllocator：先写入 100K 或 1M 个对象，
-使 allocator 位于 89%；冷对象 lease 全部过期，2048 个 hot key 由 get 持续
-续租。随后 8 个 worker 各执行 50K 次交替 put/get，共 400K 次闭环操作，其中
-200K 次为 put。Mooncake 开启默认 `high_watermark=0.90`、`eviction_ratio=0.05`，
-由其 10 ms eviction thread 自动触发；ObjectCatalog 使用相同检测周期和目标公式，
-每个 collector step 最多处理 64 个候选、64 个 reclaim 和 16 个空 slot。
+This series replaces manual `BatchEvict(50%)` calls as the basis for production
+performance conclusions. Both sides use one Memory segment, 1 KiB objects, and
+OffsetAllocator. Prefilling 100K or 1M objects brings allocator usage to 89%.
+All cold-object leases expire, while gets continuously renew 2048 hot keys.
+Then 8 workers each run 50K alternating put/get operations, totaling 400K
+closed-loop operations, including 200K puts. Mooncake enables default
+`high_watermark=0.90` and `eviction_ratio=0.05`, automatically triggered by its
+10 ms eviction thread. ObjectCatalog uses the same detection interval and target
+formula, with at most 64 candidates, 64 reclaims, and 16 empty slots per
+collector step.
 
-100K 取 5 轮中位数，1M 取 3 轮中位数。由于这是最大吞吐闭环压力测试，失败
-请求返回很快，不能用总 ops/s 判断有效写吞吐；下表单独统计成功 put。
+Results are medians of 5 rounds at 100K and 3 rounds at 1M. This is a
+maximum-throughput closed-loop stress test; failed requests return quickly, so
+total ops/s cannot measure useful write throughput. Successful puts are reported
+separately below.
 
-| 初始对象 | 实现 | 最高/结束水位 | 成功 put / 200K | 失败率 | 成功 put/s | 成功 put p99 / p99.9 | get p99 / p99.9 |
+| Initial objects | Implementation | Peak/final watermark | Successful puts / 200K | Failure rate | Successful puts/s | Successful put p99 / p99.9 | get p99 / p99.9 |
 |---:|---|---:|---:|---:|---:|---:|---:|
 | 100K | Mooncake | 100.0% / 85.6% | 31,910 | 84.0% | 685K | 9.91 / 26.44 us | 1.27 / 6.01 us |
 | 100K | ObjectCatalog stable-entry | 100.0% / 85.0% | 29,213 | 85.4% | 955K | 5.45 / 9.28 us | 0.23 / 0.37 us |
 | 1M | Mooncake | 100.0% / 88.5% | 166,003 | 17.0% | 1.590M | 11.82 / 145.25 us | 1.62 / 89.78 us |
 | 1M | ObjectCatalog stable-entry | 100.0% / 85.4% | 159,609 | 20.2% | 3.251M | 7.90 / 58.22 us | 0.24 / 0.51 us |
 
-结论分为两部分：
+Conclusions have two parts:
 
-- stable-entry 去掉 fresh-key 成功 put 的两次 ArcSwap 指针发布后，ObjectCatalog 的有效写吞吐
-  在 100K/1M 分别达到 Mooncake 的约 1.39x/2.04x。100K 尚略低于 1.5x；1M 已超过
-  目标。100K 的主要限制是仅约 30 ms 的压力窗口内只能经历两个 10 ms 回收周期，
-  成功对象数主要由释放容量而非 catalog 计算吞吐决定。
-- 规模达到 1M 后，Mooncake 的低比例 selective-frontier eviction 会扫描大量
-  metadata；成功 put p99.9 达约 145 us，get p99.9 达约 90 us。ObjectCatalog 的
-  bounded collector step p99 约 0.073 ms，get p99.9 保持在 0.51 us，成功 put
-  p99.9 约 58 us。
+- After stable-entry removes two ArcSwap pointer publications from successful
+  fresh-key puts, ObjectCatalog reaches about 1.39x/2.04x Mooncake useful write
+  throughput at 100K/1M. 100K remains slightly below the 1.5x target; 1M exceeds
+  it. At 100K, the main limit is that the roughly 30 ms stress window allows
+  only two 10 ms reclamation cycles, so freed capacity rather than catalog
+  compute throughput determines successful object count.
+- At 1M, Mooncake's low-ratio selective-frontier eviction scans large amounts
+  of metadata. Successful put p99.9 reaches about 145 us and get p99.9 about
+  90 us. ObjectCatalog's bounded collector step p99 is about 0.073 ms, get p99.9
+  stays at 0.51 us, and successful put p99.9 is about 58 us.
 
-1M 时 ObjectCatalog 最终回收到约 85.4%，Mooncake 中位数约 88.5%，说明前者在
-持续压力下完成了更多回收工作；这有利于成功率，但不能用于掩盖其有效写吞吐较低。
-此外，此处是单 key direct API；批量 get 会增加 Mooncake 单次请求撞上被锁 shard
-的概率，应另设 batch 口径，不与本表混用。
+At 1M, ObjectCatalog finishes near 85.4% versus Mooncake's median of about
+88.5%, indicating more reclamation work under sustained pressure. This helps
+success rates but must not obscure lower useful write throughput. These are
+single-key direct APIs; batch gets increase the probability of a Mooncake request
+hitting a locked shard and should be measured separately, not mixed into this table.
 
-高失败率本身也是结论：90% 水位配合 10 ms 轮询，在当前最大写入速率下会在回收
-开始或完成前撞到 100%。除了优化 catalog，还应考虑更早的触发水位、按写入速率
-估算 headroom，以及显式 backpressure，而不是让 allocator fail-fast。
+High failure rates are themselves a finding: a 90% watermark with 10 ms polling
+hits 100% before reclamation starts or finishes at current maximum write rates.
+Beyond catalog optimization, consider earlier trigger watermarks, write-rate-based
+headroom estimates, and explicit backpressure rather than allocator fail-fast.
 
-## 同步回收总工作量
+## Total synchronous reclamation work
 
-这一组直接复用 Mooncake 官方 `batch_evict_bench` 的语义：一个 Memory
-segment、一个完成态 replica、1 KiB 对象、lease 全部过期、无 pin，回收
-50% 对象。预填充不计时；候选选择、元数据删除和 OffsetAllocator 释放全部计时。
-ObjectCatalog 使用 `collect_budget=64`，重复 bounded step 直到完成相同数量的
-回收，并在计时区间内清除空 slot。10K/100K 取 5 轮中位数，1M 取 3 轮中位数。
+This series directly follows Mooncake's official `batch_evict_bench` semantics:
+one Memory segment, one completed replica, 1 KiB objects, all leases expired,
+no pins, and 50% of objects reclaimed. Prefill is untimed; candidate selection,
+metadata deletion, and OffsetAllocator release are all timed. ObjectCatalog uses
+`collect_budget=64`, repeating bounded steps until the same object count is
+reclaimed, and clears empty slots within the timed interval. Results are medians
+of 5 rounds at 10K/100K and 3 rounds at 1M.
 
-| 初始对象 | 回收对象 | Mooncake `BatchEvict` | ObjectCatalog 增量总耗时 | ObjectCatalog 相对性能 | collector step p99 |
+| Initial objects | Reclaimed objects | Mooncake `BatchEvict` | ObjectCatalog total incremental time | ObjectCatalog relative performance | collector step p99 |
 |---:|---:|---:|---:|---:|---:|
-| 10K | 5K | 3.234 ms | 2.568 ms | 1.26x | 约 36 us |
-| 100K | 50K | 44.706 ms | 23.167 ms | 1.93x | 约 33 us |
-| 1M | 500K | 434.132 ms | 252.116 ms | 1.72x | 约 35 us |
+| 10K | 5K | 3.234 ms | 2.568 ms | 1.26x | about 36 us |
+| 100K | 50K | 44.706 ms | 23.167 ms | 1.93x | about 33 us |
+| 1M | 500K | 434.132 ms | 252.116 ms | 1.72x | about 35 us |
 
-在 100K 和 1M 规模上，完整回收工作量达到超过 Mooncake 1.5x 的目标；10K
-规模的固定开销占比更高，只达到 1.26x。把 ObjectCatalog 改成单个大 step
-不会显著降低总工作量，却分别形成约 22 ms 和 275 ms 的单次停顿，因此生产
-配置应保留 bounded step。
+At 100K and 1M, total reclamation meets the goal of exceeding 1.5x Mooncake
+performance. Fixed overhead matters more at 10K, yielding only 1.26x. A single
+large ObjectCatalog step does not significantly reduce total work but creates
+pauses of about 22 ms and 275 ms, respectively, so production should retain
+bounded steps.
 
-## BatchEvict 期间的前台 lookup
+## Foreground lookups during BatchEvict
 
-这一组使用 8 个 lookup 线程循环访问预生成的 2048 个 hot key，预热 10 ms
-后回收 50% 冷对象。双方都走真实的单 key catalog API，不包含 RPC。Mooncake
-在 `BatchEvict` 内同步删除 metadata；ObjectCatalog 先完成逻辑删除和 allocation
-释放，把空 slot 清扫留到回收压力解除后。指标仍取各轮中位数。
+Eight lookup threads repeatedly access 2048 pregenerated hot keys, warm up for
+10 ms, then reclaim 50% of cold objects. Both sides use real single-key catalog
+APIs without RPC. Mooncake deletes metadata synchronously in `BatchEvict`.
+ObjectCatalog first completes logical deletion and allocation release, deferring
+empty-slot cleanup until reclamation pressure subsides. Metrics remain medians
+across rounds.
 
-| 初始对象 | Mooncake 回收耗时 | ObjectCatalog 释放容量 | ObjectCatalog 后台 slot 清扫 | Mooncake lookup p99 | ObjectCatalog lookup p99 |
+| Initial objects | Mooncake reclamation time | ObjectCatalog capacity release | ObjectCatalog background slot cleanup | Mooncake lookup p99 | ObjectCatalog lookup p99 |
 |---:|---:|---:|---:|---:|---:|
-| 100K | 56.036 ms | 46.914 ms（1.19x） | 27.190 ms | 1.57 us | 0.21 us（7.48x） |
-| 1M | 593.823 ms | 451.880 ms（1.31x） | 310.710 ms | 1.43 us | 0.21 us（6.81x） |
+| 100K | 56.036 ms | 46.914 ms (1.19x) | 27.190 ms | 1.57 us | 0.21 us (7.48x) |
+| 1M | 593.823 ms | 451.880 ms (1.31x) | 310.710 ms | 1.43 us | 0.21 us (6.81x) |
 
-ObjectCatalog 在前台有读压力时没有达到 1.5x 的容量释放吞吐，但 lookup p99
-显著更低。若把延后的 slot 清扫也加入总工作量，100K/1M 分别约为 73.9 ms
-和 762.6 ms，慢于 Mooncake；它解决的是 stop-the-world/大批次尾延迟，不是消除
-全部清扫成本。
+Under foreground read pressure, ObjectCatalog does not reach 1.5x capacity-release
+throughput, but lookup p99 is substantially lower. Including deferred slot
+cleanup gives total times of about 73.9 ms at 100K and 762.6 ms at 1M, slower
+than Mooncake. It addresses stop-the-world/large-batch tail latency rather than
+eliminating all cleanup cost.
 
 ## 50:50 put/get
 
-参数为 8 worker、8 个 Memory segment、每线程 50K 次交替 put/get、4 KiB
-对象、2048 个 hot get key。双方都在计时前生成 key；put 包含 allocator reserve、
-元数据创建和 publish/PutEnd，get 使用真实 replica lookup。双方均取 5 轮
-中位样本。
+Settings are 8 workers, 8 Memory segments, 50K alternating put/get operations per
+thread, 4 KiB objects, and 2048 hot get keys. Both sides generate keys before
+timing. Put includes allocator reservation, metadata creation, and
+publish/PutEnd; get performs real replica lookup. Both use median samples from
+5 rounds.
 
-| 实现 | 吞吐 | put p50 / p99 | get p50 / p99 |
+| Implementation | Throughput | put p50 / p99 | get p50 / p99 |
 |---|---:|---:|---:|
 | Mooncake | 6.027 M ops/s | 1.71 / 5.12 us | 0.51 / 0.91 us |
-| ObjectCatalog stable-entry，无 collector | 9.724 M ops/s | 1.14 / 3.38 us | 0.12 / 0.24 us |
-| ObjectCatalog stable-entry，增量 collector | 8.394 M ops/s | 1.11 / 2.41 us | 0.12 / 0.22 us |
+| ObjectCatalog stable-entry, no collector | 9.724 M ops/s | 1.14 / 3.38 us | 0.12 / 0.24 us |
+| ObjectCatalog stable-entry, incremental collector | 8.394 M ops/s | 1.11 / 2.41 us | 0.12 / 0.22 us |
 
-无 collector 时 ObjectCatalog 达到 Mooncake 的 1.61x，超过 1.5x 目标；启用持续
-增量 collector 后为 1.39x。与同一测试会话中的旧实现相比，8 线程无 collector
-从 2.65 M 提升到 9.72 M ops/s，约 3.66x。主要收益来自让一个 CatalogNode 在
-claim/stage/publish 全生命周期保持稳定，并将单副本 ReplicaSet 内联；fresh-key
-成功路径不再执行 ArcSwap writer 的 reader-debt 扫描。
+Without a collector, ObjectCatalog reaches 1.61x Mooncake throughput, exceeding
+the 1.5x target; continuous incremental collection reduces this to 1.39x.
+Compared with the old implementation in the same test session, 8-thread
+throughput without collection rises from 2.65 M to 9.72 M ops/s, about 3.66x.
+The main gains come from keeping a CatalogNode stable throughout
+claim/stage/publish and inlining single-replica ReplicaSet. The fresh-key success
+path no longer scans ArcSwap writer reader debt.
 
-下一优化项是把 slots、claims、pending、published 和 byte accounting 改为分片
-计数，并将 young/pending ingress queue 分片，以缩小 collector 与前台 put 的共享
-cache line。单 segment 高水位场景还需要继续优化 allocator 的串行锁。
+The next optimization is sharded counters for slots, claims, pending, published,
+and byte accounting, plus sharded young/pending ingress queues, reducing cache-line
+sharing between collection and foreground puts. Single-segment high-watermark
+scenarios also need further allocator serial-lock optimization.
 
-## 可复现入口
+## Reproduction entry points
 
-- Rust 回收与并发 lookup：`src/bin/object_catalog_evict_benchmark.rs`
-- Rust 自动水位压力：`src/bin/object_catalog_watermark_benchmark.rs`
-- Rust 50:50：`src/bin/object_catalog_benchmark.rs`
-- Mooncake direct benchmark：`interop/mooncake_object_catalog_benchmark.cpp`
-- Mooncake 官方基线：`mooncake-store/benchmarks/batch_evict_bench.cpp`
+- Rust reclamation and concurrent lookup: `src/bin/object_catalog_evict_benchmark.rs`
+- Rust automatic watermark stress: `src/bin/object_catalog_watermark_benchmark.rs`
+- Rust 50:50: `src/bin/object_catalog_benchmark.rs`
+- Mooncake direct benchmark: `interop/mooncake_object_catalog_benchmark.cpp`
+- Official Mooncake baseline: `mooncake-store/benchmarks/batch_evict_bench.cpp`
 
-ObjectCatalog 回收示例：
+ObjectCatalog reclamation example:
 
 ```bash
 cargo run --release --bin object_catalog_evict_benchmark -- \
@@ -443,7 +504,7 @@ cargo run --release --bin object_catalog_evict_benchmark -- \
   --slot_cleanup_budget=0 --lookup_threads=8 --hot_objects=2048 --rounds=5
 ```
 
-50:50 示例：
+50:50 example:
 
 ```bash
 cargo run --release --bin object_catalog_benchmark -- 8 50000 8 3 2048

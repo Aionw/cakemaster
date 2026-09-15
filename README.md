@@ -22,7 +22,7 @@ It tracks where objects live, allocates space, and coordinates writes and reclam
 
 The project focuses on concurrent metadata management and also provides a reusable Rust `coro_rpc` runtime and interface code generator.
 
-> **Project status:** A runnable, single-process, in-memory subset of the Mooncake Master. It is not yet a complete replacement for upstream `mooncake_master` or a complete Mooncake Store implementation. Metadata is lost on restart.
+> **Project status: Experimental.** This project is intended for experimentation and evaluation; production readiness, stability, and reliability are not guaranteed. It implements a runnable, single-process, in-memory subset of the Mooncake Master, not a complete replacement for upstream `mooncake_master` or a complete Mooncake Store implementation. Metadata is lost on restart.
 
 ## Features
 
@@ -55,7 +55,7 @@ Logs go to stderr and `logs/cakemaster.log` by default. For local debugging, log
 ./target/release/cakemaster --log-output stderr --access-log
 ```
 
-Ctrl-C triggers graceful shutdown; SIGTERM is also supported on Unix. See [runtime configuration](docs/technical_reference.md#直接运行) for capacity planning, reclamation budgets, and log filters.
+Ctrl-C triggers graceful shutdown; SIGTERM is also supported on Unix. See [runtime configuration](docs/technical_reference.md#running-directly) for capacity planning, reclamation budgets, and log filters.
 
 ## Compatibility and Scope
 
@@ -71,6 +71,20 @@ The current contract targets Mooncake [`5c0724d`](https://github.com/kvcache-ai/
 | Other limitations | No TLS, checksums, groups, or complete upstream RPC API coverage yet |
 
 Tenant isolation and quotas are currently library features, not a multi-tenant deployment mode of the default server. See the [feature gap analysis](docs/mooncake_feature_gap.md) for detailed coverage, wire changes, and implementation priorities.
+
+## Benchmarks
+
+In the 2026-08-27 synthetic metadata workload on an AMD Ryzen 7 9700X (8C/16T), the highest tested load meeting **end-to-end p99 ≤ 1 second** produced:
+
+| Metric | Cakemaster | C++ Mooncake + jemalloc |
+| --- | ---: | ---: |
+| Completed logical operations/s | 98,747 | 59,976 |
+| Actual RPC/s | 114,268 | 62,103 |
+| Put key success rate | 52.70% | 10.92% |
+
+That is **1.65× logical throughput** and **1.84× RPC throughput** in this workload, not a general performance guarantee. These are metadata-plane results under sustained eviction/admission pressure, not data-transfer benchmarks; throughput includes unsuccessful operations. Memory was not equalized (sampled peak RSS: 13.2 GiB vs. 1.79 GiB), so this is not a memory-efficiency comparison.
+
+See [benchmark details](docs/object_catalog_mooncake_benchmark.md) for pinned revisions, configuration, latency distributions, repeat runs, and reproduction commands.
 
 ## Repository Layout
 
@@ -108,7 +122,7 @@ cargo test --workspace --all-targets --all-features
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-Tests cover core domain logic, C++ golden wire vectors, generated interfaces, and RPC over real TCP connections. See the [technical reference](docs/technical_reference.md#验证) for cross-language interoperability and benchmark build instructions.
+Tests cover core domain logic, C++ golden wire vectors, generated interfaces, and RPC over real TCP connections. See the [technical reference](docs/technical_reference.md#validation) for cross-language interoperability and benchmark build instructions.
 
 ## License
 

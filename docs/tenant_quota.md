@@ -77,10 +77,13 @@ Reserved ── publish ──▶ Committed ── retire ──▶ Retiring
 - retire keeps `used`/`demand` charged and records the retiring subset;
 - physical reclaim removes `used`, `retiring`, and `demand`.
 
-所有 upsert（包括同尺寸）都为 candidate version 单独预留完整实际 charge。end 后新
-charge 进入 Committed，旧 charge 进入 Retiring；revoke/timeout 只释放 candidate
-reservation，旧 committed charge 不发生状态变化。事务窗口和旧版本延迟回收窗口会同时
-计入新旧版本，避免 lease 或本地 reader handle 仍有效时提前释放旧 allocation。
+Every upsert, including same-size updates, separately reserves the full actual
+charge for the candidate version. After end, the new charge becomes Committed
+and the old charge becomes Retiring; revoke/timeout releases only the candidate
+reservation, leaving the old committed charge unchanged. Both versions remain
+charged during the transaction and deferred reclamation windows, preventing
+premature release of the old allocation while its lease or local reader handles
+remain valid.
 
 Explicit transitions maintain precise snapshots. Before stage,
 `QuotaReservationGuard::drop` rolls back an untransferred reservation; after

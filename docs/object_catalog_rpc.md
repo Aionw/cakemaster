@@ -1,83 +1,104 @@
-# ObjectCatalog 的 Mooncake RPC 设计
+# ObjectCatalog Mooncake RPC design
 
-这条接口只把 Mooncake `WrappedMasterService` 的元数据 RPC 接到现有领域层，不在 RPC
-handler 中复制 catalog、placement 或事务规则。当前实现提供 client lifecycle 的
-`Ping`、`MountSegment`、`ReMountSegment`、`UnmountSegment`、
-`GracefulUnmountSegment`，单 key `ExistKey`、`GetReplicaList`，以及
-`BatchExistKey`、`BatchGetReplicaList`；`PutStart/End/Revoke` 和对应 batch 版本均已覆盖。
-对象更新已覆盖 `UpsertStart/End/Revoke` 及其 batch 版本；删除已覆盖
-`Remove`、`BatchRemove`、`RemoveByRegex` 和 `RemoveAll`。此外，`ServiceReady` 和
-`GetStorageConfig` 提供上游 Client 初始化所需的版本握手与无持久化配置。
+This interface connects Mooncake `WrappedMasterService` metadata RPCs to the
+existing domain layer without duplicating catalog, placement, or transaction
+rules in handlers. The implementation provides client lifecycle RPCs `Ping`,
+`MountSegment`, `ReMountSegment`, `UnmountSegment`, and
+`GracefulUnmountSegment`; single-key `ExistKey` and `GetReplicaList`; and
+`BatchExistKey` and `BatchGetReplicaList`. `PutStart/End/Revoke` and their batch
+variants are covered, as are `UpsertStart/End/Revoke` and their batch variants.
+Deletion covers `Remove`, `BatchRemove`, `RemoveByRegex`, and `RemoveAll`.
+`ServiceReady` and `GetStorageConfig` provide the version handshake and
+nonpersistent configuration required for upstream Client initialization.
 
-## 分层与同步/异步边界
+## Layers and synchronous/asynchronous boundary
 
 ```text
 async WrappedMasterService handler
-        ├── ServiceReady / GetStorageConfig → 固定 wire 兼容配置
+        ├── ServiceReady / GetStorageConfig → fixed wire-compatible configuration
         ├── Ping / segment lifecycle → ClientManager → ClientRegistry + SegmentPool
         └── object RPC → ObjectManager / TenantObjectManager
-                         ├── ObjectCatalog：key 生命周期、owner、lease、pin、回收状态
-                         └── ReplicaAllocator：placement 与 SegmentPool reservation
+                         ├── ObjectCatalog: key lifecycle, owner, lease, pin, reclamation state
+                         └── ReplicaAllocator: placement and SegmentPool reservations
 ```
 
-生成的 RPC trait 使用 `async fn`，因此网络入口可以直接被 Tokio/coro_rpc driver
-调度。`ObjectManager` 刻意保持同步：目前它只访问并发内存结构和本地
-`SegmentPool`，没有需要等待的 I/O，而且 maintenance 每步都有预算上限。以后若
-placement 需要访问远端调度器，应把异步引入 placement/coordinator 边界，而不是
-让 catalog 的纯内存状态机整体异步化。
+The generated RPC trait uses `async fn`, allowing Tokio/coro_rpc drivers to
+schedule network entry points directly. `ObjectManager` deliberately remains
+synchronous: it accesses only concurrent in-memory structures and the local
+`SegmentPool`, has no I/O to await, and bounds each maintenance step by a budget.
+If placement later needs a remote scheduler, introduce asynchrony at the
+placement/coordinator boundary rather than making the entire in-memory catalog
+state machine asynchronous.
 
-`ObjectCatalogRpcService` 自己持有共享的 `MasterClock`。object handler 先校验 wire
-请求并归一化领域输入，再取得单调 tick、执行一次有界 maintenance、解析一次 batch
-tenant、调用领域 batch API 并映射返回值。RPC 与后台 controller 必须 clone 同一个 clock，避免把
-不同时间原点产生的 `CatalogTick` 交给同一个 manager。批内每个 key 独立成功或失败，
-只有连接/编解码失败才返回 transport-level `RpcFailure`。
+`ObjectCatalogRpcService` holds a shared `MasterClock`. Object handlers validate
+wire requests and normalize domain inputs, then obtain a monotonic tick, execute
+one bounded maintenance step, resolve the batch tenant once, call domain batch
+APIs, and map results. RPCs and background controllers must clone the same clock
+to avoid passing `CatalogTick` values with different time origins to one manager.
+Each key succeeds or fails independently within a batch; only connection/codec
+failures return transport-level `RpcFailure`.
 
-所有 client/segment lifecycle RPC 使用同一个 core `ClientManager`：`Ping` 只刷新已有 session 的
-heartbeat，未知 client 返回 `NEED_REMOUNT`；后者把 wire segment 转成 `SegmentSpec`，
-在 per-client 锁下完成 attach/reactivate 与 session 激活，失败时回滚本次资源变更。
-segment 全部 reactivate 后才发布 active session，因此 object write 不会观察到半挂载状态。
-`MountSegment` 也允许 absent client 原子建立首次 session，active client 则可动态追加；
-普通 `UnmountSegment` 立即 quiesce/remove 目标 segment，但保留 client session 和其他
-segment。`GracefulUnmountSegment` 立即 quiesce，在 grace window 内保留已有 replica 的
-liveness，到期后才 remove；它不等待 allocation 清零，也不执行数据迁移。segment remove
-之后，读路径只返回仍 live 的 replica；catalog maintenance 会从 published object 原地剪掉
-stale replica 并同步释放容量和 tenant quota。只要至少一个 replica 存活，对象仍然可见；
-最后一个 replica 失效时才退休整个对象。当前不会自动补齐被剪掉的 replica。
+All client/segment lifecycle RPCs use the same core `ClientManager`. `Ping`
+refreshes only existing sessions' heartbeats; unknown clients receive
+`NEED_REMOUNT`. Segment lifecycle operations convert wire segments into
+`SegmentSpec`, perform attach/reactivate and session activation under a
+per-client lock, and roll back new resource changes on failure. The active
+session is published only after all segments reactivate, so object writes never
+observe a partially mounted state. `MountSegment` also lets absent clients
+atomically establish their first session and active clients add segments
+dynamically. Ordinary `UnmountSegment` immediately quiesces/removes the target
+segment while retaining the client session and other segments.
+`GracefulUnmountSegment` quiesces immediately, preserves existing replica
+liveness during the grace window, and removes only at expiry; it neither waits
+for allocations to reach zero nor migrates data. After removal, reads return only
+live replicas. Catalog maintenance prunes stale replicas from published objects
+in place and releases capacity and tenant quota together. Objects remain visible
+while at least one replica survives; the entire object retires only after its
+last replica becomes invalid. Pruned replicas are not automatically replenished.
 
-常规 object maintenance 由 composition root 从 service 构造的
-`MasterReconciler` 驱动，不再放在每个 RPC batch 的前置路径；write finish/revoke/remove
-批次只在操作完成后补一个与 batch width 匹配的有界 step，用来及时排空本批产生的候选项，
-读请求不参与维护。reconciler 默认每 100ms 依次执行
-client cleanup、到期 Graceful unmount 和有界 object maintenance；topology、deadline 和
-memory pressure 通知会立即触发，产生物理进展的 step 会主动 yield 并重新调度下一轮，
-不把多个 step 合并成一个不可中断循环。production `ObjectManager` 同时启用 90%/80% Memory 高低水位；每个 step 在同一
-collector gate 内先回收、再按去重后的物理 capacity/used 计算本轮 Memory byte target。
-allocation failure 仍允许请求线程尝试一次有界回收。RPC service 与 reconciler 共享
-deadline/topology `Notify`，controller 另有 memory-pressure `Notify`，因此 Graceful 不受
-100ms 周期量化。
-它使用 `MissedTickBehavior::Skip` 且
-由调用方显式运行、停止并 join；同步
-领域 manager 和单个 handler 不会隐式启动后台任务。
+Routine object maintenance is driven by `MasterReconciler`, constructed from the
+service by the composition root, rather than preceding every RPC batch. Write
+finish/revoke/remove batches add only one bounded post-operation step sized to
+the batch width to promptly drain their candidates; reads do not perform
+maintenance. Every 100ms by default, the reconciler runs client cleanup, due
+Graceful unmounts, and bounded object maintenance in sequence. Topology, deadline,
+and memory-pressure notifications trigger it immediately. Steps that make
+physical progress explicitly yield and reschedule another round rather than
+combining multiple steps into an uninterruptible loop. The production
+`ObjectManager` also enables 90%/80% Memory high/low watermarks. Within the same
+collector gate, each step reclaims first, then computes its Memory byte target
+from deduplicated physical capacity/used values. Allocation failure still allows
+the request thread to attempt one bounded collection. The RPC service and
+reconciler share deadline/topology `Notify` instances, while the controller has
+a separate memory-pressure `Notify`, so Graceful deadlines are not quantized to
+100ms. The reconciler uses `MissedTickBehavior::Skip` and must be explicitly run,
+stopped, and joined by the caller. Synchronous domain managers and individual
+handlers never implicitly start background tasks.
 
-`ServiceReady` 返回固定上游基线的握手版本 `2.0.0`；该字符串集中定义在
-`cakemaster::MOONCAKE_STORE_VERSION`，与上游 `MasterClient::Connect()` 的严格相等
-校验一致。`GetStorageConfig` 固定返回 `fsdir=""`、`enable_disk_eviction=false`、
-`quota_bytes=0`，表示不创建 storage backend。上游当前仅在该 RPC 失败时回退到旧
-`GetFsdir`；因此空配置成功响应足以初始化无持久化 Client，兼容 fallback `GetFsdir`
-仍未实现。
+`ServiceReady` returns handshake version `2.0.0` for the pinned upstream
+baseline. This string is centralized in `cakemaster::MOONCAKE_STORE_VERSION` and
+matches upstream `MasterClient::Connect()`'s strict equality check.
+`GetStorageConfig` always returns `fsdir=""`, `enable_disk_eviction=false`, and
+`quota_bytes=0`, indicating that no storage backend should be created. Upstream
+falls back to legacy `GetFsdir` only if this RPC fails, so a successful empty
+configuration is sufficient to initialize a nonpersistent Client. The
+compatibility fallback `GetFsdir` remains unimplemented.
 
-服务类型为 `ObjectCatalogRpcService<B>`，默认 backend 是 `ObjectManager`。RPC
-adapter 内部用私有 `ObjectBatchBackend` trait 统一 batch 接口：single backend 的
-request tenant 是 `()`，multi backend 是 `ResolvedTenant`。trait 通过泛型静态分发，
-不引入每批虚调用；其默认 `execute_batch` 统一 maintenance、tenant 解析和逐项错误
-展开，两种实现只保留实际领域调用的差异。两种具体 manager 仍是核心层的显式安全
-边界。类型化 accessor 只允许 single 服务取得 raw `ObjectManager`，multi 服务只能
-取得 `TenantObjectManager`。
+The service type is `ObjectCatalogRpcService<B>`, with `ObjectManager` as its
+default backend. A private `ObjectBatchBackend` trait unifies the batch interface:
+the single backend's request tenant is `()`, while the multi backend's is
+`ResolvedTenant`. Generic static dispatch adds no per-batch virtual calls. Its
+default `execute_batch` unifies maintenance, tenant resolution, and per-item error
+expansion; the implementations differ only in actual domain calls. The two
+concrete managers remain explicit core safety boundaries. Typed accessors expose
+a raw `ObjectManager` only for single-tenant services; multi-tenant services can
+access only `TenantObjectManager`.
 
-## Production composition 与生命周期
+## Production composition and lifecycle
 
-`MooncakeServerConfig::build` 是 production composition root，默认构造 single-tenant、
-process-local 的内存 backend。它按以下顺序只构造一份状态：
+`MooncakeServerConfig::build` is the production composition root, constructing a
+single-tenant, process-local in-memory backend by default. It constructs each
+piece of state once, in this order:
 
 ```text
 SegmentPool
@@ -85,220 +106,265 @@ SegmentPool
           ├── MemoryEvictionController + pressure Notify
           └── ObjectCatalogRpcService + MasterClock + ClientManager + deadline Notify
                 ├── WrappedMasterServiceServer
-                └── MasterReconciler（从同一 service 派生）
+                └── MasterReconciler (derived from the same service)
 ```
 
-`MooncakeServerComposition` 在 bind 前暴露只读 accessor，测试可直接核对 pool/manager 的
-`Arc` identity、clock epoch 以及 client manager state identity。bind 成功后
-`BoundMooncakeServer::run_until` 以结构化并发同时轮询 RPC server 和 reconciler；外部
-shutdown、server 提前退出或 reconciler 提前退出中的任一事件都会广播停止，随后完整
-等待另一个 participant。coro_rpc server 自身会 cancel 并 join 所有 connection task。
-reconciler 的 shutdown 分支优先于 interval/deadline，因此 shutdown 不会补跑一次
-maintenance 或 Graceful deadline。
+Before binding, `MooncakeServerComposition` exposes read-only accessors so tests
+can verify pool/manager `Arc` identity, clock epoch, and client-manager state
+identity. After a successful bind, `BoundMooncakeServer::run_until` polls the RPC
+server and reconciler with structured concurrency. External shutdown or early
+exit of either participant broadcasts a stop, then fully awaits the other.
+The coro_rpc server cancels and joins all connection tasks itself. The
+reconciler prioritizes shutdown over intervals/deadlines, so shutdown does not
+run an extra maintenance step or Graceful deadline.
 
-production binary 为 `cakemaster`：
+The production binary is `cakemaster`:
 
 ```bash
 cargo run --release -- \
   --listen 127.0.0.1:50051
 ```
 
-`--listen` 必须是明确的 socket address；默认是保守的 loopback
-`127.0.0.1:50051`。`--max-allocator-nodes-per-segment` 默认 128K，控制每个
-direct-memory allocator 预分配的区间 metadata node 数；应按最大同时存活 slice 数和
-碎片余量设置，并不改变 segment 声明的字节容量。
-`--expected-objects` 默认 64K，是 object index 的初始容量提示而非数量硬上限；应覆盖
-峰值 indexed object，并计入 grace period 内保留的空 slot。配置偏小会允许并发 hash
-table 在请求路径上扩容，形成孤立的尾延迟尖峰。
-`--object-collection-budget-per-step` 默认 256，同时控制每个后台 reconcile step 的
-candidate scan 和 retired-object reclaim 上限；增大它可以提高 watermark 收敛速度，
-但也会扩大单步 collector 占用时间，应以目标负载下的成功率和 RPC 尾延迟共同调优，
-并非越大越好。allocation-failure 请求路径仍保留独立的 64/64 预算，不受该参数影响。
-逐请求 access 日志默认关闭，可通过
-`--access-log` 开启；开启后会
-以 info 级别记录来源、路由、sequence、结果、请求/响应大小和耗时。Unix 同时监听
-Ctrl-C 和 SIGTERM，其他 Tokio 支持的平台监听
-Ctrl-C。当前默认沿用 core 已验证配置：64K expected objects、64K clients、10s client
-TTL、10s object lease、30s pending timeout、1GiB retired-byte ceiling、内部固定的 90%/80%
-Memory 水位和 100ms reconcile interval。完整 accounting、
-有界 failure retry 和 diagnostics 语义见 [`memory_eviction.md`](memory_eviction.md)。
-配置及 metadata 都只在内存中，重启不恢复；没有预挂载 segment，
-由 client 的 Mount/ReMount RPC 注册 Memory 容量。
+`--listen` requires an explicit socket address and defaults conservatively to
+loopback `127.0.0.1:50051`. `--max-allocator-nodes-per-segment` defaults to 128K
+and controls the number of preallocated range metadata nodes per direct-memory
+allocator. Size it for peak concurrent slices plus fragmentation headroom; it
+does not change the segment's declared byte capacity.
+`--expected-objects` defaults to 64K and is an initial object-index capacity hint,
+not a hard count limit. It should cover peak indexed objects, including empty
+slots retained during the grace period. Undersizing permits concurrent hash-table
+growth on the request path, causing isolated tail-latency spikes.
+`--object-collection-budget-per-step` defaults to 256 and controls both candidate
+scan and retired-object reclaim limits per background reconcile step. Raising it
+can speed watermark convergence but also increase collector occupancy per step.
+Tune against both success rate and RPC tail latency under the target load;
+larger is not always better. The allocation-failure request path retains an
+independent 64/64 budget unaffected by this setting.
+Per-request access logs are disabled by default. `--access-log` enables info-level
+logging of source, route, sequence, result, request/response sizes, and duration.
+Unix handles both Ctrl-C and SIGTERM; other Tokio-supported platforms handle
+Ctrl-C. Defaults retain the core's validated configuration: 64K expected objects,
+64K clients, 10s client TTL, 10s object lease, 30s pending timeout, 1GiB retired-byte
+ceiling, internally fixed 90%/80% Memory watermarks, and a 100ms reconcile interval.
+See [`memory_eviction.md`](memory_eviction.md) for full accounting, bounded failure
+retry, and diagnostics semantics. Configuration and metadata are in-memory only
+and are not restored after restart. No segments are premounted; clients register
+Memory capacity through Mount/ReMount RPCs.
 
-这个入口只部署本文列出的当前 `WrappedMasterService` 子集，不附带 HA、持久化、TLS、
-HTTP metadata、NoF/LocalSSD workflow 或 multi-tenant policy connector。已合并的
-`ServiceReady` 和空 `GetStorageConfig` 由同一个生成的 `WrappedMasterServiceServer`
-注册，不需要额外的 bootstrap server。
+This entry point deploys only the current `WrappedMasterService` subset listed
+here, without HA, persistence, TLS, HTTP metadata, NoF/LocalSSD workflows, or a
+multi-tenant policy connector. The integrated `ServiceReady` and empty
+`GetStorageConfig` are registered by the same generated
+`WrappedMasterServiceServer`; no extra bootstrap server is required.
 
-Vec 数量、wire config、replica selector 和 checksum 等纯请求校验全部发生在
-`execute_batch` 之前，非法请求不会触发 maintenance 或 tenant lookup。`put_end` 的
-逐项 checksum 校验会先分流合法项，只把合法 key 交给 backend，再按原索引合并结果；
-backend callback 因此只包含对应的领域 batch 调用。
+Pure request validation, including Vec lengths, wire configuration, replica
+selectors, and checksums, occurs before `execute_batch`; invalid requests trigger
+neither maintenance nor tenant lookup. Per-item checksum validation in `put_end`
+first separates valid items, passes only valid keys to the backend, then merges
+results by original index. Backend callbacks therefore contain only the
+corresponding domain batch calls.
 
-## ObjectManager 的职责与行为
+## ObjectManager responsibilities and behavior
 
-`ObjectManager` 是 put/get/exists 的领域协调器，拥有一个 `ObjectCatalog`、一个
-`ReplicaAllocator` 和可选的 production Memory eviction controller。owner、
-per-key transaction、timeout candidate 和 committed version 全部由 catalog 维护，
-不在 manager 中复制事务表与 deadline heap。controller 的阈值来自 composition 配置，
-manager 只负责采样、设定 byte debt 和协调有界 collection。
+`ObjectManager` coordinates put/get/exists in the domain layer. It owns an
+`ObjectCatalog`, a `ReplicaAllocator`, and an optional production Memory eviction
+controller. The catalog maintains owners, per-key transactions, timeout
+candidates, and committed versions; the manager does not duplicate transaction
+tables or deadline heaps. Controller thresholds come from composition
+configuration. The manager only samples usage, sets byte debt, and coordinates
+bounded collection.
 
-每个 catalog slot 只有两个正交状态：一个由 `ArcSwapOption` 保存、供 reader 无锁加载的
-immutable committed version，以及一个由 slot-local mutex 保护的 active transaction。
-active transaction 只有 `Claimed` 和 `Staged` 两个 phase；它不改变 committed pointer。
-因此不再用 `Claimed/Pending/Published/Updating/Retiring` 组合状态表达可见性，也没有
-rollback pointer。retired version 属于独立的物理回收队列。controller 只决定何时设置
-全局 byte debt；second-chance、lease、pin、tenant scope、segment invalidation 和 RAII
-仍由 catalog/replica 层执行。
+Each catalog slot has two orthogonal states: an immutable committed version
+stored in `ArcSwapOption` for lock-free reader loads, and an active transaction
+protected by a slot-local mutex. Active transactions have only `Claimed` and
+`Staged` phases and never alter the committed pointer. Visibility is therefore
+no longer represented by combined
+`Claimed/Pending/Published/Updating/Retiring` states, and there is no rollback
+pointer. Retired versions belong to a separate physical reclamation queue. The
+controller decides only when to set global byte debt; second-chance, lease,
+pin, tenant scope, segment invalidation, and RAII rules remain in the
+catalog/replica layer.
 
-`start_put` 的顺序为：
+`start_put` sequence:
 
-1. 校验 object size、allocation size、replica count 和 replica class。
-2. 在 catalog 中原子 claim key；同一个 key 同时只能有一个成功者。
-3. 让 `ReplicaAllocator` 按 placement plan 预留空间。
-4. 把 reservation 转成由 catalog 持有的 `ReplicaSet`，并将 claim stage 为
-   pending version。
-5. Catalog slot 只保留纯身份 `WriteOwner`、`TransactionId`、replica、pin 和超时
-   deadline；
-   start/stage 使用的 `WriteAdmission` fence 随 claim 离开后即释放，Manager 丢弃临时
-   ticket，向 RPC 返回可写 descriptor。
+1. Validate object size, allocation size, replica count, and replica class.
+2. Atomically claim the key in the catalog; only one claimant can succeed for a
+   key at a time.
+3. Have `ReplicaAllocator` reserve space according to the placement plan.
+4. Convert reservations into a catalog-owned `ReplicaSet` and stage the claim
+   as a pending version.
+5. The catalog slot retains only the pure `WriteOwner` identity,
+   `TransactionId`, replicas, pin, and timeout deadline. The `WriteAdmission`
+   fence used for start/stage is released when the claim leaves; the manager
+   discards the temporary ticket and returns writable descriptors to RPC.
 
-任何中途失败都依靠 claim/reservation 的 RAII drop 回滚；all-or-nothing
-placement 的部分 reservation 也会在返回错误前释放。
+Any intermediate failure rolls back through claim/reservation RAII drops.
+Partial all-or-nothing placement reservations are also released before returning
+an error.
 
-`finish_put` 按 key 查找当前 active transaction，检查 client owner 和请求的 replica
-selector，再原子 commit。提交元数据固定为 `checksum=None`。相同 transaction 和 metadata
-的重复 finish 是幂等成功；owner 不同返回 `ILLEGAL_CLIENT`，class 不
-匹配或已失效写事务返回 `INVALID_WRITE`。
+`finish_put` looks up the current active transaction by key, checks the client
+owner and requested replica selector, then commits atomically. Commit metadata
+always uses `checksum=None`. Repeated finish with the same transaction and
+metadata succeeds idempotently; a different owner returns `ILLEGAL_CLIENT`, and
+a class mismatch or invalidated write transaction returns `INVALID_WRITE`.
 
-`revoke_put` 做同样的 owner/class 校验，然后撤销 active transaction。reservation
-随 catalog record 进入回收流程并最终归还 allocator；已 committed 的对象不能用
-revoke 删除。
+`revoke_put` performs the same owner/class checks, then revokes the active
+transaction. Reservations follow the catalog record into reclamation and are
+eventually returned to the allocator. Revoke cannot delete committed objects.
 
-`start_upsert` 对缺失 key 等价 insert；无论尺寸是否变化都申请新的 allocation，并把当前
-committed version 记为 transaction base。事务期间旧版本持续可读。`finish_put` 完成所有
-可能失败的校验和 quota 转换后，一次原子切换 committed pointer；旧版本按最后一次 reader
-刷新后的 lease deadline 进入延迟回收，并且必须等所有本地 handle 释放后才归还 allocation
-和 quota。`revoke_put`、pending timeout 或 client session fencing 只丢弃 candidate，旧
-committed version 和 pin metadata 完全不变。同一对象已有 active transaction 时返回冲突，
-不实现上游 UpsertStart 对旧 PROCESSING writer 的立即抢占。
+`start_upsert` is an insert for missing keys. It always requests fresh allocation,
+regardless of size changes, and records the current committed version as the
+transaction base. The old version remains readable throughout the transaction.
+After all fallible validation and quota transitions, `finish_put` atomically
+switches the committed pointer once. The old version enters deferred reclamation
+using the lease deadline from its last reader refresh; allocation and quota are
+returned only after all local handles are released. `revoke_put`, pending
+timeout, and client-session fencing discard only the candidate, leaving the old
+committed version and pin metadata unchanged. An existing active transaction
+causes a conflict; upstream UpsertStart's immediate preemption of an old
+PROCESSING writer is not implemented.
 
-当前 Mooncake wire 不携带 transaction id。Manager 只能按 `key + owner` 解析 active
-transaction，因此同一 client session 对同一 key 开启新事务后，旧请求迟到的 End 无法与
-新事务区分；这是保持 IDL 不变时的明确限制。
+The current Mooncake wire carries no transaction ID. The manager can resolve an
+active transaction only by `key + owner`, so once the same client session starts
+a new transaction on a key, a delayed End from an old request cannot be
+distinguished from the new transaction. This is an explicit limitation of
+keeping the IDL unchanged.
 
-pin 变更与 write transaction 一起提交：`ENABLE` 使用请求 TTL，缺省为 30 分钟，单次
-请求上限为 24 小时；`PRESERVE`/`DISABLE` 携带 TTL 会被拒绝，`ENABLE + 0` 表示提交后
-没有 soft pin。deadline 从 `finish_put_at` 的提交 tick 起算。Upsert 的 soft pin action
-只在 End 生效，Revoke、timeout 和 session fence 都保留旧 deadline；`PRESERVE` 继承
-尚未过期的 deadline，`ENABLE` 从 commit tick 重新计算，`DISABLE` 清除。hard pin 对普通
-Put 在创建时固定；replacement 保留旧 hard pin，并允许请求把它从 false 提升为 true。
+Pin changes commit with the write transaction. `ENABLE` uses the requested TTL,
+defaulting to 30 minutes with a 24-hour per-request maximum. TTL with
+`PRESERVE`/`DISABLE` is rejected; `ENABLE + 0` means no soft pin after commit.
+Deadlines start at the commit tick of `finish_put_at`. Upsert soft-pin actions
+take effect only at End; Revoke, timeout, and session fencing preserve the old
+deadline. `PRESERVE` inherits an unexpired deadline, `ENABLE` recalculates from
+the commit tick, and `DISABLE` clears it. Ordinary Put fixes hard pin at creation;
+replacement preserves the old hard pin and allows requests to promote it from
+false to true.
 
-`remove` 只删除已发布对象；普通删除受 lease 和 hard pin 保护，`force=true` 同时绕过
-两者。pending 或
-upsert 中对象返回 `REPLICA_IS_NOT_READY`，缺失对象返回 `OBJECT_NOT_FOUND`。batch 删除逐项
-返回结果；regex/all 删除只统计实际成功删除的对象，并跳过仍受保护或未完成的对象。
-wire 没有 hard-pin 专用错误码，普通删除 hard-pinned 对象复用 `OBJECT_HAS_LEASE`。
-replication task 仍未建模，因此 force 不会绕过这类尚不存在的状态。
+`remove` deletes only published objects. Ordinary deletion respects leases and
+hard pins; `force=true` bypasses both. Pending objects or objects undergoing
+upsert return `REPLICA_IS_NOT_READY`; missing objects return `OBJECT_NOT_FOUND`.
+Batch removal returns per-item results. Regex/all removal counts only actual
+successful deletions and skips protected or incomplete objects. The wire has no
+dedicated hard-pin error, so ordinary deletion of hard-pinned objects reuses
+`OBJECT_HAS_LEASE`. Replication tasks are not modeled, so force does not bypass
+those not-yet-existing states.
 
-`get` 只返回完整 committed version：pending insert 返回 `REPLICA_IS_NOT_READY`，pending
-upsert 返回旧 committed version。reader 先刷新该 version 的 lease，再验证 committed
-pointer；如果 pointer 已切换就重试，因此结果在线性化上只可能属于 commit 前或 commit 后。
-`exists` 与 get 使用同一可见性和 lease 语义，但只返回 bool。
-`maintenance(now, budget)` 由 catalog 的单一 bounded collector 同时处理到期
-soft pin、pending write、淘汰、物理回收和空 slot；soft-pin queue 每步最多扫描
-`max_candidates` 个注册项，旧 generation 和被刷新 deadline 的 stale 项通过 weak node
-与 deadline CAS 自动失效，不需要全表扫描。它不会在一次调用中无限扫描。诊断 snapshot
-同时暴露各 candidate queue 深度，用于发现清理吞吐落后于写入吞吐。
+`get` returns only complete committed versions: pending inserts return
+`REPLICA_IS_NOT_READY`, while pending upserts return the old committed version.
+Readers refresh that version's lease before validating the committed pointer,
+retrying if the pointer changed. The result therefore linearizes either before
+or after commit. `exists` uses the same visibility and lease semantics but
+returns only bool. `maintenance(now, budget)` uses the catalog's single bounded
+collector for expired soft pins, pending writes, eviction, physical reclamation,
+and empty slots. The soft-pin queue scans at most `max_candidates` registrations
+per step. Old generations and stale entries whose deadlines were refreshed
+invalidate automatically through weak nodes and deadline CAS, without full-table
+scans. No call scans indefinitely. Diagnostic snapshots also expose candidate
+queue depths to reveal cleanup throughput falling behind writes.
 
-## ReplicaAllocator 具体负责什么
+## ReplicaAllocator responsibilities
 
-`ReplicaAllocator` 只负责把一个 `PlacementRequest` 变成一组持有 reservation 的
-结果：
+`ReplicaAllocator` only converts a `PlacementRequest` into a set of
+reservation-owning results:
 
-- 从 `SegmentPool` 获取指定 `ReplicaClass` 的无锁快照；
-- 过滤非 accepting、空间不足、被排除或 kind 不允许的 segment；
-- 先按 preferred name，再按空闲比例、最大连续空闲区和稳定 segment id 排序；
-- 按 `Segment`、`Resource` 或 `Owner` failure domain 去重；
-- 逐个调用 `SegmentPool::reserve`，容忍快照过期造成的 `OutOfSpace` 或
-  `NotAccepting` 并继续尝试下一个候选；
-- `AllOrNothing` 未满足数量时释放全部部分结果，`BestEffort` 则返回至少一个已经
-  成功的 replica。
+- Obtain a lock-free snapshot for the requested `ReplicaClass` from `SegmentPool`.
+- Filter non-accepting, undersized, excluded, or disallowed-kind segments.
+- Sort by preferred name, then free ratio, largest contiguous free range, and
+  stable segment ID.
+- Deduplicate by `Segment`, `Resource`, or `Owner` failure domain.
+- Call `SegmentPool::reserve` for each candidate, tolerating `OutOfSpace` or
+  `NotAccepting` caused by stale snapshots and trying the next candidate.
+- Release all partial results if `AllOrNothing` cannot meet the count;
+  `BestEffort` returns at least one successfully allocated replica.
 
-它不负责 key 去重、write owner、pending/published 状态、lease、淘汰选择、RPC
-错误码或 descriptor wire 格式。这些职责分别属于 `ObjectManager`、
-`ObjectCatalog`、压力控制器和 RPC adapter。
+It does not handle key deduplication, write ownership, pending/published states,
+leases, eviction selection, RPC error codes, or descriptor wire formats. Those
+belong to `ObjectManager`, `ObjectCatalog`, the pressure controller, and the RPC
+adapter.
 
-## 当前 Mooncake 兼容子集
+## Current Mooncake compatibility subset
 
-| Mooncake 输入 | 当前行为 |
+| Mooncake input | Current behavior |
 | --- | --- |
-| `replica_num > 0, nof_replica_num == 0` | Memory，和 C++ 一致使用 best-effort，但至少要成功一个 replica |
-| `nof_replica_num > 0` 或非空 `preferred_nof_segments` | `INVALID_PARAMS` |
-| Memory 与 NoF 同时请求 | `INVALID_PARAMS` |
-| preferred Memory segment | 转成 placement preferred names |
-| soft pin `PRESERVE/ENABLE/DISABLE` | 完整接入事务；TTL 只允许用于 `ENABLE`，缺省 30 分钟、最大 24 小时、0 表示不 pin |
-| hard pin | 保存到 metadata；eviction 永远跳过，普通 Remove 拒绝，force Remove 可删除 |
-| same-node、host/group | `INVALID_PARAMS`，避免静默降级 |
+| `replica_num > 0, nof_replica_num == 0` | Memory; best-effort as in C++, with at least one successful replica |
+| `nof_replica_num > 0` or nonempty `preferred_nof_segments` | `INVALID_PARAMS` |
+| Memory and NoF requested together | `INVALID_PARAMS` |
+| preferred Memory segment | Converted to placement preferred names |
+| soft pin `PRESERVE/ENABLE/DISABLE` | Fully transactional; TTL only with `ENABLE`, default 30 minutes, maximum 24 hours, 0 means no pin |
+| hard pin | Stored in metadata; eviction always skips it, ordinary Remove rejects it, force Remove can delete it |
+| same-node, host/group | `INVALID_PARAMS`, avoiding silent fallback |
 | Disk/LocalDisk selector | `INVALID_PARAMS` |
 | `ObjectMeta.object_checksum=Some(...)` | `INVALID_PARAMS` |
-| Get/BatchGet checksum | 永远返回 `None` |
-| `ServiceReady` | 返回固定基线握手版本 `2.0.0`，满足上游 `MasterClient::Connect()` 的严格版本校验 |
-| `GetStorageConfig` | 返回空 `fsdir`、关闭 disk eviction、quota 为 0；不初始化持久化 backend |
-| `GetFsdir` | 尚未实现；它只是在 `GetStorageConfig` 调用失败时供旧 Client 使用的兼容 fallback |
-| `Ping` | 返回 view version；已激活 session 为 `OK`，其余为 `NEED_REMOUNT` |
-| `MountSegment` | absent client 原子建立 session；active client 动态追加；相同配置幂等，冲突返回 `SEGMENT_ALREADY_EXISTS` |
-| `ReMountSegment` | 支持 Memory segment 的原子激活与幂等重挂载；CXL、NoF 和冲突配置返回错误 |
-| `UnmountSegment` | 立即摘除单个 segment；不存在幂等成功，client session 保持 active |
-| `GracefulUnmountSegment` | 立即停止新分配并在 grace deadline 摘除；不存在返回 `SEGMENT_NOT_FOUND`；依赖显式运行的 `MasterReconciler` |
-| `UpsertStart/End/Revoke` + batch | 缺失 key 等价 put；始终申请新 allocation；pending 时旧 committed version 可读；end 原子切换，revoke/timeout/session-fence 保留旧版本 |
-| `Remove` / `BatchRemove` | 普通模式遵守 lease 和 hard pin，force 同时绕过两者；pending/upsert 中对象拒绝删除 |
-| `RemoveByRegex` / `RemoveAll` | 删除所有当前可删除的匹配对象并返回成功数量；multi-tenant 下空 tenant 的 `RemoveAll` 覆盖所有租户 |
-| tenant id（single 构造） | 忽略并统一映射到 `NamespaceId::DEFAULT` |
-| tenant id（multi 构造） | 映射到隔离 namespace；未知租户和超额分别返回现有 tenant 错误码 |
+| Get/BatchGet checksum | Always returns `None` |
+| `ServiceReady` | Returns pinned-baseline handshake version `2.0.0`, satisfying upstream `MasterClient::Connect()`'s strict version check |
+| `GetStorageConfig` | Empty `fsdir`, disk eviction disabled, quota 0; no persistent backend initialized |
+| `GetFsdir` | Unimplemented; only a legacy Client compatibility fallback when `GetStorageConfig` fails |
+| `Ping` | Returns view version; `OK` for activated sessions, otherwise `NEED_REMOUNT` |
+| `MountSegment` | Atomically establishes absent clients' sessions; dynamically adds for active clients; identical configuration is idempotent, conflicts return `SEGMENT_ALREADY_EXISTS` |
+| `ReMountSegment` | Atomic activation and idempotent remount of Memory segments; CXL, NoF, and conflicting configuration return errors |
+| `UnmountSegment` | Immediately detaches one segment; absence succeeds idempotently, client session stays active |
+| `GracefulUnmountSegment` | Immediately stops new allocations, detaches at grace deadline; absence returns `SEGMENT_NOT_FOUND`; requires an explicitly running `MasterReconciler` |
+| `UpsertStart/End/Revoke` + batch | Missing keys behave as put; always fresh allocation; old committed version readable while pending; end switches atomically, revoke/timeout/session-fence preserves the old version |
+| `Remove` / `BatchRemove` | Ordinary mode respects leases and hard pins; force bypasses both; pending/upserting objects reject deletion |
+| `RemoveByRegex` / `RemoveAll` | Deletes all currently removable matching objects and returns success count; multi-tenant `RemoveAll` with an empty tenant covers all tenants |
+| tenant id (single constructor) | Ignored and mapped to `NamespaceId::DEFAULT` |
+| tenant id (multi constructor) | Mapped to isolated namespaces; unknown tenants and quota excess use existing tenant error codes |
 
-`ObjectDataType::KVCACHE` 和 `TENSOR` 会保留为对应的 `ObjectKind`，其余类型暂归为
-`General`。空 key、零长度、batch key/length 数量不一致等均逐项返回明确错误。
+`ObjectDataType::KVCACHE` and `TENSOR` retain their corresponding `ObjectKind`;
+other types currently map to `General`. Empty keys, zero lengths, and mismatched
+batch key/length counts produce explicit per-item errors.
 
-## 仍需补齐的设计
+## Remaining design work
 
-RPC adapter 本身已经是薄层。tenant quota 仅计 Memory，并通过 scoped
-filter 在现有 generation queue 上定向回收；整体物理水位控制仍由部署侧 controller
-决定。支持混合 Memory+NoF replica 仍需要把一个 object plan 从单 class 扩展成多
-class 子计划及原子回滚。group 和 checksum 是当前明确不支持的能力，不在 RPC
-层用占位实现掩盖。pin 已覆盖内存态生命周期，但尚无 snapshot/oplog 恢复和独立指标。
-tenant 的完整约束见 `docs/tenant_quota.md`。
+The RPC adapter is already a thin layer. Tenant quota accounts only for Memory
+and uses scoped filters for targeted reclamation on existing generation queues;
+overall physical watermark control remains with the deployment-side controller.
+Mixed Memory+NoF replicas require extending an object plan from one class to
+multiple class subplans with atomic rollback. Groups and checksums are explicitly
+unsupported, not hidden behind RPC placeholders. Pins cover the in-memory
+lifecycle but lack snapshot/oplog recovery and dedicated metrics. See
+`docs/tenant_quota.md` for complete tenant constraints.
 
-## 与当前 C++ Mooncake 的已知边角差异
+## Known edge-case differences from current C++ Mooncake
 
-行为核对基于 Mooncake 提交 [`07422af7d81eb905fb8054c0f8f87bea243343f7`](https://github.com/kvcache-ai/Mooncake/tree/07422af7d81eb905fb8054c0f8f87bea243343f7)
-的源码（其 `extern/yalantinglibs` 子模块有本地改动，但不影响 Master pin 逻辑）。本实现对齐提交/回滚、Upsert preserve/enable/disable、hard-pin eviction 保护以及 TTL
-校验等可观察语义，但没有复制 C++ 内部数据结构：Rust 使用单调 `CatalogTick`、原子
-deadline 和现有 bounded collector；C++ 使用 system clock、deadline index 和 metadata
-shard。仍有这些已知差异：
+Behavior was checked against Mooncake commit
+[`07422af7d81eb905fb8054c0f8f87bea243343f7`](https://github.com/kvcache-ai/Mooncake/tree/07422af7d81eb905fb8054c0f8f87bea243343f7)
+(the `extern/yalantinglibs` submodule had local changes that did not affect
+Master pin logic). Observable commit/rollback, Upsert preserve/enable/disable,
+hard-pin eviction protection, and TTL validation semantics are aligned without
+copying C++ internals. Rust uses monotonic `CatalogTick`, atomic deadlines, and
+the existing bounded collector; C++ uses the system clock, a deadline index, and
+metadata shards. Known differences remain:
 
-- C++ 在允许 soft-pin eviction 时做“先无 pin、仍不足再 soft pin”的全局两阶段选择；
-  Rust 在有界分代队列内允许该候选，不能保证跨全部对象的严格 soft-pin 低优先级。
-- 本实现按需求让非 force Remove 受 hard pin 保护、force 同时绕过 lease/hard pin；当前
-  C++ `Remove` 实际只检查 lease，hard pin 主要保护 eviction，因此这是有意的安全增强。
-- C++ 对 mixed Memory/NoF 的 pending pin action 可在首个合格 replica 完成时提交，并让
-  后续 replica End 不刷新 TTL；Rust 当前每个对象只支持单一 replica class，End 一次提交
-  整个对象，所以还没有该 partial-End 边角。
-- Rust 的 Upsert 始终申请 fresh allocation，包括同尺寸更新；C++ 可复用原 allocation。
-  这是 per-key MVCC 保证 pending 期间旧版本持续可读的有意差异。
-- pin metadata 仍是纯内存状态，服务重启不会恢复；也尚未接入上游 soft-pin key metric。
+- When soft-pin eviction is allowed, C++ uses global two-phase selection:
+  unpinned objects first, then soft-pinned objects if still necessary. Rust
+  permits those candidates within bounded generation queues and cannot
+  guarantee strict lower priority for soft pins across all objects.
+- This implementation intentionally protects non-force Remove with hard pins
+  and lets force bypass both leases and hard pins. Current C++ `Remove` checks
+  only leases, with hard pins mainly protecting eviction; this is a deliberate
+  safety enhancement.
+- C++ may commit pending pin actions for mixed Memory/NoF when the first eligible
+  replica completes, without refreshing TTL on later replica End calls. Rust
+  supports only one replica class per object and commits the whole object in one
+  End, so this partial-End edge case does not yet apply.
+- Rust Upsert always requests fresh allocation, including same-size updates;
+  C++ may reuse the original allocation. This deliberate per-key MVCC difference
+  keeps the old version readable while pending.
+- Pin metadata is in-memory only and is not restored after service restart;
+  upstream soft-pin key metrics are also not integrated.
 
-实现入口：
+Implementation entry points:
 
-- `src/object/manager.rs`：领域协调器；
-- `src/object/tenant/mod.rs`：tenant 公共模型与模块出口；
-- `src/object/tenant/manager.rs`：tenant-safe object façade；
-- `src/object/tenant/registry.rs`：ID/namespace 解析、注册与生命周期；
-- `src/object/tenant/quota.rs`：quota admission、accounting 与 RAII token；
-- `src/segment/placement.rs`：placement 与 reservation；
-- `src/server/rpc/mod.rs`：service 与 RPC handler；
-- `src/server/rpc/backend.rs`：静态 backend 契约与公共 batch 流程；
-- `src/server/rpc/single_tenant.rs`、`multi_tenant.rs`：两种领域 backend 适配；
-- `src/server/rpc/request.rs`、`response.rs`：wire 请求归一化与响应映射；
-- `src/client/manager.rs`：client remount、session fencing 与资源清理协调；
-- `tests/rpc.rs`、`client_lifecycle_rpc.rs`：真实 TCP 跨层测试。
+- `src/object/manager.rs`: domain coordinator;
+- `src/object/tenant/mod.rs`: public tenant models and module exports;
+- `src/object/tenant/manager.rs`: tenant-safe object façade;
+- `src/object/tenant/registry.rs`: ID/namespace resolution, registration, lifecycle;
+- `src/object/tenant/quota.rs`: quota admission, accounting, RAII tokens;
+- `src/segment/placement.rs`: placement and reservations;
+- `src/server/rpc/mod.rs`: service and RPC handlers;
+- `src/server/rpc/backend.rs`: static backend contract and common batch flow;
+- `src/server/rpc/single_tenant.rs`, `multi_tenant.rs`: the two domain backend adapters;
+- `src/server/rpc/request.rs`, `response.rs`: wire request normalization and response mapping;
+- `src/client/manager.rs`: client remount, session fencing, resource cleanup coordination;
+- `tests/rpc.rs`, `client_lifecycle_rpc.rs`: real-TCP cross-layer tests.
