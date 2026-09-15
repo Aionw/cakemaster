@@ -4,12 +4,11 @@ use cakemaster::client::{CleanupReason, ClientLifecycleConfig, ClientManager, Cl
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     DirectReplica, NamespaceId, ObjectCatalogConfig, ObjectCommit, ObjectContent, ObjectIdentity,
-    ObjectManager, ObjectPinRequest, ReplicaId, ReplicaLease, ReplicaSet, WriteAdmission,
-    WriteMode,
+    ObjectManager, ObjectPinRequest, ReplicaId, ReplicaSet, WriteAdmission, WriteMode,
 };
 use cakemaster::segment::{
-    ClientId, CxlArenaId, CxlArenaSpec, SegmentId, SegmentIdentity, SegmentPool, SegmentPoolConfig,
-    SegmentSpec,
+    ClientId, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool, SegmentPoolConfig,
+    SegmentSpec, TransportEndpoint, TransportProtocol,
 };
 use std::hint::black_box;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -18,7 +17,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const OBJECT_BYTES: u64 = 4096;
-const MIN_ARENA_BYTES: u64 = 1 << 30;
+const MIN_SEGMENT_BYTES: u64 = 1 << 30;
 const HEALTHY_CLIENT: ClientId = ClientId::new(1, 1);
 const COLLECT_BUDGET: usize = 256;
 
@@ -60,7 +59,7 @@ fn main() {
             .map_or(4, usize::from)
             .clamp(1, 8),
         operations_per_worker: 50_000,
-        exiting_clients: 1_000,
+        exiting_clients: 16,
         objects_per_exiting_client: 4,
         pending_writes_per_exiting_client: 0,
         hot_objects: 2048,
@@ -103,12 +102,10 @@ fn run_once(arguments: Arguments, storm: bool, round: usize) -> ResultRow {
             .workers
             .saturating_mul(arguments.operations_per_worker.div_ceil(2))
             .saturating_add(arguments.hot_objects)
-            .saturating_add(
-                arguments.exiting_clients.saturating_mul(
-                    arguments
-                        .objects_per_exiting_client
-                        .saturating_add(arguments.pending_writes_per_exiting_client),
-                ),
+            .max(
+                arguments
+                    .objects_per_exiting_client
+                    .saturating_add(arguments.pending_writes_per_exiting_client),
             )
             .saturating_add(1024)
             .saturating_mul(2),
@@ -147,9 +144,9 @@ fn run_once(arguments: Arguments, storm: bool, round: usize) -> ResultRow {
             .with_cleanup_scan_budget(arguments.exiting_clients.max(1)),
     )
     .unwrap();
-    let arena_bytes = u64::from(max_allocations)
+    let segment_bytes = u64::from(max_allocations)
         .saturating_mul(OBJECT_BYTES)
-        .max(MIN_ARENA_BYTES);
+        .max(MIN_SEGMENT_BYTES);
     let cleanup_only = arguments.operations_per_worker == 0
         && arguments.objects_per_exiting_client == 0
         && arguments.pending_writes_per_exiting_client == 0
@@ -158,7 +155,7 @@ fn run_once(arguments: Arguments, storm: bool, round: usize) -> ResultRow {
     clients
         .remount(
             HEALTHY_CLIENT,
-            vec![segment(0, HEALTHY_CLIENT, arena_bytes)],
+            vec![segment(0, HEALTHY_CLIENT, segment_bytes)],
             ClientTick::ZERO,
         )
         .unwrap();
@@ -166,7 +163,7 @@ fn run_once(arguments: Arguments, storm: bool, round: usize) -> ResultRow {
         let segments = if cleanup_only {
             Vec::new()
         } else {
-            vec![segment(client + 1, exiting_client(client), arena_bytes)]
+            vec![segment(client + 1, exiting_client(client), segment_bytes)]
         };
         let session = clients
             .remount(exiting_client(client), segments, ClientTick::ZERO)
@@ -174,11 +171,7 @@ fn run_once(arguments: Arguments, storm: bool, round: usize) -> ResultRow {
             .session();
         exiting_sessions.push(session);
     }
-    let healthy_candidate = pool
-        .segment(SegmentId::new(1, 1))
-        .unwrap()
-        .direct_candidate()
-        .unwrap();
+    let healthy_candidate = pool.segment(SegmentId::new(1, 1)).unwrap();
     let hot = Arc::<[ObjectIdentity]>::from(preload_healthy(&manager, arguments.hot_objects));
     preload_exiting(&manager, arguments, round);
     preload_exiting_pending(&manager, &clients, arguments, round);
@@ -317,7 +310,7 @@ fn run_once(arguments: Arguments, storm: bool, round: usize) -> ResultRow {
 #[allow(clippy::too_many_arguments)]
 fn run_worker(
     manager: Arc<ObjectManager>,
-    healthy_candidate: cakemaster::segment::DirectCandidate,
+    healthy_candidate: cakemaster::segment::SegmentHandle,
     hot: Arc<[ObjectIdentity]>,
     tick: Arc<AtomicU64>,
     barrier: Arc<Barrier>,
@@ -355,10 +348,7 @@ fn run_worker(
                 let ticket = claim
                     .stage(
                         ObjectContent::new(OBJECT_BYTES),
-                        ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
-                            ReplicaId::new(1),
-                            reservation,
-                        ))),
+                        ReplicaSet::one(DirectReplica::new(ReplicaId::new(1), reservation)),
                     )
                     .ok()?;
                 manager
@@ -453,10 +443,7 @@ fn preload_exiting_pending(
                 .unwrap()
                 .stage(
                     ObjectContent::new(OBJECT_BYTES),
-                    ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
-                        ReplicaId::new(1),
-                        reservation,
-                    ))),
+                    ReplicaSet::one(DirectReplica::new(ReplicaId::new(1), reservation)),
                 )
                 .unwrap();
         }
@@ -482,10 +469,7 @@ fn publish_on(
         .unwrap()
         .stage(
             ObjectContent::new(OBJECT_BYTES),
-            ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
-                ReplicaId::new(1),
-                reservation,
-            ))),
+            ReplicaSet::one(DirectReplica::new(ReplicaId::new(1), reservation)),
         )
         .unwrap();
     drop(
@@ -496,15 +480,16 @@ fn publish_on(
     );
 }
 
-fn segment(index: usize, owner: ClientId, arena_bytes: u64) -> SegmentSpec {
+fn segment(index: usize, owner: ClientId, segment_bytes: u64) -> SegmentSpec {
     let index = index as u64;
-    SegmentSpec::cxl(
+    SegmentSpec::memory(
         SegmentIdentity::new(
             SegmentId::new(1, index + 1),
             owner,
             format!("client-{index}"),
         ),
-        CxlArenaSpec::new(CxlArenaId::new("client-cleanup-benchmark"), arena_bytes),
+        MemoryRegion::new(0x1_0000_0000, segment_bytes),
+        TransportEndpoint::new(TransportProtocol::Tcp, "client-cleanup-benchmark"),
     )
 }
 

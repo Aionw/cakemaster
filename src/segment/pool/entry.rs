@@ -1,7 +1,7 @@
-use super::resource::{CandidateCapability, MountedResource};
-use crate::segment::error::{LocalSsdError, ReserveError, SegmentStateError};
+use crate::segment::MemoryRegion;
+use crate::segment::error::{ReserveError, SegmentStateError};
 use crate::segment::lifetime::SegmentLifetime;
-use crate::segment::local_ssd::{LocalSsdStats, OffloadPermit};
+use crate::segment::offset_allocator::ByteAllocator;
 use crate::segment::reservation::Reservation;
 use crate::segment::spec::SegmentSpec;
 use crate::segment::stats::{SegmentState, SegmentStats, SegmentUsageStats};
@@ -11,16 +11,16 @@ use std::sync::Arc;
 pub(super) struct SegmentEntry {
     spec: Arc<SegmentSpec>,
     state: Mutex<SegmentState>,
-    resource: MountedResource,
+    allocator: ByteAllocator,
     lifetime: SegmentLifetime,
 }
 
 impl SegmentEntry {
-    pub(super) fn new(spec: Arc<SegmentSpec>, resource: MountedResource) -> Self {
+    pub(super) fn new(spec: Arc<SegmentSpec>, allocator: ByteAllocator) -> Self {
         Self {
             spec,
             state: Mutex::new(SegmentState::Accepting),
-            resource,
+            allocator,
             lifetime: SegmentLifetime::new(),
         }
     }
@@ -29,32 +29,17 @@ impl SegmentEntry {
         &self.spec
     }
 
-    pub(super) fn supports_direct_reservation(&self) -> bool {
-        self.resource.supports_direct_reservation()
-    }
-
-    pub(super) fn supports_offload(&self) -> bool {
-        self.resource.supports_offload()
-    }
-
-    pub(super) fn candidate_capability(&self) -> Option<CandidateCapability> {
-        if !self.state.lock().is_accepting() {
-            return None;
-        }
-        self.resource
-            .candidate_capability(self.spec.replica_class())
+    pub(super) fn is_accepting(&self) -> bool {
+        self.state.lock().is_accepting()
     }
 
     #[inline]
     pub(super) fn reserve(&self, bytes: u64) -> Result<Reservation, ReserveError> {
         let id = self.spec.identity().id();
-        if !self.supports_direct_reservation() {
-            return Err(ReserveError::NotDirectlyAllocatable(id));
-        }
         if bytes == 0 {
             return Err(ReserveError::ZeroSize);
         }
-        if !self.resource.may_satisfy(bytes) {
+        if !self.allocator.may_satisfy(bytes) {
             return Err(ReserveError::OutOfSpace(id));
         }
 
@@ -62,48 +47,24 @@ impl SegmentEntry {
         if !state.is_accepting() {
             return Err(ReserveError::NotAccepting(id));
         }
-        let result = self
-            .resource
-            .reserve(self.spec.clone(), self.lifetime.acquire(), bytes);
+        let allocation = self
+            .allocator
+            .allocate_after_precheck(bytes)
+            .ok_or(ReserveError::OutOfSpace(id))?;
+        let address = self
+            .spec
+            .region()
+            .base()
+            .checked_add(allocation.offset())
+            .ok_or(ReserveError::AddressOverflow(id))?;
+        let reservation = Reservation {
+            allocation,
+            segment: self.spec.clone(),
+            segment_lease: self.lifetime.acquire(),
+            region: MemoryRegion::new(address, bytes),
+        };
         drop(state);
-        result
-    }
-
-    pub(super) fn report_local_ssd_capacity(
-        &self,
-        capacity_bytes: u64,
-    ) -> Result<(), LocalSsdError> {
-        self.resource
-            .report_capacity(self.spec.identity().id(), capacity_bytes)
-    }
-
-    pub(super) fn set_local_ssd_offload_enabled(&self, enabled: bool) -> Result<(), LocalSsdError> {
-        self.resource
-            .set_offload_enabled(self.spec.identity().id(), enabled)
-    }
-
-    pub(super) fn admit_offload(&self, bytes: u64) -> Result<OffloadPermit, LocalSsdError> {
-        let id = self.spec.identity().id();
-        if !self.supports_offload() {
-            return Err(LocalSsdError::NotLocalSsd(id));
-        }
-        if bytes == 0 {
-            return Err(LocalSsdError::ZeroSize);
-        }
-
-        let state = self.state.lock();
-        if !state.is_accepting() {
-            return Err(LocalSsdError::NotAccepting(id));
-        }
-        let result = self
-            .resource
-            .admit_offload(self.spec.clone(), self.lifetime.acquire(), bytes);
-        drop(state);
-        result
-    }
-
-    pub(super) fn local_ssd_stats(&self) -> Option<LocalSsdStats> {
-        self.resource.local_ssd_stats()
+        Ok(reservation)
     }
 
     pub(super) fn quiesce(&self) {
@@ -146,7 +107,15 @@ impl SegmentEntry {
     pub(super) fn stats(&self) -> SegmentStats {
         let state = *self.state.lock();
         SegmentStats {
-            space: self.resource.space_stats(),
+            space: {
+                let stats = self.allocator.stats();
+                crate::segment::stats::SegmentSpaceStats {
+                    capacity_bytes: stats.capacity,
+                    used_bytes: stats.used_bytes,
+                    available_bytes: stats.available_bytes,
+                    largest_free_region_bytes: stats.largest_free_region,
+                }
+            },
             usage: SegmentUsageStats {
                 active_allocations: self.lifetime.active_leases(),
             },

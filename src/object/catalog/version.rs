@@ -108,7 +108,7 @@ impl ObjectRecord {
     }
 
     fn direct_replica_class(replicas: &ReplicaSet) -> Option<crate::segment::ReplicaClass> {
-        Some(replicas.replicas().first()?.direct()?.replica_class())
+        Some(replicas.replicas().first()?.replica_class())
     }
 
     pub(super) fn current_direct_replica_class(&self) -> Option<crate::segment::ReplicaClass> {

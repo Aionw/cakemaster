@@ -70,7 +70,6 @@ pub(super) struct TenantEntry {
     pub(super) namespace: NamespaceId,
     pub(super) version: AtomicU64,
     pub(super) memory: QuotaAccount,
-    pub(super) nof: QuotaAccount,
 }
 
 impl TenantRegistry {
@@ -263,7 +262,6 @@ impl TenantRegistry {
             Ordering::Release,
         );
         entry.memory.set_effective(0);
-        entry.nof.set_effective(0);
         self.recompute_quotas_locked();
         Ok(())
     }
@@ -278,47 +276,32 @@ impl TenantRegistry {
         if self.capacity_generation.load(Ordering::Acquire) == generation {
             return;
         }
-        let (capacities, observed_generation) = self.stable_capacities();
+        let (capacity, observed_generation) = self.stable_capacity();
         let _update = self.update.lock();
         if self.capacity_generation.load(Ordering::Acquire) != observed_generation {
-            self.recompute_with_capacities_locked(
-                capacities[0],
-                capacities[1],
-                observed_generation,
-            );
+            self.recompute_with_capacity_locked(capacity, observed_generation);
         }
     }
 
     fn recompute_quotas_locked(&self) {
-        let (capacities, generation) = self.stable_capacities();
-        self.recompute_with_capacities_locked(capacities[0], capacities[1], generation);
+        let (capacity, generation) = self.stable_capacity();
+        self.recompute_with_capacity_locked(capacity, generation);
     }
 
-    fn stable_capacities(&self) -> ([u64; 2], u64) {
+    fn stable_capacity(&self) -> (u64, u64) {
         loop {
             let generation = self.pool.direct_capacity_epoch();
-            let capacities = self
+            let capacity = self
                 .pool
-                .capacities_for(&[ReplicaClass::Memory, ReplicaClass::Nof]);
-            let observed_generation = self.pool.direct_capacity_epoch();
-            if generation == observed_generation {
-                return (
-                    [
-                        capacities[0].capacity_bytes(),
-                        capacities[1].capacity_bytes(),
-                    ],
-                    observed_generation,
-                );
+                .capacity_for(ReplicaClass::Memory)
+                .capacity_bytes();
+            if generation == self.pool.direct_capacity_epoch() {
+                return (capacity, generation);
             }
         }
     }
 
-    fn recompute_with_capacities_locked(
-        &self,
-        memory_capacity: u64,
-        nof_capacity: u64,
-        generation: u64,
-    ) {
+    fn recompute_with_capacity_locked(&self, memory_capacity: u64, generation: u64) {
         let directory = self.directory.load();
         let mut entries: Vec<_> = directory
             .entries
@@ -332,18 +315,13 @@ impl TenantRegistry {
             .collect();
         entries.sort_unstable_by(|left, right| left.id.cmp(&right.id));
         distribute_effective_quota(&entries, TenantResourceClass::Memory, memory_capacity);
-        distribute_effective_quota(&entries, TenantResourceClass::Nof, nof_capacity);
         let has_reclaim_debt = entries.iter().any(|entry| {
-            [TenantResourceClass::Memory, TenantResourceClass::Nof]
-                .into_iter()
-                .any(|class| {
-                    let account = entry.account(class);
-                    account.demand.load(Ordering::Relaxed)
-                        > account
-                            .effective
-                            .load(Ordering::Relaxed)
-                            .saturating_add(account.retiring.load(Ordering::Relaxed))
-                })
+            let account = &entry.memory;
+            account.demand.load(Ordering::Relaxed)
+                > account
+                    .effective
+                    .load(Ordering::Relaxed)
+                    .saturating_add(account.retiring.load(Ordering::Relaxed))
         });
         let _ = self
             .reclaim_state
@@ -396,44 +374,24 @@ impl TenantRegistry {
         for entry in directory.entries.values().filter(|entry| {
             tenant_state(entry.version.load(Ordering::Acquire)) == TENANT_REGISTERED
         }) {
-            for class in [TenantResourceClass::Memory, TenantResourceClass::Nof] {
-                let account = entry.account(class);
-                let demand = account.demand.load(Ordering::Relaxed);
-                let retiring = account.retiring.load(Ordering::Relaxed);
-                let effective = account.effective.load(Ordering::Acquire);
-                let bytes = demand.saturating_sub(retiring).saturating_sub(effective);
-                if bytes > 0 {
-                    targets.push(ReclaimTarget {
-                        filter: ReclaimFilter::Scope {
-                            namespace: entry.namespace,
-                            replica_class: class.replica_class(),
-                        },
-                        bytes,
-                    });
-                }
+            let account = &entry.memory;
+            let demand = account.demand.load(Ordering::Relaxed);
+            let retiring = account.retiring.load(Ordering::Relaxed);
+            let effective = account.effective.load(Ordering::Acquire);
+            let bytes = demand.saturating_sub(retiring).saturating_sub(effective);
+            if bytes > 0 {
+                targets.push(ReclaimTarget {
+                    filter: ReclaimFilter::Scope {
+                        namespace: entry.namespace,
+                        replica_class: ReplicaClass::Memory,
+                    },
+                    bytes,
+                });
             }
         }
         targets.sort_unstable_by_key(|target| match target.filter {
-            ReclaimFilter::Any => (0, 0),
-            ReclaimFilter::Class(replica_class) => (
-                0,
-                match replica_class {
-                    ReplicaClass::Memory => 0,
-                    ReplicaClass::Nof => 1,
-                    ReplicaClass::LocalSsd => 2,
-                },
-            ),
-            ReclaimFilter::Scope {
-                namespace,
-                replica_class,
-            } => (
-                namespace.get(),
-                match replica_class {
-                    ReplicaClass::Memory => 0,
-                    ReplicaClass::Nof => 1,
-                    ReplicaClass::LocalSsd => 2,
-                },
-            ),
+            ReclaimFilter::Scope { namespace, .. } => namespace.get(),
+            ReclaimFilter::Any | ReclaimFilter::Class(_) => 0,
         });
         if targets.is_empty() {
             let _ = self.reclaim_state.compare_exchange(

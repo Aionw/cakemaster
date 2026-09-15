@@ -488,13 +488,15 @@ catalog/placement 锁竞争。
 
 ```bash
 cargo run --release --bin client_cleanup_benchmark -- \
-  --workers=8 --operations=50000 --clients=10000 \
+  --workers=8 --operations=50000 --clients=16 \
   --objects-per-client=4 --pending-per-client=4 \
   --hot-objects=2048 --rounds=5
 ```
 
-逻辑 segment 共用一个 CXL arena，所以 allocator 节点只预分配一次，不随 client 数量
-相乘。64K cleanup-only 可用下面的低内存档验证 registry/slot/claim 扩展性：
+Memory-only 版本每个 client segment 独占 allocator，metadata 预分配会随 segment
+数量增长，因此普通压力档默认 16 个 exiting client；不要直接沿用历史共享 CXL arena
+版本的 10K 参数。此前的 CXL 性能数据不代表当前实现。64K cleanup-only 不挂载 exiting
+segment，可用下面的低内存档验证 registry/slot/claim 扩展性：
 
 ```bash
 cargo run --release --bin client_cleanup_benchmark -- \

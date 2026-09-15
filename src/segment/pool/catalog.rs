@@ -1,10 +1,8 @@
 use super::entry::SegmentEntry;
-use super::resource::{CandidateCapability, ResourceRegistry};
-use super::{
-    AttachOutcome, DirectCandidate, OffloadSnapshot, OffloadTarget, PoolSnapshot, SegmentHandle,
-};
-use crate::segment::error::{AttachError, LocalSsdError, SegmentStateError};
+use super::{AttachOutcome, PoolSnapshot, SegmentHandle};
+use crate::segment::error::{AttachError, SegmentStateError};
 use crate::segment::identity::{ClientId, SegmentId};
+use crate::segment::offset_allocator::ByteAllocator;
 use crate::segment::spec::{ReplicaClass, SegmentSpec};
 use crate::segment::stats::ReplicaClassSpaceStats;
 use std::collections::{HashMap, HashSet};
@@ -14,16 +12,13 @@ pub(super) struct Catalog {
     pool_id: u64,
     segments: HashMap<SegmentId, Arc<SegmentEntry>>,
     segments_by_owner: HashMap<ClientId, HashSet<SegmentId>>,
-    resources: ResourceRegistry,
     indexes: CandidateIndexes,
 }
 
 #[derive(Default)]
 struct CandidateIndexes {
     direct_generation: u64,
-    direct: HashMap<ReplicaClass, Arc<[DirectCandidate]>>,
-    offload_generation: u64,
-    offload: Arc<[OffloadTarget]>,
+    direct: Arc<[SegmentHandle]>,
 }
 
 impl Catalog {
@@ -32,7 +27,6 @@ impl Catalog {
             pool_id,
             segments: HashMap::new(),
             segments_by_owner: HashMap::new(),
-            resources: ResourceRegistry::default(),
             indexes: CandidateIndexes::default(),
         }
     }
@@ -50,12 +44,21 @@ impl Catalog {
             };
         }
 
-        let resource = self.resources.mount(
-            &spec,
-            self.segments.values().map(|entry| entry.spec()),
-            max_allocator_nodes,
-        )?;
-        let entry = Arc::new(SegmentEntry::new(Arc::new(spec), resource));
+        let region = spec.region();
+        let end = region.end().ok_or(AttachError::AddressOverflow)?;
+        for existing in self.segments.values().map(|entry| entry.spec()) {
+            if existing.identity().owner() == spec.identity().owner()
+                && existing.transport() == spec.transport()
+                && region.base() < existing.region().end().expect("mounted ranges are valid")
+                && existing.region().base() < end
+            {
+                return Err(AttachError::OverlappingAddressRange {
+                    existing: existing.identity().id(),
+                });
+            }
+        }
+        let allocator = ByteAllocator::new(region.size(), max_allocator_nodes);
+        let entry = Arc::new(SegmentEntry::new(Arc::new(spec), allocator));
         let segment = self.handle(entry.clone());
         self.segments.insert(segment.id(), entry);
         self.segments_by_owner
@@ -70,17 +73,11 @@ impl Catalog {
         PoolSnapshot {
             generation: self.indexes.direct_generation,
             replica_class,
-            candidates: self
-                .indexes
-                .direct
-                .get(&replica_class)
-                .cloned()
-                .unwrap_or_else(|| Arc::from([])),
+            candidates: self.indexes.direct.clone(),
         }
     }
 
     pub(super) fn space_for(&self, replica_class: ReplicaClass) -> ReplicaClassSpaceStats {
-        let mut resources = HashSet::new();
         let mut capacity_bytes = 0_u64;
         let mut used_bytes = 0_u64;
         let mut available_bytes = 0_u64;
@@ -90,9 +87,6 @@ impl Catalog {
             .values()
             .filter(|entry| entry.spec().replica_class() == replica_class)
         {
-            if !resources.insert(entry.spec().resource_id()) {
-                continue;
-            }
             let space = entry.stats().space;
             capacity_bytes = capacity_bytes.saturating_add(space.capacity_bytes);
             used_bytes = used_bytes.saturating_add(space.used_bytes);
@@ -109,13 +103,6 @@ impl Catalog {
         }
     }
 
-    pub(super) fn offload_snapshot(&self) -> OffloadSnapshot {
-        OffloadSnapshot {
-            generation: self.indexes.offload_generation,
-            targets: self.indexes.offload.clone(),
-        }
-    }
-
     pub(super) fn segment(&self, id: SegmentId) -> Option<SegmentHandle> {
         self.segments
             .get(&id)
@@ -125,28 +112,6 @@ impl Catalog {
 
     pub(super) fn len(&self) -> usize {
         self.segments.len()
-    }
-
-    pub(super) fn report_local_ssd_capacity(
-        &self,
-        owner: ClientId,
-        id: SegmentId,
-        capacity_bytes: u64,
-    ) -> Result<(), LocalSsdError> {
-        self.owned_offload_entry(owner, id)?
-            .report_local_ssd_capacity(capacity_bytes)
-    }
-
-    pub(super) fn set_local_ssd_offload_enabled(
-        &mut self,
-        owner: ClientId,
-        id: SegmentId,
-        enabled: bool,
-    ) -> Result<(), LocalSsdError> {
-        self.owned_offload_entry(owner, id)?
-            .set_local_ssd_offload_enabled(enabled)?;
-        self.rebuild_indexes();
-        Ok(())
     }
 
     pub(super) fn quiesce(
@@ -192,12 +157,10 @@ impl Catalog {
     ) -> Result<(), SegmentStateError> {
         let entry = self.owned_entry(owner, id)?;
         entry.prepare_remove()?;
-        let removed = self
-            .segments
+        self.segments
             .remove(&id)
             .expect("owned entries remain registered while the catalog is write-locked");
         self.remove_owner_segment(owner, id);
-        self.resources.unmount(removed.spec());
         self.rebuild_indexes();
         Ok(())
     }
@@ -221,7 +184,6 @@ impl Catalog {
                     .remove(&id)
                     .expect("the owner index only contains mounted segments");
                 removed.invalidate();
-                self.resources.unmount(removed.spec());
                 invalidated += 1;
             }
         }
@@ -272,63 +234,22 @@ impl Catalog {
         Ok(entry)
     }
 
-    fn owned_offload_entry(
-        &self,
-        owner: ClientId,
-        id: SegmentId,
-    ) -> Result<Arc<SegmentEntry>, LocalSsdError> {
-        let entry = self
-            .segments
-            .get(&id)
-            .cloned()
-            .ok_or(LocalSsdError::NotFound(id))?;
-        let expected = entry.spec().identity().owner();
-        if expected != owner {
-            return Err(LocalSsdError::OwnerMismatch {
-                segment: id,
-                expected,
-                actual: owner,
-            });
-        }
-        if !entry.supports_offload() {
-            return Err(LocalSsdError::NotLocalSsd(id));
-        }
-        Ok(entry)
-    }
-
     fn rebuild_indexes(&mut self) {
-        let mut direct: HashMap<_, Vec<_>> = HashMap::new();
-        let mut offload = Vec::new();
-
-        for entry in self.segments.values() {
-            let Some(capability) = entry.candidate_capability() else {
-                continue;
-            };
-            let segment = self.handle(entry.clone());
-            match capability {
-                CandidateCapability::Direct(replica_class) => direct
-                    .entry(replica_class)
-                    .or_default()
-                    .push(DirectCandidate { segment }),
-                CandidateCapability::Offload => offload.push(OffloadTarget { segment }),
-            }
-        }
-
-        for candidates in direct.values_mut() {
-            candidates.sort_unstable_by_key(|candidate| candidate.id());
-        }
-        offload.sort_unstable_by_key(|target| target.id());
-
-        if !same_direct_index(&direct, &self.indexes.direct) {
-            self.indexes.direct = direct
-                .into_iter()
-                .map(|(class, candidates)| (class, Arc::from(candidates)))
-                .collect();
+        let mut direct: Vec<_> = self
+            .segments
+            .values()
+            .filter(|entry| entry.is_accepting())
+            .map(|entry| self.handle(entry.clone()))
+            .collect();
+        direct.sort_unstable_by_key(|candidate| candidate.id());
+        if direct.len() != self.indexes.direct.len()
+            || !direct
+                .iter()
+                .zip(self.indexes.direct.iter())
+                .all(|(left, right)| Arc::ptr_eq(&left.entry, &right.entry))
+        {
+            self.indexes.direct = Arc::from(direct);
             self.indexes.direct_generation = self.indexes.direct_generation.wrapping_add(1);
-        }
-        if !same_offload_index(&offload, &self.indexes.offload) {
-            self.indexes.offload = Arc::from(offload);
-            self.indexes.offload_generation = self.indexes.offload_generation.wrapping_add(1);
         }
     }
 }
@@ -339,28 +260,4 @@ impl Drop for Catalog {
             entry.invalidate();
         }
     }
-}
-
-fn same_direct_index(
-    left: &HashMap<ReplicaClass, Vec<DirectCandidate>>,
-    right: &HashMap<ReplicaClass, Arc<[DirectCandidate]>>,
-) -> bool {
-    left.len() == right.len()
-        && left.iter().all(|(class, candidates)| {
-            right.get(class).is_some_and(|current| {
-                candidates.len() == current.len()
-                    && candidates
-                        .iter()
-                        .zip(current.iter())
-                        .all(|(left, right)| Arc::ptr_eq(&left.entry, &right.entry))
-            })
-        })
-}
-
-fn same_offload_index(left: &[OffloadTarget], right: &[OffloadTarget]) -> bool {
-    left.len() == right.len()
-        && left
-            .iter()
-            .zip(right.iter())
-            .all(|(left, right)| Arc::ptr_eq(&left.entry, &right.entry))
 }

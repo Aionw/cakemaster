@@ -3,9 +3,9 @@
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     DirectReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
-    ObjectIdentity, ObjectPinRequest, ObjectPutPlan, ReplicaId, ReplicaLease, ReplicaSelector,
-    ReplicaSet, TenantConfig, TenantId, TenantObjectManager, TenantPutRequest, WriteAdmission,
-    WriteMode, WriteOwner,
+    ObjectIdentity, ObjectPinRequest, ObjectPutPlan, ReplicaId, ReplicaSelector, ReplicaSet,
+    TenantConfig, TenantId, TenantObjectManager, TenantPutRequest, WriteAdmission, WriteMode,
+    WriteOwner,
 };
 use cakemaster::segment::config::DEFAULT_MAX_ALLOCATOR_NODES_PER_SEGMENT;
 use cakemaster::segment::placement::{AllocationSpec, PlacementRequest, ReplicaPolicy};
@@ -322,10 +322,7 @@ fn stage_and_commit(
         .expect("benchmark write can begin")
         .stage(
             ObjectContent::new(OBJECT_BYTES),
-            ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
-                ReplicaId::new(1),
-                reservation,
-            ))),
+            ReplicaSet::one(DirectReplica::new(ReplicaId::new(1), reservation)),
         )
         .expect("benchmark write can stage");
     let handle = catalog
@@ -442,7 +439,7 @@ fn run_worker(
     operations: usize,
     put_keys: Vec<ObjectIdentity>,
     pool: Arc<SegmentPool>,
-    candidate: cakemaster::segment::DirectCandidate,
+    candidate: cakemaster::segment::SegmentHandle,
     catalog: Arc<ObjectCatalog>,
     hot_keys: Arc<[ObjectIdentity]>,
     tick: Arc<AtomicU64>,
@@ -474,10 +471,7 @@ fn run_worker(
                 .expect("benchmark keys are unique")
                 .stage(
                     ObjectContent::new(OBJECT_BYTES),
-                    ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
-                        ReplicaId::new(1),
-                        reservation,
-                    ))),
+                    ReplicaSet::one(DirectReplica::new(ReplicaId::new(1), reservation)),
                 )
                 .expect("benchmark objects are valid");
             let handle = catalog
@@ -593,10 +587,7 @@ fn preload_hot_objects(
             .unwrap()
             .stage(
                 ObjectContent::new(OBJECT_BYTES),
-                ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
-                    ReplicaId::new(1),
-                    reservation,
-                ))),
+                ReplicaSet::one(DirectReplica::new(ReplicaId::new(1), reservation)),
             )
             .unwrap();
         drop(

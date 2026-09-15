@@ -6,8 +6,7 @@ use cakemaster::client::{
 use cakemaster::object::reclamation::CatalogTick;
 use cakemaster::object::{
     DirectReplica, NamespaceId, ObjectContent, ObjectIdentity, ObjectKind, ObjectManager,
-    ObjectPinRequest, ObjectPutPlan, ReplicaId, ReplicaLease, ReplicaSelector, ReplicaSet,
-    WriteMode, WriteOwner,
+    ObjectPinRequest, ObjectPutPlan, ReplicaId, ReplicaSelector, ReplicaSet, WriteMode, WriteOwner,
 };
 use cakemaster::segment::error::AttachError;
 use cakemaster::segment::placement::{AllocationSpec, PlacementRequest, ReplicaPolicy};
@@ -290,10 +289,7 @@ fn fenced_write_admission_cannot_reach_pending() {
     assert!(matches!(
         claim.stage(
             ObjectContent::new(4096),
-            ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
-                ReplicaId::new(1),
-                reservation,
-            ))),
+            ReplicaSet::one(DirectReplica::new(ReplicaId::new(1), reservation,)),
         ),
         Err(cakemaster::object::error::StageError::OwnerInactive)
     ));

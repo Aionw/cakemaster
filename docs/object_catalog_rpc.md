@@ -123,7 +123,7 @@ TTL、10s object lease、30s pending timeout、1GiB retired-byte ceiling、内�
 Memory 水位和 100ms reconcile interval。完整 accounting、
 有界 failure retry 和 diagnostics 语义见 [`memory_eviction.md`](memory_eviction.md)。
 配置及 metadata 都只在内存中，重启不恢复；没有预挂载 segment，
-由 client 的 Mount/ReMount RPC 注册 Memory/CXL 容量。
+由 client 的 Mount/ReMount RPC 注册 Memory 容量。
 
 这个入口只部署本文列出的当前 `WrappedMasterService` 子集，不附带 HA、持久化、TLS、
 HTTP metadata、NoF/LocalSSD workflow 或 multi-tenant policy connector。已合并的
@@ -234,9 +234,9 @@ soft pin、pending write、淘汰、物理回收和空 slot；soft-pin queue 每
 | Mooncake 输入 | 当前行为 |
 | --- | --- |
 | `replica_num > 0, nof_replica_num == 0` | Memory，和 C++ 一致使用 best-effort，但至少要成功一个 replica |
-| `replica_num == 0, nof_replica_num > 0` | NoF，all-or-nothing |
+| `nof_replica_num > 0` 或非空 `preferred_nof_segments` | `INVALID_PARAMS` |
 | Memory 与 NoF 同时请求 | `INVALID_PARAMS` |
-| preferred Memory/NoF segment | 转成 placement preferred names |
+| preferred Memory segment | 转成 placement preferred names |
 | soft pin `PRESERVE/ENABLE/DISABLE` | 完整接入事务；TTL 只允许用于 `ENABLE`，缺省 30 分钟、最大 24 小时、0 表示不 pin |
 | hard pin | 保存到 metadata；eviction 永远跳过，普通 Remove 拒绝，force Remove 可删除 |
 | same-node、host/group | `INVALID_PARAMS`，避免静默降级 |
@@ -248,7 +248,7 @@ soft pin、pending write、淘汰、物理回收和空 slot；soft-pin queue 每
 | `GetFsdir` | 尚未实现；它只是在 `GetStorageConfig` 调用失败时供旧 Client 使用的兼容 fallback |
 | `Ping` | 返回 view version；已激活 session 为 `OK`，其余为 `NEED_REMOUNT` |
 | `MountSegment` | absent client 原子建立 session；active client 动态追加；相同配置幂等，冲突返回 `SEGMENT_ALREADY_EXISTS` |
-| `ReMountSegment` | 支持 Memory/CXL segment 的原子激活与幂等重挂载；NoF 和冲突配置返回错误 |
+| `ReMountSegment` | 支持 Memory segment 的原子激活与幂等重挂载；CXL、NoF 和冲突配置返回错误 |
 | `UnmountSegment` | 立即摘除单个 segment；不存在幂等成功，client session 保持 active |
 | `GracefulUnmountSegment` | 立即停止新分配并在 grace deadline 摘除；不存在返回 `SEGMENT_NOT_FOUND`；依赖显式运行的 `MasterReconciler` |
 | `UpsertStart/End/Revoke` + batch | 缺失 key 等价 put；始终申请新 allocation；pending 时旧 committed version 可读；end 原子切换，revoke/timeout/session-fence 保留旧版本 |
@@ -262,7 +262,7 @@ soft pin、pending write、淘汰、物理回收和空 slot；soft-pin queue 每
 
 ## 仍需补齐的设计
 
-RPC adapter 本身已经是薄层。tenant quota 已按 Memory/NoF 分账，并通过 scoped
+RPC adapter 本身已经是薄层。tenant quota 仅计 Memory，并通过 scoped
 filter 在现有 generation queue 上定向回收；整体物理水位控制仍由部署侧 controller
 决定。支持混合 Memory+NoF replica 仍需要把一个 object plan 从单 class 扩展成多
 class 子计划及原子回滚。group 和 checksum 是当前明确不支持的能力，不在 RPC

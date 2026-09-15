@@ -3,8 +3,7 @@
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     DirectReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig, ObjectCommit, ObjectContent,
-    ObjectIdentity, ObjectPinRequest, ReplicaId, ReplicaLease, ReplicaSet, WriteAdmission,
-    WriteMode,
+    ObjectIdentity, ObjectPinRequest, ReplicaId, ReplicaSet, WriteAdmission, WriteMode,
 };
 use cakemaster::segment::{
     ClientId, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool, SegmentPoolConfig,
@@ -114,8 +113,8 @@ fn run_once(arguments: Arguments) -> EvictResult {
             TransportEndpoint::new(TransportProtocol::Tcp, "127.0.0.1:12345"),
         ))
         .expect("benchmark segment must be valid")
-        .direct_candidate()
-        .expect("memory segment must be directly allocatable");
+        .segment()
+        .clone();
     let catalog = Arc::new(
         ObjectCatalog::with_config(
             ObjectCatalogConfig::new(arguments.num_objects)
@@ -150,10 +149,7 @@ fn run_once(arguments: Arguments) -> EvictResult {
             .expect("benchmark keys are unique")
             .stage(
                 ObjectContent::new(OBJECT_BYTES),
-                ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
-                    ReplicaId::new(1),
-                    reservation,
-                ))),
+                ReplicaSet::one(DirectReplica::new(ReplicaId::new(1), reservation)),
             )
             .expect("benchmark replica is valid");
         drop(

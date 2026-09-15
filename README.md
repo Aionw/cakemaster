@@ -1,6 +1,6 @@
 # cakemaster
 
-Cakemaster workspace 包含高并发 object catalog、异构 segment/placement 核心库，以及基于 Tokio 的 yalantinglibs `coro_rpc` v0 兼容实现，可让 Rust 与 C++ `coro_rpc` 客户端/服务端通过 TCP 直接互调。
+Cakemaster workspace 包含高并发 object catalog、Memory segment/placement 核心库，以及基于 Tokio 的 yalantinglibs `coro_rpc` v0 兼容实现，可让 Rust 与 C++ `coro_rpc` 客户端/服务端通过 TCP 直接互调。
 
 兼容基线为 `alibaba/yalantinglibs` 的 `c1cef74057b139944c982d840c09c9940f26e08e` 提交。协议实现依据该版本的 [`coro_rpc_protocol.hpp`](https://github.com/alibaba/yalantinglibs/blob/c1cef74057b139944c982d840c09c9940f26e08e/include/ylt/coro_rpc/impl/protocol/coro_rpc_protocol.hpp) 和 [`struct_pack`](https://alibaba.github.io/yalantinglibs/en/struct_pack/struct_pack_layout.html)。
 
@@ -50,12 +50,12 @@ crates/coro-rpc/examples/   # RPC crate 的 benchmark
 领域模块不导入 Tokio、RPC 或 codegen API，但不再用额外 Cargo package 人为隔离。
 领域 API 通过 `object`、`segment` 两个门面暴露；错误、回收控制、placement 和诊断类型位于各自的具名子模块，内部实现文件保持私有。
 
-SegmentPool 对 Memory、CXL、NoF 和 LocalSSD 的领域建模与扩展约束见 [`docs/segment_pool_backends.md`](docs/segment_pool_backends.md)。
+Memory-only SegmentPool 的结构、生命周期与 API 变更见 [`docs/segment_pool_backends.md`](docs/segment_pool_backends.md)。
 ObjectManager、ReplicaAllocator、异步 RPC 边界和当前 Mooncake 兼容子集见
 [`docs/object_catalog_rpc.md`](docs/object_catalog_rpc.md)。
 与当前上游 C++ Mooncake Store 的完整功能差距、最新 wire 漂移和建议实施顺序见
 [`docs/mooncake_feature_gap.md`](docs/mooncake_feature_gap.md)。
-可选的 tenant namespace、Memory/NoF quota、RAII 计费与定向回收见
+可选的 tenant namespace、Memory quota、RAII 计费与定向回收见
 [`docs/tenant_quota.md`](docs/tenant_quota.md)。
 
 核心类型保持短路径，扩展接口按职责导入：
@@ -347,11 +347,10 @@ RPC server 和 `MasterReconciler` 的统一 shutdown/join。workspace 的主 bin
 `cakemaster` 就是该 production 入口，benchmark server 仍只用于性能测量。
 
 当前明确不支持 checksum：PutEnd 携带 checksum 返回 `INVALID_PARAMS`，Get/BatchGet
-固定返回 `None`。Memory-only replica 使用与 C++ 一致的 best-effort 语义，NoF-only
-使用 all-or-nothing；`ReplicateConfig` 的 soft-pin action/TTL 和 hard pin 已接入事务、
-淘汰与强制删除生命周期。混合 Memory+NoF、group 和 Disk 仍需领域模型支持，不在 RPC
-handler 中静默降级。multi-tenant 构造会解析 tenant、隔离 namespace 并执行
-Memory/NoF quota admission。
+固定返回 `None`。Memory replica 使用与 C++ 一致的 best-effort 语义；`ReplicateConfig` 的 soft-pin action/TTL 和 hard pin 已接入事务、
+淘汰与强制删除生命周期。CXL、NoF、LocalSSD 后端已移除，非 Memory 请求明确拒绝；group 和 Disk
+也不在 RPC handler 中静默降级。multi-tenant 构造会解析 tenant、隔离 namespace 并执行
+Memory quota admission。
 
 真实 TCP 测试位于
 [`tests/rpc.rs`](tests/rpc.rs)

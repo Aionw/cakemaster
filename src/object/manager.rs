@@ -290,7 +290,7 @@ impl ObjectManager {
         pins: ResolvedObjectPinRequest,
         now: CatalogTick,
     ) -> Result<PreparedPut, ObjectManagerError> {
-        let retry_limit = self.allocation_retry_limit(plan.placement().replica_class());
+        let retry_limit = self.allocation_retry_limit();
         let mut retries = 0;
         let mut allocation_generation = None;
         loop {
@@ -366,8 +366,7 @@ impl ObjectManager {
         }
 
         let replica_class = plan.placement().replica_class();
-        let started = started_put(replica_class, replicas.replicas().iter())
-            .map_err(PrepareClaimedPutError::Manager)?;
+        let started = started_put(replica_class, replicas.replicas().iter());
         Ok(PreparedPut {
             content: plan.content(),
             claim,
@@ -619,10 +618,6 @@ impl ObjectManager {
         if plan.content().logical_bytes() == 0
             || plan.placement().allocation().bytes() != plan.content().logical_bytes()
             || plan.placement().replicas().count() == 0
-            || !matches!(
-                plan.placement().replica_class(),
-                ReplicaClass::Memory | ReplicaClass::Nof
-            )
         {
             return Err(ObjectManagerError::InvalidPlan);
         }
@@ -631,10 +626,7 @@ impl ObjectManager {
             .map_err(|_| ObjectManagerError::InvalidPlan)
     }
 
-    fn allocation_retry_limit(&self, replica_class: ReplicaClass) -> usize {
-        if replica_class != ReplicaClass::Memory {
-            return 0;
-        }
+    fn allocation_retry_limit(&self) -> usize {
         self.memory_eviction
             .as_ref()
             .map_or(0, |eviction| eviction.config().allocation_retry_limit())
@@ -700,28 +692,18 @@ impl ObjectManager {
 fn started_put<'a>(
     replica_class: ReplicaClass,
     replicas: impl IntoIterator<Item = &'a ReplicaLease>,
-) -> Result<StartedPut, ObjectManagerError> {
+) -> StartedPut {
     let replicas = replicas
         .into_iter()
-        .map(|replica| {
-            let Some(direct) = replica.direct() else {
-                log::error!(
-                    target: "cakemaster::object::manager",
-                    replica_id = replica.id().get();
-                    "direct placement produced a non-direct replica"
-                );
-                return Err(ObjectManagerError::Internal);
-            };
-            Ok::<AllocatedReplica, ObjectManagerError>(AllocatedReplica {
-                id: direct.id(),
-                descriptor: direct.owned_descriptor(),
-            })
+        .map(|replica| AllocatedReplica {
+            id: replica.id(),
+            descriptor: replica.owned_descriptor(),
         })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(StartedPut {
+        .collect();
+    StartedPut {
         replica_class,
         replicas,
-    })
+    }
 }
 
 fn allocation_shortfall(
@@ -776,23 +758,7 @@ fn validate_replicas<'a>(
         );
         return Err(ObjectManagerError::Internal);
     };
-    let actual = replica
-        .direct()
-        .map(|replica| replica.replica_class())
-        .unwrap_or(ReplicaClass::LocalSsd);
-    if replicas.any(|replica| {
-        replica
-            .direct()
-            .map(|replica| replica.replica_class())
-            .unwrap_or(ReplicaClass::LocalSsd)
-            != actual
-    }) {
-        log::error!(
-            target: "cakemaster::object::manager",
-            "object replicas have inconsistent storage classes"
-        );
-        return Err(ObjectManagerError::Internal);
-    }
+    let actual = replica.replica_class();
     validate_selector(actual, selector)
 }
 

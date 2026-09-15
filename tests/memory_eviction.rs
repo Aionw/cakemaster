@@ -9,8 +9,8 @@ use cakemaster::segment::placement::{
     AllocationSpec, FulfillmentPolicy, PlacementRequest, ReplicaPolicy,
 };
 use cakemaster::segment::{
-    ClientId, CxlArenaId, CxlArenaSpec, MemoryRegion, ReplicaClass, SegmentId, SegmentIdentity,
-    SegmentPool, SegmentSpec, TransportEndpoint, TransportProtocol,
+    ClientId, MemoryRegion, ReplicaClass, SegmentId, SegmentIdentity, SegmentPool, SegmentSpec,
+    TransportEndpoint, TransportProtocol,
 };
 use cakemaster::server::{MasterClock, MasterReconcileConfig, ObjectCatalogRpcService};
 use std::sync::{Arc, Barrier};
@@ -57,14 +57,6 @@ fn plan(bytes: u64) -> ObjectPutPlan {
     ObjectPutPlan::new(
         ObjectContent::new(bytes),
         PlacementRequest::new(AllocationSpec::new(bytes), ReplicaPolicy::new(1)),
-    )
-}
-
-fn nof_plan(bytes: u64) -> ObjectPutPlan {
-    ObjectPutPlan::new(
-        ObjectContent::new(bytes),
-        PlacementRequest::new(AllocationSpec::new(bytes), ReplicaPolicy::new(1))
-            .for_replica_class(ReplicaClass::Nof),
     )
 }
 
@@ -129,21 +121,18 @@ fn watermarks_and_failure_limits_are_strictly_validated() {
 }
 
 #[test]
-fn aggregate_space_deduplicates_cxl_and_keeps_quiesced_capacity() {
+fn aggregate_memory_space_keeps_quiesced_capacity() {
     let pool = SegmentPool::new();
-    let arena = CxlArenaSpec::new(CxlArenaId::new("watermark-shared"), 8 * BYTES);
     let first = SegmentId::new(109, 1);
     let second = SegmentId::new(109, 2);
-    pool.attach(SegmentSpec::cxl(
-        SegmentIdentity::new(first, OWNER, "cxl-first"),
-        arena.clone(),
-    ))
-    .unwrap();
-    pool.attach(SegmentSpec::cxl(
-        SegmentIdentity::new(second, OWNER, "cxl-second"),
-        arena,
-    ))
-    .unwrap();
+    for (id, base) in [(first, 0x10000), (second, 0x20000)] {
+        pool.attach(SegmentSpec::memory(
+            SegmentIdentity::new(id, OWNER, format!("memory-{base}")),
+            MemoryRegion::new(base, 4 * BYTES),
+            TransportEndpoint::new(TransportProtocol::Tcp, "memory-client"),
+        ))
+        .unwrap();
+    }
     let reservation = pool.reserve_on(first, BYTES).unwrap();
 
     let space = pool.space_for(ReplicaClass::Memory);
@@ -412,48 +401,6 @@ fn best_effort_failure_requests_only_one_replica_of_reclaim() {
 }
 
 #[test]
-fn memory_watermark_never_retires_nof_objects() {
-    let pool = Arc::new(SegmentPool::new());
-    pool.attach(segment(1, 2 * BYTES)).unwrap();
-    pool.attach(SegmentSpec::nof(
-        SegmentIdentity::new(SegmentId::new(211, 1), OWNER, "watermark-nof"),
-        MemoryRegion::new(0, BYTES),
-        "nvme://127.0.0.1/watermark",
-    ))
-    .unwrap();
-    let manager = ObjectManager::with_eviction_config(
-        pool,
-        ObjectCatalogConfig::new(32).with_lease(1, 0),
-        MemoryEvictionConfig::new(0.75, 0.50).unwrap(),
-    )
-    .unwrap();
-    let nof = identity(10);
-    manager
-        .start_put(
-            nof.clone(),
-            WriteAdmission::unmanaged(OWNER),
-            nof_plan(BYTES),
-            CatalogTick::ZERO,
-        )
-        .unwrap();
-    manager
-        .finish_put(&nof, WriteOwner::new(OWNER), ReplicaSelector::All)
-        .unwrap();
-    publish(&manager, 11, CatalogTick::ZERO);
-    publish(&manager, 12, CatalogTick::ZERO);
-
-    manager.maintenance(CatalogTick::new(2), CollectBudget::new(16, 16, 0));
-    manager.maintenance(CatalogTick::new(3), CollectBudget::new(16, 16, 0));
-
-    assert!(manager.exists(nof.as_lookup(), CatalogTick::new(3)));
-    assert_eq!(
-        manager.pool().space_for(ReplicaClass::Nof).used_bytes,
-        BYTES
-    );
-    assert!(manager.pool().space_for(ReplicaClass::Memory).used_bytes <= BYTES);
-}
-
-#[test]
 fn allocation_failure_does_not_retry_without_observed_reclaim_progress() {
     let eviction = MemoryEvictionConfig::new(0.90, 0.60)
         .unwrap()
@@ -479,24 +426,6 @@ fn allocation_failure_does_not_retry_without_observed_reclaim_progress() {
     assert_eq!(stats.allocation_retries, 0);
     assert_eq!(stats.controller_steps, 1);
     drop(leased);
-}
-
-#[test]
-fn nof_allocation_failure_does_not_issue_memory_reclaim_debt() {
-    let manager = manager(BYTES, MemoryEvictionConfig::default());
-    assert_eq!(
-        manager.start_put(
-            identity(0),
-            WriteAdmission::unmanaged(OWNER),
-            nof_plan(BYTES),
-            CatalogTick::ZERO,
-        ),
-        Err(ObjectManagerError::NoAvailableReplicas)
-    );
-    assert_eq!(manager.catalog().stats().reclaim_debt, 0);
-    let stats = manager.memory_eviction_stats().unwrap();
-    assert_eq!(stats.allocation_failures, 0);
-    assert_eq!(stats.controller_steps, 0);
 }
 
 #[tokio::test(start_paused = true)]

@@ -2,7 +2,6 @@
 
 use super::config::{MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE, MIN_ALLOCATOR_NODES_PER_SEGMENT};
 use super::identity::{ClientId, SegmentId};
-use super::spec::{CxlArenaId, SegmentKind};
 use super::transport::TransportProtocol;
 use std::sync::Arc;
 use thiserror::Error;
@@ -45,11 +44,8 @@ pub enum AttachError {
         #[source]
         source: ParseTransportProtocolError,
     },
-    #[error("transport protocol {protocol:?} is incompatible with {kind:?} segments")]
-    IncompatibleTransportProtocol {
-        kind: SegmentKind,
-        protocol: TransportProtocol,
-    },
+    #[error("transport protocol {protocol:?} is incompatible with memory segments")]
+    IncompatibleTransportProtocol { protocol: TransportProtocol },
     #[error("segment size must not be zero")]
     ZeroSize,
     #[error("segment address range overflows u64")]
@@ -58,14 +54,6 @@ pub enum AttachError {
     ConflictingSegmentId(SegmentId),
     #[error("segment address range overlaps existing segment {existing} in the same address space")]
     OverlappingAddressRange { existing: SegmentId },
-    #[error("NVMe-oF namespace endpoint is already attached as segment {existing}")]
-    DuplicateNofEndpoint { existing: SegmentId },
-    #[error("CXL arena id must not be empty")]
-    EmptyCxlArenaId,
-    #[error("CXL arena {arena:?} is already registered with different capacity")]
-    ConflictingCxlArena { arena: CxlArenaId },
-    #[error("client already has LocalSSD segment {existing}")]
-    DuplicateLocalSsdOwner { existing: SegmentId },
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
@@ -95,40 +83,10 @@ pub enum ReserveError {
     ForeignCandidate,
     #[error("segment {0} was not found")]
     NotFound(SegmentId),
-    #[error("segment {0} does not support direct reservations")]
-    NotDirectlyAllocatable(SegmentId),
     #[error("segment {0} is not accepting reservations")]
     NotAccepting(SegmentId),
     #[error("segment {0} has no suitable free range")]
     OutOfSpace(SegmentId),
     #[error("allocated address overflowed in segment {0}")]
     AddressOverflow(SegmentId),
-}
-
-#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
-pub enum LocalSsdError {
-    #[error("offload size must not be zero")]
-    ZeroSize,
-    #[error("LocalSSD object transport endpoint must not be empty")]
-    EmptyTransportEndpoint,
-    #[error("segment candidate belongs to another pool")]
-    ForeignCandidate,
-    #[error("segment {0} was not found")]
-    NotFound(SegmentId),
-    #[error("segment {segment} belongs to client {expected}, not {actual}")]
-    OwnerMismatch {
-        segment: SegmentId,
-        expected: ClientId,
-        actual: ClientId,
-    },
-    #[error("segment {0} is not a LocalSSD offload target")]
-    NotLocalSsd(SegmentId),
-    #[error("LocalSSD segment {0} is not accepting offloads")]
-    NotAccepting(SegmentId),
-    #[error("LocalSSD segment {0} has offloading disabled")]
-    OffloadDisabled(SegmentId),
-    #[error("LocalSSD segment {0} has not reported capacity")]
-    CapacityNotReported(SegmentId),
-    #[error("LocalSSD segment {0} has insufficient reported capacity")]
-    OutOfSpace(SegmentId),
 }

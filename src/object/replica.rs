@@ -1,7 +1,6 @@
 use crate::segment::placement::ReservationSet;
 use crate::segment::{
-    LocalSsdDescriptor, LocalSsdDescriptorRef, LocalSsdLease, ReplicaClass, Reservation,
-    ReservationDescriptor, ReservationDescriptorRef, SegmentId,
+    ReplicaClass, Reservation, ReservationDescriptor, ReservationDescriptorRef, SegmentId,
 };
 use std::fmt;
 
@@ -18,18 +17,13 @@ impl ReplicaId {
     }
 }
 
-pub struct DirectReplica {
+pub struct ReplicaLease {
     id: ReplicaId,
     reservation: Reservation,
 }
 
-impl DirectReplica {
+impl ReplicaLease {
     pub fn new(id: ReplicaId, reservation: Reservation) -> Self {
-        assert_ne!(
-            reservation.replica_class(),
-            ReplicaClass::LocalSsd,
-            "DirectReplica requires a direct reservation"
-        );
         Self { id, reservation }
     }
 
@@ -70,10 +64,10 @@ impl DirectReplica {
     }
 }
 
-impl fmt::Debug for DirectReplica {
+impl fmt::Debug for ReplicaLease {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("DirectReplica")
+            .debug_struct("ReplicaLease")
             .field("id", &self.id)
             .field("segment_id", &self.segment_id())
             .field("replica_class", &self.replica_class())
@@ -83,136 +77,7 @@ impl fmt::Debug for DirectReplica {
     }
 }
 
-pub struct LocalSsdReplica {
-    id: ReplicaId,
-    lease: LocalSsdLease,
-}
-
-impl LocalSsdReplica {
-    pub const fn new(id: ReplicaId, lease: LocalSsdLease) -> Self {
-        Self { id, lease }
-    }
-
-    pub const fn id(&self) -> ReplicaId {
-        self.id
-    }
-
-    pub fn segment_id(&self) -> SegmentId {
-        self.lease.segment_id()
-    }
-
-    pub const fn reserved_bytes(&self) -> u64 {
-        self.lease.bytes()
-    }
-
-    pub const fn capacity_bytes(&self) -> u64 {
-        self.lease.bytes()
-    }
-
-    pub fn is_live(&self) -> bool {
-        self.lease.is_live()
-    }
-
-    pub fn descriptor(&self) -> LocalSsdDescriptorRef<'_> {
-        self.lease.descriptor()
-    }
-
-    pub fn owned_descriptor(&self) -> LocalSsdDescriptor {
-        self.descriptor().to_owned()
-    }
-
-    pub(crate) fn into_lease(self) -> LocalSsdLease {
-        self.lease
-    }
-}
-
-impl fmt::Debug for LocalSsdReplica {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("LocalSsdReplica")
-            .field("id", &self.id)
-            .field("segment_id", &self.segment_id())
-            .field("reserved_bytes", &self.reserved_bytes())
-            .field("descriptor", &self.descriptor())
-            .finish()
-    }
-}
-
-#[derive(Debug)]
-#[non_exhaustive]
-pub enum ReplicaLease {
-    Direct(DirectReplica),
-    LocalSsd(LocalSsdReplica),
-}
-
-impl ReplicaLease {
-    pub const fn id(&self) -> ReplicaId {
-        match self {
-            Self::Direct(replica) => replica.id(),
-            Self::LocalSsd(replica) => replica.id(),
-        }
-    }
-
-    pub fn segment_id(&self) -> SegmentId {
-        match self {
-            Self::Direct(replica) => replica.segment_id(),
-            Self::LocalSsd(replica) => replica.segment_id(),
-        }
-    }
-
-    /// Whether the exact mounted segment incarnation backing this replica is
-    /// still logically valid.
-    pub fn is_live(&self) -> bool {
-        match self {
-            Self::Direct(replica) => replica.is_live(),
-            Self::LocalSsd(replica) => replica.is_live(),
-        }
-    }
-
-    pub const fn reserved_bytes(&self) -> u64 {
-        match self {
-            Self::Direct(replica) => replica.reserved_bytes(),
-            Self::LocalSsd(replica) => replica.reserved_bytes(),
-        }
-    }
-
-    pub const fn capacity_bytes(&self) -> u64 {
-        match self {
-            Self::Direct(replica) => replica.capacity_bytes(),
-            Self::LocalSsd(replica) => replica.capacity_bytes(),
-        }
-    }
-
-    pub fn direct(&self) -> Option<&DirectReplica> {
-        match self {
-            Self::Direct(replica) => Some(replica),
-            Self::LocalSsd(_) => None,
-        }
-    }
-
-    pub fn memory(&self) -> Option<&DirectReplica> {
-        match self {
-            Self::Direct(replica) if replica.replica_class() == ReplicaClass::Memory => {
-                Some(replica)
-            }
-            Self::Direct(_) | Self::LocalSsd(_) => None,
-        }
-    }
-
-    pub fn nof(&self) -> Option<&DirectReplica> {
-        match self {
-            Self::Direct(replica) if replica.replica_class() == ReplicaClass::Nof => Some(replica),
-            Self::Direct(_) | Self::LocalSsd(_) => None,
-        }
-    }
-
-    pub fn local_ssd(&self) -> Option<&LocalSsdReplica> {
-        match self {
-            Self::Direct(_) => None,
-            Self::LocalSsd(replica) => Some(replica),
-        }
-    }
-}
+pub type DirectReplica = ReplicaLease;
 
 #[derive(Debug, Default)]
 pub struct ReplicaSet {
@@ -237,7 +102,6 @@ enum ReplicaStorage {
 #[derive(Default)]
 pub(crate) struct ReplicaReclaimBatch {
     direct: Vec<Reservation>,
-    local_ssd: Vec<LocalSsdLease>,
 }
 
 impl ReplicaSet {
@@ -287,7 +151,7 @@ impl ReplicaSet {
                 .enumerate()
                 .map(|(index, reservation)| {
                     let id = u32::try_from(index + 1).expect("replica count exceeds u32::MAX");
-                    ReplicaLease::Direct(DirectReplica::new(ReplicaId::new(id), reservation))
+                    ReplicaLease::new(ReplicaId::new(id), reservation)
                 }),
         )
     }
@@ -380,7 +244,6 @@ impl ReplicaReclaimBatch {
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             direct: Vec::with_capacity(capacity),
-            local_ssd: Vec::with_capacity(capacity),
         }
     }
 
@@ -389,14 +252,10 @@ impl ReplicaReclaimBatch {
     }
 
     fn push(&mut self, replica: ReplicaLease) {
-        match replica {
-            ReplicaLease::Direct(replica) => self.direct.push(replica.into_reservation()),
-            ReplicaLease::LocalSsd(replica) => self.local_ssd.push(replica.into_lease()),
-        }
+        self.direct.push(replica.into_reservation());
     }
 
     pub(crate) fn release(self) {
         Reservation::release_batch(self.direct);
-        drop(self.local_ssd);
     }
 }

@@ -14,7 +14,7 @@ pub struct ObjectCatalogStats {
     pub pending_bytes: u64,
     pub live_bytes: u64,
     pub retired_bytes: u64,
-    /// Retired bytes backed by Memory/CXL reservations.
+    /// Retired bytes backed by Memory reservations.
     pub retired_memory_bytes: u64,
     // Explicit global reclaim pressure. Watermark and allocation-failure
     // pressure are controller-owned, class-scoped, and exposed separately.

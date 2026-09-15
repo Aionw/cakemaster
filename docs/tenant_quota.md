@@ -10,7 +10,7 @@ Group placement/accounting is not part of this design.
 The core value and policy types are:
 
 - `TenantId`: validated external identity with an opaque representation;
-- `TenantResourceClass::{Memory, Nof}`: independent accounting domains;
+- `TenantResourceClass::Memory`: the supported accounting domain;
 - `TenantQuotaLimits` and `TenantPolicy`: requested policy;
 - `TenantConfig::{Single, Multi { initial_policies }}`;
 - `ResolvedTenant`: opaque manager- and generation-bound batch handle;
@@ -32,16 +32,14 @@ generation, so stale `ResolvedTenant` values cannot be reused.
 
 ## Quota semantics
 
-Quota is tracked independently for Memory and NoF. LocalSSD is deliberately
-outside v1. An object is charged by logical object bytes multiplied by its
-actual direct replica count; allocator rounding and shared segment capacity do
-not inflate the tenant charge.
+Only Memory quota is tracked. `TenantQuotaLimits::new(memory_bytes)` sets the
+requested limit. An object is charged by logical object bytes multiplied by its
+actual replica count; allocator rounding does not inflate the tenant charge.
 
 Requested quota is policy. Effective quota is recomputed from the capacity of
 currently accepting `SegmentPool` resources:
 
-1. Shared physical resource IDs, such as multiple CXL mounts of one arena, are
-   counted once.
+1. Each accepting memory segment contributes its independent capacity.
 2. If total requested quota is no greater than capacity, every tenant receives
    its request.
 3. Otherwise, capacity is divided proportionally using `u128` arithmetic.
@@ -53,7 +51,7 @@ that epoch changes. Tenant policy updates are serialized and rare, while
 resolution reads an immutable `ArcSwap` directory snapshot without a lock.
 
 Admission uses a policy epoch plus atomic compare-and-swap. A batch performs
-its initial demand reservation with at most one CAS per resource class, then
+its initial demand reservation with one aggregate Memory admission, then
 splits that reservation into per-object guards. Best-effort placement initially reserves
 one replica and grows the reservation after placement if more replicas were
 actually allocated. A failed growth releases the physical reservations before
@@ -101,8 +99,8 @@ generation, and matching objects still obey second-chance and lease rules.
 Accounting remains charged until the final object handle is gone and physical
 replicas are released.
 
-Deleting a tenant first closes admission and succeeds only when both class
-demands are zero. Revoked pending records no longer make the tenant logically
+Deleting a tenant first closes admission and succeeds only when Memory
+demand is zero. Revoked pending records no longer make the tenant logically
 non-empty while their physical reservations finish asynchronous cleanup.
 
 ## RPC behavior and scope
