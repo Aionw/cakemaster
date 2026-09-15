@@ -271,8 +271,8 @@ tenant 的完整约束见 `docs/tenant_quota.md`。
 
 ## 与当前 C++ Mooncake 的已知边角差异
 
-行为核对基于本机 `/home/aione/src/cpp/Mooncake` 的 `07422af7d81eb905fb8054c0f8f87bea243343f7`
-源码（其 `extern/yalantinglibs` 子模块有本地改动，但不影响 Master pin 逻辑）。本实现对齐提交/回滚、Upsert preserve/enable/disable、hard-pin eviction 保护以及 TTL
+行为核对基于 Mooncake 提交 [`07422af7d81eb905fb8054c0f8f87bea243343f7`](https://github.com/kvcache-ai/Mooncake/tree/07422af7d81eb905fb8054c0f8f87bea243343f7)
+的源码（其 `extern/yalantinglibs` 子模块有本地改动，但不影响 Master pin 逻辑）。本实现对齐提交/回滚、Upsert preserve/enable/disable、hard-pin eviction 保护以及 TTL
 校验等可观察语义，但没有复制 C++ 内部数据结构：Rust 使用单调 `CatalogTick`、原子
 deadline 和现有 bounded collector；C++ 使用 system clock、deadline index 和 metadata
 shard。仍有这些已知差异：

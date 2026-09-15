@@ -4,6 +4,15 @@
 /target/
 /logs/
 
+# Local coding-agent configuration
+/.codex/
+/.agents/
+
+# Local environment files (keep sanitized examples trackable)
+.env
+.env.*
+!.env.example
+
 # Remove Cargo.lock from version control if you prefer
 # Cargo.lock
 
