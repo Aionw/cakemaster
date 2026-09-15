@@ -109,3 +109,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
 Tests cover core domain logic, C++ golden wire vectors, generated interfaces, and RPC over real TCP connections. See the [technical reference](docs/technical_reference.md#验证) for cross-language interoperability and benchmark build instructions.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
