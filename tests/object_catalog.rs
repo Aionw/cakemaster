@@ -4,16 +4,13 @@ use cakemaster::object::error::{
 use cakemaster::object::reclamation::{CatalogTick, CollectBudget};
 use cakemaster::object::{
     DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS, DEFAULT_MAX_SOFT_PIN_TTL_TICKS,
-    DEFAULT_SOFT_PIN_TTL_TICKS, DirectReplica, LocalSsdReplica, NamespaceId, ObjectCatalog,
-    ObjectCatalogConfig, ObjectCommit, ObjectContent, ObjectIdentity, ObjectPinRequest, ReplicaId,
-    ReplicaLease, ReplicaSet, WriteAdmission, WriteClaim, WriteMode, WriteOwner,
-};
-use cakemaster::segment::placement::{
-    AllocationSpec, PlacementRequest, ReplicaAllocator, ReplicaPolicy,
+    DEFAULT_SOFT_PIN_TTL_TICKS, DirectReplica, NamespaceId, ObjectCatalog, ObjectCatalogConfig,
+    ObjectCommit, ObjectContent, ObjectIdentity, ObjectPinRequest, ReplicaId, ReplicaSet,
+    WriteAdmission, WriteClaim, WriteMode, WriteOwner,
 };
 use cakemaster::segment::{
-    ClientId, MemoryRegion, ReplicaClass, SegmentId, SegmentIdentity, SegmentPool,
-    SegmentPoolConfig, SegmentSpec, TransportEndpoint, TransportProtocol,
+    ClientId, MemoryRegion, SegmentId, SegmentIdentity, SegmentPool, SegmentPoolConfig,
+    SegmentSpec, TransportEndpoint, TransportProtocol,
 };
 use std::sync::Arc;
 
@@ -59,10 +56,10 @@ fn begin_insert(
 }
 
 fn replica(pool: &SegmentPool, bytes: u64) -> ReplicaSet {
-    ReplicaSet::one(ReplicaLease::Direct(DirectReplica::new(
+    ReplicaSet::one(DirectReplica::new(
         ReplicaId::new(1),
         pool.reserve_on(SEGMENT_ID, bytes).unwrap(),
-    )))
+    ))
 }
 
 #[test]
@@ -110,101 +107,20 @@ fn replica_set_preserves_inline_and_multiple_replica_views() {
     drop(inline);
 
     let multiple = ReplicaSet::new([
-        ReplicaLease::Direct(DirectReplica::new(
+        DirectReplica::new(
             ReplicaId::new(1),
             pool.reserve_on(SEGMENT_ID, 1024).unwrap(),
-        )),
-        ReplicaLease::Direct(DirectReplica::new(
+        ),
+        DirectReplica::new(
             ReplicaId::new(2),
             pool.reserve_on(SEGMENT_ID, 2048).unwrap(),
-        )),
+        ),
     ]);
     assert_eq!(multiple.len(), 2);
     assert_eq!(multiple.reserved_bytes(), 3072);
     assert_eq!(multiple.replicas()[1].id(), ReplicaId::new(2));
     drop(multiple);
     assert_eq!(pool.stats(SEGMENT_ID).unwrap().usage.active_allocations, 0);
-}
-
-#[test]
-fn replica_set_preserves_nof_reservations_as_nof_replicas() {
-    let pool = pool(1 << 20, 64);
-    let nof_id = SegmentId::new(9, 2);
-    pool.attach(SegmentSpec::nof(
-        SegmentIdentity::new(nof_id, OWNER, "catalog-nof"),
-        MemoryRegion::new(0, 1 << 20),
-        "nvme://10.0.0.1/nqn.1",
-    ))
-    .unwrap();
-
-    let reservations = ReplicaAllocator::new(pool.clone())
-        .reserve(
-            &PlacementRequest::new(AllocationSpec::new(4096), ReplicaPolicy::new(1))
-                .for_replica_class(ReplicaClass::Nof),
-        )
-        .unwrap();
-    let replicas = ReplicaSet::from_reservations(reservations);
-    let nof = replicas.replicas()[0].nof().unwrap();
-    assert_eq!(nof.segment_id(), nof_id);
-    assert_eq!(nof.descriptor().region().base(), 0);
-    drop(replicas);
-    assert_eq!(pool.stats(nof_id).unwrap().usage.active_allocations, 0);
-}
-
-#[test]
-fn pending_object_reclamation_releases_local_ssd_capacity() {
-    let pool = pool(1 << 20, 64);
-    let local_id = SegmentId::new(9, 3);
-    let candidate = pool
-        .attach(SegmentSpec::local_ssd(
-            SegmentIdentity::new(local_id, OWNER, "catalog-local-ssd"),
-            true,
-        ))
-        .unwrap()
-        .offload_target()
-        .expect("LocalSSD attachment must expose an offload target");
-    pool.report_local_ssd_capacity(OWNER, local_id, 1 << 20)
-        .unwrap();
-    let lease = pool
-        .admit_offload(&candidate, 4096)
-        .unwrap()
-        .commit("file://catalog-local/object")
-        .unwrap();
-    let replicas = ReplicaSet::one(ReplicaLease::LocalSsd(LocalSsdReplica::new(
-        ReplicaId::new(1),
-        lease,
-    )));
-    let local_replica = replicas.replicas()[0].local_ssd().unwrap();
-    assert_eq!(local_replica.segment_id(), local_id);
-    assert_eq!(local_replica.capacity_bytes(), 4096);
-    assert_eq!(
-        local_replica.descriptor().transport_endpoint(),
-        "file://catalog-local/object"
-    );
-
-    let catalog = ObjectCatalog::with_config(
-        ObjectCatalogConfig::new(16)
-            .with_pending_timeout(1)
-            .with_empty_slot_grace(1),
-    )
-    .unwrap();
-    let ticket = begin_insert(
-        &catalog,
-        identity("local-ssd-pending"),
-        admission(),
-        CatalogTick::ZERO,
-    )
-    .unwrap()
-    .stage(ObjectContent::new(4096), replicas)
-    .unwrap();
-    drop(ticket);
-    assert_eq!(candidate.local_ssd_stats().unwrap().committed_bytes, 4096);
-
-    let report = catalog.collect_step(CatalogTick::new(1), CollectBudget::new(8, 8, 0));
-    assert_eq!(report.expired_pending, 1);
-    assert_eq!(report.reclaimed_objects, 1);
-    assert_eq!(candidate.local_ssd_stats().unwrap().committed_bytes, 0);
-    assert_eq!(candidate.stats().usage.active_allocations, 0);
 }
 
 #[test]

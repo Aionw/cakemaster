@@ -1,4 +1,4 @@
-//! Heterogeneous segment registration, placement, offload admission, and
+//! Memory segment registration, placement, and
 //! lifecycle management.
 
 pub mod config;
@@ -6,7 +6,6 @@ mod descriptor;
 pub mod error;
 mod identity;
 mod lifetime;
-mod local_ssd;
 mod offset_allocator;
 pub mod placement;
 mod pool;
@@ -17,19 +16,13 @@ mod transport;
 
 pub use config::SegmentPoolConfig;
 pub use descriptor::{
-    LocalSsdDescriptor, LocalSsdDescriptorRef, MemoryRegion, RangeDescriptor, RangeDescriptorRef,
-    ReservationDescriptor, ReservationDescriptorRef,
+    MemoryRegion, RangeDescriptor, RangeDescriptorRef, ReservationDescriptor,
+    ReservationDescriptorRef,
 };
 pub use identity::{ClientId, SegmentId, SegmentIdentity};
-pub use local_ssd::{LocalSsdLease, LocalSsdStats, OffloadPermit};
 pub(crate) use pool::SegmentIncarnation;
-pub use pool::{
-    AttachOutcome, DirectCandidate, OffloadSnapshot, OffloadTarget, PoolSnapshot,
-    ReplicaClassCapacity, SegmentHandle, SegmentPool,
-};
+pub use pool::{AttachOutcome, PoolSnapshot, ReplicaClassCapacity, SegmentHandle, SegmentPool};
 pub use reservation::Reservation;
-pub use spec::{
-    CxlArenaId, CxlArenaSpec, ReplicaClass, SegmentKind, SegmentResourceId, SegmentSpec,
-};
+pub use spec::{ReplicaClass, SegmentSpec};
 pub use stats::ReplicaClassSpaceStats;
 pub use transport::{TransportEndpoint, TransportProtocol};

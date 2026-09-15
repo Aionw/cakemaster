@@ -1,25 +1,19 @@
 mod catalog;
 mod entry;
-mod resource;
 
 use self::catalog::Catalog;
 use self::entry::SegmentEntry;
 use super::config::{
     MAX_ALLOCATOR_NODES_PER_SEGMENT_EXCLUSIVE, MIN_ALLOCATOR_NODES_PER_SEGMENT, SegmentPoolConfig,
 };
-use super::error::{AttachError, LocalSsdError, PoolConfigError, ReserveError, SegmentStateError};
+use super::error::{AttachError, PoolConfigError, ReserveError, SegmentStateError};
 use super::identity::{ClientId, SegmentId};
-use super::local_ssd::{LocalSsdStats, OffloadPermit};
 use super::reservation::Reservation;
-use super::spec::{
-    ReplicaClass, SegmentConfiguration, SegmentKind, SegmentResourceId, SegmentSpec,
-};
+use super::spec::{ReplicaClass, SegmentSpec};
 use super::stats::ReplicaClassSpaceStats;
 use super::stats::SegmentStats;
 use parking_lot::RwLock;
-use std::collections::HashSet;
 use std::fmt;
-use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -36,8 +30,7 @@ pub struct SegmentPool {
 /// Metadata and runtime-state handle for one logical segment.
 ///
 /// This handle does not represent an allocation and therefore never blocks
-/// removal by itself. Convert it to a capability-specific candidate before
-/// reserving capacity.
+/// removal by itself. Pass it to [`SegmentPool::reserve`] to reserve capacity.
 #[derive(Clone)]
 pub struct SegmentHandle {
     pool_id: u64,
@@ -64,24 +57,12 @@ impl SegmentHandle {
         self.entry.spec()
     }
 
-    pub fn kind(&self) -> SegmentKind {
-        self.spec().kind()
-    }
-
     pub fn replica_class(&self) -> ReplicaClass {
         self.spec().replica_class()
     }
 
-    pub fn resource_id(&self) -> SegmentResourceId {
-        self.spec().resource_id()
-    }
-
     pub fn stats(&self) -> SegmentStats {
         self.entry.stats()
-    }
-
-    pub fn local_ssd_stats(&self) -> Option<LocalSsdStats> {
-        self.entry.local_ssd_stats()
     }
 
     pub(crate) fn incarnation(&self) -> SegmentIncarnation {
@@ -89,20 +70,6 @@ impl SegmentHandle {
             pool_id: self.pool_id,
             entry: Arc::downgrade(&self.entry),
         }
-    }
-
-    pub fn direct_candidate(&self) -> Option<DirectCandidate> {
-        self.entry
-            .supports_direct_reservation()
-            .then(|| DirectCandidate {
-                segment: self.clone(),
-            })
-    }
-
-    pub fn offload_target(&self) -> Option<OffloadTarget> {
-        self.entry.supports_offload().then(|| OffloadTarget {
-            segment: self.clone(),
-        })
     }
 }
 
@@ -128,45 +95,16 @@ impl fmt::Debug for SegmentHandle {
     }
 }
 
-/// Capability token accepted by synchronous range reservation APIs.
-#[derive(Clone, Debug)]
-pub struct DirectCandidate {
-    segment: SegmentHandle,
-}
-
-impl Deref for DirectCandidate {
-    type Target = SegmentHandle;
-
-    fn deref(&self) -> &Self::Target {
-        &self.segment
-    }
-}
-
-/// Capability token accepted by asynchronous LocalSSD admission APIs.
-#[derive(Clone, Debug)]
-pub struct OffloadTarget {
-    segment: SegmentHandle,
-}
-
-impl Deref for OffloadTarget {
-    type Target = SegmentHandle;
-
-    fn deref(&self) -> &Self::Target {
-        &self.segment
-    }
-}
-
 #[derive(Clone, Debug)]
 pub struct PoolSnapshot {
     generation: u64,
     replica_class: ReplicaClass,
-    candidates: Arc<[DirectCandidate]>,
+    candidates: Arc<[SegmentHandle]>,
 }
 
 /// Capacity currently accepting direct allocations for one replica class.
 ///
-/// Logical segments that share a physical resource (for example, CXL mounts)
-/// are counted once.
+/// Each mounted memory segment owns independent capacity.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ReplicaClassCapacity {
     generation: u64,
@@ -197,11 +135,11 @@ impl PoolSnapshot {
         self.replica_class
     }
 
-    pub fn candidates(&self) -> &[DirectCandidate] {
+    pub fn candidates(&self) -> &[SegmentHandle] {
         &self.candidates
     }
 
-    pub fn iter(&self) -> std::slice::Iter<'_, DirectCandidate> {
+    pub fn iter(&self) -> std::slice::Iter<'_, SegmentHandle> {
         self.candidates.iter()
     }
 
@@ -211,34 +149,6 @@ impl PoolSnapshot {
 
     pub fn is_empty(&self) -> bool {
         self.candidates.is_empty()
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct OffloadSnapshot {
-    generation: u64,
-    targets: Arc<[OffloadTarget]>,
-}
-
-impl OffloadSnapshot {
-    pub const fn generation(&self) -> u64 {
-        self.generation
-    }
-
-    pub fn targets(&self) -> &[OffloadTarget] {
-        &self.targets
-    }
-
-    pub fn iter(&self) -> std::slice::Iter<'_, OffloadTarget> {
-        self.targets.iter()
-    }
-
-    pub fn len(&self) -> usize {
-        self.targets.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.targets.is_empty()
     }
 }
 
@@ -253,14 +163,6 @@ impl AttachOutcome {
         match self {
             Self::Attached(segment) | Self::AlreadyAttached(segment) => segment,
         }
-    }
-
-    pub fn direct_candidate(&self) -> Option<DirectCandidate> {
-        self.segment().direct_candidate()
-    }
-
-    pub fn offload_target(&self) -> Option<OffloadTarget> {
-        self.segment().offload_target()
     }
 
     pub const fn is_new(&self) -> bool {
@@ -328,18 +230,7 @@ impl SegmentPool {
 
     /// Returns the physical capacity behind the current accepting snapshot.
     pub fn capacity_for(&self, replica_class: ReplicaClass) -> ReplicaClassCapacity {
-        self.capacities_for(&[replica_class])
-            .pop()
-            .expect("one requested replica class produces one capacity result")
-    }
-
-    /// Computes multiple class capacities from one catalog snapshot lock.
-    pub fn capacities_for(&self, replica_classes: &[ReplicaClass]) -> Vec<ReplicaClassCapacity> {
-        let catalog = self.catalog.read();
-        replica_classes
-            .iter()
-            .map(|replica_class| summarize_capacity(catalog.snapshot(*replica_class)))
-            .collect()
+        summarize_capacity(self.catalog.read().snapshot(replica_class))
     }
 
     /// Returns aggregate physical space for all mounted segments in a class.
@@ -361,10 +252,6 @@ impl SegmentPool {
         self.invalidation_epoch.load(Ordering::Acquire)
     }
 
-    pub fn offload_snapshot(&self) -> OffloadSnapshot {
-        self.catalog.read().offload_snapshot()
-    }
-
     pub fn segment(&self, id: SegmentId) -> Option<SegmentHandle> {
         self.catalog.read().segment(id)
     }
@@ -384,7 +271,7 @@ impl SegmentPool {
     #[inline]
     pub fn reserve(
         &self,
-        candidate: &DirectCandidate,
+        candidate: &SegmentHandle,
         bytes: u64,
     ) -> Result<Reservation, ReserveError> {
         if candidate.pool_id != self.pool_id {
@@ -398,43 +285,7 @@ impl SegmentPool {
             return Err(ReserveError::ZeroSize);
         }
         let segment = self.segment(id).ok_or(ReserveError::NotFound(id))?;
-        let candidate = segment
-            .direct_candidate()
-            .ok_or(ReserveError::NotDirectlyAllocatable(id))?;
-        self.reserve(&candidate, bytes)
-    }
-
-    pub fn report_local_ssd_capacity(
-        &self,
-        owner: ClientId,
-        id: SegmentId,
-        capacity_bytes: u64,
-    ) -> Result<(), LocalSsdError> {
-        self.catalog
-            .read()
-            .report_local_ssd_capacity(owner, id, capacity_bytes)
-    }
-
-    pub fn set_local_ssd_offload_enabled(
-        &self,
-        owner: ClientId,
-        id: SegmentId,
-        enabled: bool,
-    ) -> Result<(), LocalSsdError> {
-        self.catalog
-            .write()
-            .set_local_ssd_offload_enabled(owner, id, enabled)
-    }
-
-    pub fn admit_offload(
-        &self,
-        target: &OffloadTarget,
-        bytes: u64,
-    ) -> Result<OffloadPermit, LocalSsdError> {
-        if target.pool_id != self.pool_id {
-            return Err(LocalSsdError::ForeignCandidate);
-        }
-        target.entry.admit_offload(bytes)
+        self.reserve(&segment, bytes)
     }
 
     pub fn quiesce(&self, owner: ClientId, id: SegmentId) -> Result<(), SegmentStateError> {
@@ -496,12 +347,9 @@ impl SegmentPool {
 }
 
 fn summarize_capacity(snapshot: PoolSnapshot) -> ReplicaClassCapacity {
-    let mut resources = HashSet::with_capacity(snapshot.len());
     let mut capacity_bytes = 0_u64;
     for candidate in snapshot.iter() {
-        if resources.insert(candidate.resource_id()) {
-            capacity_bytes = capacity_bytes.saturating_add(candidate.stats().space.capacity_bytes);
-        }
+        capacity_bytes = capacity_bytes.saturating_add(candidate.stats().space.capacity_bytes);
     }
     ReplicaClassCapacity {
         generation: snapshot.generation(),
@@ -526,33 +374,15 @@ fn validate_spec(spec: &SegmentSpec) -> Result<(), AttachError> {
     if spec.identity().name().is_empty() {
         return Err(AttachError::EmptyName);
     }
-    match spec.configuration() {
-        SegmentConfiguration::Memory { region, transport } => {
-            if matches!(transport.protocol().as_str(), "cxl" | "nvmeof") {
-                return Err(AttachError::IncompatibleTransportProtocol {
-                    kind: SegmentKind::Memory,
-                    protocol: transport.protocol().clone(),
-                });
-            }
-            if region.base() == 0 {
-                return Err(AttachError::ZeroBaseAddress);
-            }
-            validate_direct_range(*region, transport)
-        }
-        SegmentConfiguration::Nof { region, transport } => {
-            validate_direct_range(*region, transport)
-        }
-        SegmentConfiguration::Cxl { arena, .. } => {
-            if arena.id().as_str().is_empty() {
-                return Err(AttachError::EmptyCxlArenaId);
-            }
-            if arena.capacity_bytes() == 0 {
-                return Err(AttachError::ZeroSize);
-            }
-            Ok(())
-        }
-        SegmentConfiguration::LocalSsd { .. } => Ok(()),
+    if matches!(spec.transport().protocol().as_str(), "cxl" | "nvmeof") {
+        return Err(AttachError::IncompatibleTransportProtocol {
+            protocol: spec.transport().protocol().clone(),
+        });
     }
+    if spec.region().base() == 0 {
+        return Err(AttachError::ZeroBaseAddress);
+    }
+    validate_direct_range(spec.region(), spec.transport())
 }
 
 fn validate_direct_range(

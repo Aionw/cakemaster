@@ -43,7 +43,7 @@ pub use manager::{
     ReplicaSelector, StartedPut,
 };
 pub use reclamation::ReclaimFilter;
-pub use replica::{DirectReplica, LocalSsdReplica, ReplicaId, ReplicaLease, ReplicaSet};
+pub use replica::{DirectReplica, ReplicaId, ReplicaLease, ReplicaSet};
 pub use tenant::{
     ResolvedTenant, TenantAdminError, TenantCatalog, TenantConfig, TenantConfigError,
     TenantGetError, TenantId, TenantIdError, TenantObjectError, TenantObjectManager,

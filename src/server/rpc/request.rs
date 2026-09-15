@@ -11,15 +11,13 @@ use crate::segment::placement::{
     AllocationSpec, FulfillmentPolicy, PlacementConstraints, PlacementRequest, ReplicaPolicy,
 };
 use crate::segment::{
-    ClientId, CxlArenaId, CxlArenaSpec, MemoryRegion, ReplicaClass, SegmentId, SegmentIdentity,
-    SegmentSpec, TransportEndpoint, TransportProtocol,
+    ClientId, MemoryRegion, ReplicaClass, SegmentId, SegmentIdentity, SegmentSpec,
+    TransportEndpoint, TransportProtocol,
 };
 use std::collections::HashSet;
 
 pub(super) struct PutPlanTemplate {
-    replica_class: ReplicaClass,
     replica_count: usize,
-    fulfillment: FulfillmentPolicy,
     constraints: PlacementConstraints,
     object_kind: ObjectKind,
     pins: ObjectPinRequest,
@@ -31,8 +29,7 @@ impl PutPlanTemplate {
             AllocationSpec::new(logical_bytes),
             ReplicaPolicy::new(self.replica_count),
         )
-        .for_replica_class(self.replica_class)
-        .with_fulfillment(self.fulfillment)
+        .with_fulfillment(FulfillmentPolicy::BestEffort)
         .constrained_by(self.constraints.clone());
         ObjectPutPlan::new(
             ObjectContent::new(logical_bytes).with_kind(self.object_kind),
@@ -53,38 +50,20 @@ impl TryFrom<&ReplicateConfig> for PutPlanTemplate {
             return Err(ErrorCode::InvalidParams);
         }
 
-        let (replica_class, raw_count, fulfillment, preferred) =
-            match (config.replica_num > 0, config.nof_replica_num > 0) {
-                (true, false) if config.preferred_nof_segments.is_empty() => {
-                    let preferred = if config.preferred_segment.is_empty() {
-                        config.preferred_segments.clone()
-                    } else {
-                        vec![config.preferred_segment.clone()]
-                    };
-                    (
-                        ReplicaClass::Memory,
-                        config.replica_num,
-                        FulfillmentPolicy::BestEffort,
-                        preferred,
-                    )
-                }
-                (false, true)
-                    if config.preferred_segment.is_empty()
-                        && config.preferred_segments.is_empty() =>
-                {
-                    (
-                        ReplicaClass::Nof,
-                        config.nof_replica_num,
-                        FulfillmentPolicy::AllOrNothing,
-                        config.preferred_nof_segments.clone(),
-                    )
-                }
-                _ => return Err(ErrorCode::InvalidParams),
-            };
-        let replica_count = usize::try_from(raw_count).map_err(|_| ErrorCode::InvalidParams)?;
-        if raw_count > u64::from(u32::MAX) {
+        if config.replica_num == 0
+            || config.replica_num > u64::from(u32::MAX)
+            || config.nof_replica_num != 0
+            || !config.preferred_nof_segments.is_empty()
+        {
             return Err(ErrorCode::InvalidParams);
         }
+        let replica_count =
+            usize::try_from(config.replica_num).map_err(|_| ErrorCode::InvalidParams)?;
+        let preferred = if config.preferred_segment.is_empty() {
+            config.preferred_segments.clone()
+        } else {
+            vec![config.preferred_segment.clone()]
+        };
         let soft_pin_action = match config.soft_pin_action {
             WireSoftPinAction::Preserve => SoftPinAction::Preserve,
             WireSoftPinAction::Enable => SoftPinAction::Enable,
@@ -95,9 +74,7 @@ impl TryFrom<&ReplicateConfig> for PutPlanTemplate {
         }
 
         Ok(Self {
-            replica_class,
             replica_count,
-            fulfillment,
             constraints: PlacementConstraints::default()
                 .with_preferred_names(normalize_names(preferred)),
             object_kind: object_kind(config.data_type),
@@ -137,8 +114,9 @@ pub(super) fn replica_selector(replica_type: ReplicaType) -> Result<ReplicaSelec
     match replica_type {
         ReplicaType::All => Ok(ReplicaSelector::All),
         ReplicaType::Memory => Ok(ReplicaSelector::Class(ReplicaClass::Memory)),
-        ReplicaType::NofSsd => Ok(ReplicaSelector::Class(ReplicaClass::Nof)),
-        ReplicaType::Disk | ReplicaType::LocalDisk => Err(ErrorCode::InvalidParams),
+        ReplicaType::NofSsd | ReplicaType::Disk | ReplicaType::LocalDisk => {
+            Err(ErrorCode::InvalidParams)
+        }
     }
 }
 
@@ -165,11 +143,7 @@ pub(super) fn segment_spec_from_wire(
     )
     .with_host_id(segment.host_id);
     match protocol {
-        TransportProtocol::Cxl => Ok(SegmentSpec::cxl(
-            identity,
-            CxlArenaSpec::new(CxlArenaId::new(segment.te_endpoint), segment.size),
-        )),
-        TransportProtocol::NvmeOf => Err(ErrorCode::InvalidParams),
+        TransportProtocol::Cxl | TransportProtocol::NvmeOf => Err(ErrorCode::InvalidParams),
         protocol => Ok(SegmentSpec::memory(
             identity,
             MemoryRegion::new(segment.base, segment.size),
@@ -205,9 +179,7 @@ mod tests {
         config.preferred_segments = vec!["memory-a".into(), "".into(), "memory-a".into()];
         let template = PutPlanTemplate::try_from(&config).unwrap();
 
-        assert_eq!(template.replica_class, ReplicaClass::Memory);
         assert_eq!(template.replica_count, 2);
-        assert_eq!(template.fulfillment, FulfillmentPolicy::BestEffort);
         assert_eq!(template.object_kind, ObjectKind::KvCache);
         assert_eq!(normalize_names(config.preferred_segments), vec!["memory-a"]);
 
@@ -216,16 +188,22 @@ mod tests {
         assert_eq!(plan.placement().allocation().bytes(), 4096);
         assert_eq!(plan.placement().replicas().count(), 2);
         assert_eq!(plan.placement().replica_class(), ReplicaClass::Memory);
+        assert_eq!(
+            plan.placement().fulfillment(),
+            FulfillmentPolicy::BestEffort
+        );
     }
 
     #[test]
-    fn put_template_distinguishes_nof_and_rejects_unsupported_shapes() {
-        let template = PutPlanTemplate::try_from(&config(0, 2)).unwrap();
-        assert_eq!(template.replica_class, ReplicaClass::Nof);
-        assert_eq!(template.fulfillment, FulfillmentPolicy::AllOrNothing);
-
+    fn put_template_rejects_unsupported_shapes() {
+        assert!(PutPlanTemplate::try_from(&config(0, 2)).is_err());
         assert!(PutPlanTemplate::try_from(&config(0, 0)).is_err());
         assert!(PutPlanTemplate::try_from(&config(1, 1)).is_err());
+        let mut preferred_nof = config(1, 0);
+        preferred_nof
+            .preferred_nof_segments
+            .push("unsupported".into());
+        assert!(PutPlanTemplate::try_from(&preferred_nof).is_err());
         let mut pinned = config(1, 0);
         pinned.soft_pin_action = WireSoftPinAction::Enable;
         assert!(PutPlanTemplate::try_from(&pinned).is_ok());
@@ -249,9 +227,12 @@ mod tests {
             replica_selector(ReplicaType::Memory),
             Ok(ReplicaSelector::Class(ReplicaClass::Memory))
         );
-        assert_eq!(
-            replica_selector(ReplicaType::Disk),
-            Err(ErrorCode::InvalidParams)
-        );
+        for kind in [
+            ReplicaType::NofSsd,
+            ReplicaType::Disk,
+            ReplicaType::LocalDisk,
+        ] {
+            assert_eq!(replica_selector(kind), Err(ErrorCode::InvalidParams));
+        }
     }
 }

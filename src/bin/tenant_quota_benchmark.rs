@@ -548,7 +548,7 @@ fn tenant_manager(
         .map(|index| {
             (
                 TenantId::new(format!("tenant-{index}")).unwrap(),
-                TenantPolicy::new(TenantQuotaLimits::new(quota, 0)),
+                TenantPolicy::new(TenantQuotaLimits::new(quota)),
             )
         })
         .collect();

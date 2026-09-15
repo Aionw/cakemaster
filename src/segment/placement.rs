@@ -1,8 +1,8 @@
 use super::error::ReserveError;
 use super::identity::{ClientId, SegmentId};
-use super::pool::{DirectCandidate, PoolSnapshot, SegmentPool};
+use super::pool::{PoolSnapshot, SegmentHandle, SegmentPool};
 use super::reservation::Reservation;
-use super::spec::{ReplicaClass, SegmentKind, SegmentResourceId};
+use super::spec::ReplicaClass;
 use super::stats::SegmentStats;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -19,7 +19,6 @@ pub enum FulfillmentPolicy {
 pub enum FailureDomain {
     #[default]
     Segment,
-    Resource,
     Owner,
 }
 
@@ -70,7 +69,6 @@ impl ReplicaPolicy {
 pub struct PlacementConstraints {
     preferred_names: Vec<Arc<str>>,
     excluded_segments: HashSet<SegmentId>,
-    allowed_kinds: Option<HashSet<SegmentKind>>,
 }
 
 impl PlacementConstraints {
@@ -91,24 +89,12 @@ impl PlacementConstraints {
         self
     }
 
-    pub fn allowing_kinds<I>(mut self, kinds: I) -> Self
-    where
-        I: IntoIterator<Item = SegmentKind>,
-    {
-        self.allowed_kinds = Some(kinds.into_iter().collect());
-        self
-    }
-
     pub fn preferred_names(&self) -> &[Arc<str>] {
         &self.preferred_names
     }
 
     pub const fn excluded_segments(&self) -> &HashSet<SegmentId> {
         &self.excluded_segments
-    }
-
-    pub const fn allowed_kinds(&self) -> Option<&HashSet<SegmentKind>> {
-        self.allowed_kinds.as_ref()
     }
 }
 
@@ -169,25 +155,20 @@ impl PlacementRequest {
 }
 
 pub trait PlacementPolicy: Send + Sync {
-    fn order(&self, snapshot: &PoolSnapshot, request: &PlacementRequest) -> Vec<DirectCandidate>;
+    fn order(&self, snapshot: &PoolSnapshot, request: &PlacementRequest) -> Vec<SegmentHandle>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FreeCapacityPolicy;
 
 impl PlacementPolicy for FreeCapacityPolicy {
-    fn order(&self, snapshot: &PoolSnapshot, request: &PlacementRequest) -> Vec<DirectCandidate> {
+    fn order(&self, snapshot: &PoolSnapshot, request: &PlacementRequest) -> Vec<SegmentHandle> {
         let mut candidates: Vec<_> = snapshot
             .iter()
             .filter_map(|candidate| {
                 let stats = candidate.stats();
                 (stats.state.is_accepting()
                     && stats.space.available_bytes >= request.allocation.bytes
-                    && request
-                        .constraints
-                        .allowed_kinds
-                        .as_ref()
-                        .is_none_or(|kinds| kinds.contains(&candidate.kind()))
                     && !request
                         .constraints
                         .excluded_segments
@@ -340,25 +321,23 @@ pub enum PlacementError {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum DomainKey {
     Segment(SegmentId),
-    Resource(SegmentResourceId),
     Owner(ClientId),
 }
 
 struct RankedCandidate {
-    candidate: DirectCandidate,
+    candidate: SegmentHandle,
     stats: SegmentStats,
     preference: usize,
 }
 
-fn domain_key(candidate: &DirectCandidate, domain: FailureDomain) -> DomainKey {
+fn domain_key(candidate: &SegmentHandle, domain: FailureDomain) -> DomainKey {
     match domain {
         FailureDomain::Segment => DomainKey::Segment(candidate.id()),
-        FailureDomain::Resource => DomainKey::Resource(candidate.resource_id()),
         FailureDomain::Owner => DomainKey::Owner(candidate.spec().identity().owner()),
     }
 }
 
-fn preference_rank(request: &PlacementRequest, candidate: &DirectCandidate) -> usize {
+fn preference_rank(request: &PlacementRequest, candidate: &SegmentHandle) -> usize {
     request
         .constraints
         .preferred_names

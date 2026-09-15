@@ -88,8 +88,8 @@ async fn run_server(address: &str, arguments: Arguments) -> Result<(), Box<dyn E
             MemoryRegion::new(0x4_0000_0000, arguments.segment_bytes),
             TransportEndpoint::new(TransportProtocol::Tcp, "127.0.0.1:12345"),
         ))?
-        .direct_candidate()
-        .expect("a Memory segment supports direct reservations");
+        .segment()
+        .clone();
     for client in BENCHMARK_CLIENTS {
         composition.service().client_manager().remount(
             client,

@@ -40,7 +40,7 @@ Mooncake Store。
 - 这 27 个路由已由 workspace 主 binary `cakemaster` 组合；原 `DemoService` 入口已移除。
 - 27 个路由均已对齐固定的最新上游 wire；`BatchPutStart` 的 `SoftPinAction`/TTL schema
   drift 已修复，`ServiceReady`/`GetStorageConfig` 已足够让无持久化 Client 完成初始化。
-- 已有 `ObjectCatalog`、`SegmentPool`、tenant quota 和 LocalSSD primitive 能复用，但
+- 已有 `ObjectCatalog`、`SegmentPool`、Memory tenant quota 能复用，但
   client 生命周期、完整对象 API、分层存储任务、HA/恢复、数据面和运维面仍未完成。
 
 因此，“基础 Memory Master 可替换”与“完整 Mooncake Store 对等”应作为两个里程碑，
@@ -51,10 +51,10 @@ Mooncake Store。
 | 能力 | 当前实现 | 边界 |
 | --- | --- | --- |
 | Object metadata | `ObjectCatalog` 和 `ObjectManager` 已有 per-key transaction、无锁 committed version 读取、commit/abort、原子 upsert、remove、get/exists、lease、soft/hard pin、transaction timeout、按 client session 主动撤销、有界回收，以及 segment 失效后的 replica 级剪枝 | 没有 replica 自动修复/补齐和完整上游 API；checksum、group、upsert 抢占/busy-refcnt 等语义未接入；pin 尚无持久化恢复 |
-| Segment/placement | `ClientManager` 已把 `Ping`、Memory/CXL `MountSegment`/`ReMountSegment`、立即/Graceful unmount、session TTL fencing 和批量 cleanup 接到 `SegmentPool`；production runtime 显式运行并 join 兼有 100ms 周期维护和 Graceful deadline 唤醒的 `MasterReconciler` | 没有 NoF lifecycle RPC、探活和真实 I/O |
+| Segment/placement | `ClientManager` 已把 `Ping`、Memory `MountSegment`/`ReMountSegment`、立即/Graceful unmount、session TTL fencing 和批量 cleanup 接到 `SegmentPool`；production runtime 显式运行并 join 兼有 100ms 周期维护和 Graceful deadline 唤醒的 `MasterReconciler` | 没有 NoF lifecycle RPC、探活和真实 I/O |
 | Placement | 支持 preferred segment、free-capacity 排序、replica failure domain 和 RAII 回滚 | 不是上游可配置的五种策略；不支持 mixed Memory+NoF 和 host-local placement |
-| Tenant | `TenantObjectManager` 已有 namespace 隔离、Memory/NoF 分账、quota admission、RAII accounting 和定向回收 | 没有上游 policy connector、HTTP admin、持久化和启动恢复 |
-| Mooncake RPC | 有 `ServiceReady`、禁用持久化的 `GetStorageConfig`、`Ping`、四个 Memory/CXL segment lifecycle 路由、single/batch exists/get/put、六个 upsert 和四个 remove 路由，并由 `cakemaster` 组合 | `GetFsdir` 兼容 fallback 未实现；production 入口仍是内存态单租户子集，不是完整 upstream Master |
+| Tenant | `TenantObjectManager` 已有 namespace 隔离、Memory 计费、quota admission、RAII accounting 和定向回收 | 没有上游 policy connector、HTTP admin、持久化和启动恢复 |
+| Mooncake RPC | 有 `ServiceReady`、禁用持久化的 `GetStorageConfig`、`Ping`、四个 Memory segment lifecycle 路由、single/batch exists/get/put、六个 upsert 和四个 remove 路由，并由 `cakemaster` 组合 | `GetFsdir` 兼容 fallback 未实现；production 入口仍是内存态单租户子集，不是完整 upstream Master |
 | RPC runtime | TCP 上兼容 coro_rpc v0/struct_pack，支持 multiplexing、attachment、timeout、取消和流式拆帧 | 没有上游可选的 RDMA RPC socket、leader-aware client pool 和 Store API |
 | Task/client primitive | `ClientRegistry` 已封装在 core `ClientManager` 后，并有 generation-fenced cleanup；另有单 client 有界 `ClientTaskQueue<T>` | 没有任务事实表、重试、恢复、task/LocalSSD cleanup hook 或 task RPC |
 
@@ -101,7 +101,7 @@ literal/type hash。C++ yalantinglibs 生成的 metadata 和代表性请求字�
 - pin 的 snapshot/oplog 恢复、独立 metrics，以及允许 soft-pin eviction 时与 C++ 完全一致的
   全局两阶段 priority；
 - optional object group 的同 shard 路由、group lease refresh 和 best-effort group eviction；
-- 同一对象同时拥有 Memory 与 NoF replica；当前请求转换只允许二选一；
+- 同一对象同时拥有 Memory 与 NoF replica；当前请求转换只允许 Memory；
 - Disk/LocalDisk replica 的对象提交和选择；
 - `prefer_alloc_in_same_node`、`host_id` 和完整 `ObjectDataType` 行为；当前除 KVCACHE、
   TENSOR 外都折叠成 `General`；
@@ -129,7 +129,7 @@ force 同时绕过 lease/hard pin。replication task 尚未建模。
 
 - 没有默认 random 和 best-of-N sampling 行为；
 - 没有基于 SSD free ratio 的联动；
-- CXL 有共享容量模型，但没有上游 `cxl` strategy 的单 preferred target 约束；
+- CXL 共享容量模型已移除，也没有上游 `cxl` strategy；
 - 没有 host-aware `local_first`；
 - 没有 deployment config 选择策略。
 
@@ -151,7 +151,7 @@ eviction policy 等价。
 
 ### 3. Client 生命周期与动态 segment 控制面
 
-状态：**Memory/CXL 基础 runtime 与五个 lifecycle RPC 已实现，完整控制面未实现；基础 Master 的 P0 缺口**。
+状态：**Memory 基础 runtime 与五个 lifecycle RPC 已实现，完整控制面未实现；基础 Master 的 P0 缺口**。
 
 缺少的端到端能力包括：
 
@@ -168,7 +168,7 @@ eviction policy 等价。
 - graceful drain 和 segment drain job。
 
 `SegmentPool::attach/quiesce/reactivate/remove/invalidate_owners` 是这些流程的底层
-capability；当前 `ClientManager` 已实现 Memory/CXL `MountSegment`/`ReMountSegment` 的
+capability；当前 `ClientManager` 已实现 Memory `MountSegment`/`ReMountSegment` 的
 原子激活与回滚、立即/Graceful 单 segment 摘除，以及超时后的批量 pending-write revoke
 与 segment/object 逻辑失效。task 和 LocalSSD
 workflow 仍未接入。详细约束见
@@ -176,10 +176,9 @@ workflow 仍未接入。详细约束见
 
 ### 4. SSD/NoF/DFS 分层存储
 
-状态：**LocalSSD/NoF 只完成模型和容量 primitive，工作流与 I/O 未实现**。
+状态：**LocalSSD/NoF 模型和容量 primitive 已移除，工作流与 I/O 未实现**。
 
-当前 LocalSSD 能做 capacity report、admission、commit/drop accounting，但没有任何
-对象或 RPC 路径持有这些能力。上游仍领先的部分包括：
+当前只保留 Memory 领域实现，未接入的存储 primitive 不再维护。上游仍领先的部分包括：
 
 - `MountLocalDiskSegment`、SSD capacity heartbeat 和 per-client offload queue；
 - eager offload 与 `offload_on_evict` 两种 memory -> SSD 策略；
@@ -190,7 +189,7 @@ workflow 仍未接入。详细约束见
 - bucket、file-per-key、offset-allocator 三种本地存储 backend、restart scan/recovery、
   POSIX/io_uring I/O；
 - legacy DFS persistence、distributed storage/HF3FS/3FS adapter；
-- NoF SSD 的真实 namespace 管理、探活和数据传输；当前 NoF 只是 range allocator。
+- NoF SSD 的真实 namespace 管理、探活和数据传输；当前不提供 NoF allocator。
 
 上游依据：[`SSD Offload 设计`](https://github.com/kvcache-ai/Mooncake/blob/5c0724d22e7f04513a3453c8b6642a5a21b80b47/docs/source/design/ssd-offload.md)、
 [`storage_backend.h`](https://github.com/kvcache-ai/Mooncake/blob/5c0724d22e7f04513a3453c8b6642a5a21b80b47/mooncake-store/include/storage_backend.h)。
@@ -218,8 +217,7 @@ completion validation，不能直接等同于上游 TaskManager。
 
 状态：**核心 admission/accounting 已实现，配置、管理和恢复未实现**。
 
-当前实现甚至比上游 memory-only quota 多了独立 NoF 账本，但它还不是可部署的上游
-tenant feature：
+当前实现提供 Memory quota，但还不是可部署的完整上游 tenant feature：
 
 - 没有 `enable_multi_tenants` 启动模式和 production composition；
 - 没有 file/etcd YAML policy connector，也没有 connector-first 的原子 policy 更新；
@@ -229,8 +227,7 @@ tenant feature：
 - 没有 HA active-only admin fencing；
 - LocalSSD quota、group accounting 和上游 orphan tenant 恢复规则未实现。
 
-本仓库 Memory/NoF 两类 quota 是有意扩展，不应为了“字段相同”退化；但 wire/admin
-行为和上游不同的部分需要明确版本化和文档化。
+本仓库只保留 Memory quota；wire/admin 行为和上游不同的部分需要明确版本化和文档化。
 
 上游依据：[`multi-tenancy.md`](https://github.com/kvcache-ai/Mooncake/blob/5c0724d22e7f04513a3453c8b6642a5a21b80b47/docs/source/deployment/multi-tenancy.md)、
 [`tenant_quota_policy_store.h`](https://github.com/kvcache-ai/Mooncake/blob/5c0724d22e7f04513a3453c8b6642a5a21b80b47/mooncake-store/include/tenant_quota_policy_store.h)。

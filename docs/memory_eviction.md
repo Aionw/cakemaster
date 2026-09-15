@@ -14,7 +14,7 @@ parts-per-million. Allocation-failure work is also configured as a finite
 ## Capacity and debt units
 
 All watermark decisions and reclaim targets use physical reservation bytes,
-not object count or logical object size. For the current mounted Memory/CXL
+not object count or logical object size. For the current mounted Memory
 resources:
 
 ```text
@@ -23,7 +23,7 @@ low_bytes  = floor(total_capacity_bytes * low_ratio)
 watermark_debt = max(physical_used_bytes - low_bytes, 0)
 ```
 
-`SegmentPool::space_for(ReplicaClass::Memory)` counts a shared CXL arena once.
+`SegmentPool::space_for(ReplicaClass::Memory)` sums dedicated memory segments.
 It includes both accepting and quiesced segments because quiescing placement
 does not release their allocations. This prevents graceful-unmount state from
 looking like an abrupt capacity loss. Attach, remove, and remount changes are
@@ -32,9 +32,8 @@ watermark target before another object is retired.
 
 The catalog persists only explicit/admin reclaim debt. Watermark and
 allocation-failure pressure remain controller-owned, are recomputed for each
-collector step, and are restricted to Memory/CXL candidates. This prevents a
-late concurrent sample from restoring stale debt and prevents Memory pressure
-from retiring NoF objects. Retirement and physical reclaim are intentionally
+collector step, and are restricted to Memory candidates. This prevents a
+late concurrent sample from restoring stale debt. Retirement and physical reclaim are intentionally
 different accounting events:
 
 - retiring an object removes it from `live_bytes` and adds it to
@@ -83,8 +82,7 @@ replica; `AllOrNothing` uses the allocator's actual missing replica count. A
 retry is made only when that step observed Memory reclaim or a larger free
 region, and never more than the configured finite retry limit. A successful
 retry cancels its own pressure generation without erasing newer concurrent
-failures. NoF allocation failures do not invoke the Memory controller. There
-is no unbounded map scan or busy loop in the request path.
+failures. There is no unbounded map scan or busy loop in the request path.
 
 The controller does not spawn a detached worker. Periodic, topology, deadline,
 and pressure wakeups are owned by `MasterReconciler`, which is started alongside

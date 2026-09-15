@@ -21,7 +21,6 @@ use tokio::sync::oneshot;
 
 const OWNER: ClientId = ClientId::new(17, 23);
 const MEMORY_ID: SegmentId = SegmentId::new(1, 1);
-const NOF_ID: SegmentId = SegmentId::new(2, 1);
 
 fn pool() -> Arc<SegmentPool> {
     let pool = Arc::new(SegmentPool::new());
@@ -29,12 +28,6 @@ fn pool() -> Arc<SegmentPool> {
         SegmentIdentity::new(MEMORY_ID, OWNER, "memory-a"),
         MemoryRegion::new(0x2_0000_0000, 1 << 20),
         TransportEndpoint::new(TransportProtocol::Tcp, "127.0.0.1:12345"),
-    ))
-    .unwrap();
-    pool.attach(SegmentSpec::nof(
-        SegmentIdentity::new(NOF_ID, OWNER, "nof-a"),
-        MemoryRegion::new(0, 1 << 20),
-        "nvme://127.0.0.1/nqn.1",
     ))
     .unwrap();
     pool
@@ -312,12 +305,7 @@ async fn generated_mooncake_rpc_drives_the_real_object_manager() {
         )
         .await
         .unwrap();
-    let DescriptorVariant::NofSsd(descriptor) = &nof[0].as_ref().unwrap()[0].descriptor_variant
-    else {
-        panic!("expected a NoF descriptor");
-    };
-    assert_eq!(descriptor.buffer_descriptor.protocol, "nvmeof");
-    assert_eq!(descriptor.buffer_descriptor.buffer_address, 0);
+    assert_eq!(nof, vec![Err(ErrorCode::InvalidParams)]);
     assert_eq!(
         client
             .batch_put_revoke(
@@ -328,7 +316,7 @@ async fn generated_mooncake_rpc_drives_the_real_object_manager() {
             )
             .await
             .unwrap(),
-        vec![Ok(())]
+        vec![Err(ErrorCode::InvalidParams)]
     );
 
     assert_eq!(
@@ -781,7 +769,7 @@ async fn upsert_and_remove_routes_drive_transactional_catalog_semantics() {
 async fn multi_tenant_rpc_resolves_once_per_batch_and_maps_tenant_errors() {
     let tenant_a = TenantId::try_from("tenant-a").unwrap();
     let tenant_b = TenantId::try_from("tenant-b").unwrap();
-    let policy = TenantPolicy::new(TenantQuotaLimits::new(4096, 0));
+    let policy = TenantPolicy::new(TenantQuotaLimits::new(4096));
     let manager = Arc::new(
         TenantObjectManager::new(
             pool(),

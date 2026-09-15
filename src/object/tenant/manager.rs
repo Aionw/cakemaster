@@ -296,42 +296,35 @@ impl TenantObjectManager {
                 .collect();
         };
 
-        let mut totals = [Some(0_u64), Some(0_u64)];
-        let mut counts = [0_usize; 2];
-        let mut charges = Vec::with_capacity(requests.len());
-        for request in &requests {
-            let admission = admission_charge(&request.plan);
-            if let Ok((class, bytes)) = admission {
-                let class_index = class.index();
-                totals[class_index] =
-                    totals[class_index].and_then(|total| total.checked_add(bytes));
-                counts[class_index] += 1;
+        let charges: Vec<_> = requests
+            .iter()
+            .map(|request| admission_charge(&request.plan))
+            .collect();
+        let mut valid_count = 0;
+        let total = charges
+            .iter()
+            .filter_map(|charge| charge.as_ref().ok())
+            .try_fold(0_u64, |total, (_, bytes)| {
+                valid_count += 1;
+                total.checked_add(*bytes)
+            });
+        let batch_error = if valid_count == 0 {
+            None
+        } else {
+            match total {
+                Some(total) => entry
+                    .reserve_batch_total(TenantResourceClass::Memory, total, tenant.version)
+                    .err(),
+                None => Some(TenantObjectError::Object(ObjectManagerError::InvalidPlan)),
             }
-            charges.push(admission);
-        }
-
-        let mut class_errors = [None; 2];
-        for class in [TenantResourceClass::Memory, TenantResourceClass::Nof] {
-            let class_index = class.index();
-            if counts[class_index] == 0 {
-                continue;
-            }
-            let Some(total) = totals[class_index] else {
-                class_errors[class_index] =
-                    Some(TenantObjectError::Object(ObjectManagerError::InvalidPlan));
-                continue;
-            };
-            if let Err(error) = entry.reserve_batch_total(class, total, tenant.version) {
-                class_errors[class_index] = Some(error);
-            }
-        }
+        };
 
         requests
             .into_iter()
             .zip(charges)
             .map(|(request, charge)| {
                 let (class, bytes) = charge?;
-                if let Some(error) = class_errors[class.index()] {
+                if let Some(error) = batch_error {
                     return Err(error);
                 }
                 let reservation = QuotaReservationGuard::from_reserved(entry.clone(), class, bytes);

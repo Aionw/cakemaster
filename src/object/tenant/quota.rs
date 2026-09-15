@@ -54,14 +54,12 @@ impl TenantEntry {
             namespace,
             version: AtomicU64::new(tenant_version(1, state)),
             memory: QuotaAccount::new(policy.quota().memory_bytes()),
-            nof: QuotaAccount::new(policy.quota().nof_bytes()),
         }
     }
 
     pub(super) fn account(&self, class: TenantResourceClass) -> &QuotaAccount {
         match class {
             TenantResourceClass::Memory => &self.memory,
-            TenantResourceClass::Nof => &self.nof,
         }
     }
 
@@ -113,29 +111,20 @@ impl TenantEntry {
         self.memory
             .requested
             .store(limits.memory_bytes(), Ordering::Relaxed);
-        self.nof
-            .requested
-            .store(limits.nof_bytes(), Ordering::Relaxed);
     }
 
     pub(super) fn is_empty(&self) -> bool {
         self.memory.demand.load(Ordering::Acquire) == 0
-            && self.nof.demand.load(Ordering::Acquire) == 0
     }
 
     pub(super) fn snapshot(&self) -> TenantSnapshot {
         let memory = self.memory.snapshot();
-        let nof = self.nof.snapshot();
         TenantSnapshot {
             id: self.id.clone(),
             namespace: self.namespace,
             generation: tenant_generation(self.version.load(Ordering::Acquire)),
-            policy: TenantPolicy::new(TenantQuotaLimits::new(
-                memory.requested_bytes,
-                nof.requested_bytes,
-            )),
+            policy: TenantPolicy::new(TenantQuotaLimits::new(memory.requested_bytes)),
             memory,
-            nof,
         }
     }
 }
@@ -291,7 +280,7 @@ impl Drop for QuotaReservationGuard {
 impl TenantQuotaCharge {
     fn account(&self, replica_class: ReplicaClass) -> &QuotaAccount {
         let class = TenantResourceClass::from_replica_class(replica_class)
-            .expect("tenant charges only support direct Memory and NoF replicas");
+            .expect("tenant charges only support Memory replicas");
         self.entry.account(class)
     }
 

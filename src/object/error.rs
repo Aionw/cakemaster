@@ -194,9 +194,7 @@ impl From<PlacementError> for ObjectManagerError {
                 | ReserveError::NotFound(_),
             ) => Self::NoAvailableReplicas,
             PlacementError::Reserve(
-                ReserveError::ForeignCandidate
-                | ReserveError::NotDirectlyAllocatable(_)
-                | ReserveError::AddressOverflow(_),
+                ReserveError::ForeignCandidate | ReserveError::AddressOverflow(_),
             ) => Self::Internal,
         };
         if mapped == Self::Internal {

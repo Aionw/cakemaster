@@ -63,29 +63,18 @@ impl TryFrom<String> for TenantId {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum TenantResourceClass {
     Memory,
-    Nof,
 }
 
 impl TenantResourceClass {
     pub const fn replica_class(self) -> ReplicaClass {
         match self {
             Self::Memory => ReplicaClass::Memory,
-            Self::Nof => ReplicaClass::Nof,
         }
     }
 
     pub fn from_replica_class(replica_class: ReplicaClass) -> Option<Self> {
         match replica_class {
             ReplicaClass::Memory => Some(Self::Memory),
-            ReplicaClass::Nof => Some(Self::Nof),
-            _ => None,
-        }
-    }
-
-    const fn index(self) -> usize {
-        match self {
-            Self::Memory => 0,
-            Self::Nof => 1,
         }
     }
 }
@@ -93,29 +82,20 @@ impl TenantResourceClass {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct TenantQuotaLimits {
     memory_bytes: u64,
-    nof_bytes: u64,
 }
 
 impl TenantQuotaLimits {
-    pub const fn new(memory_bytes: u64, nof_bytes: u64) -> Self {
-        Self {
-            memory_bytes,
-            nof_bytes,
-        }
+    pub const fn new(memory_bytes: u64) -> Self {
+        Self { memory_bytes }
     }
 
     pub const fn memory_bytes(self) -> u64 {
         self.memory_bytes
     }
 
-    pub const fn nof_bytes(self) -> u64 {
-        self.nof_bytes
-    }
-
     pub const fn for_class(self, class: TenantResourceClass) -> u64 {
         match class {
             TenantResourceClass::Memory => self.memory_bytes,
-            TenantResourceClass::Nof => self.nof_bytes,
         }
     }
 }
@@ -169,7 +149,6 @@ pub struct TenantSnapshot {
     pub generation: u64,
     pub policy: TenantPolicy,
     pub memory: TenantQuotaSnapshot,
-    pub nof: TenantQuotaSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]

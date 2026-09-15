@@ -95,6 +95,35 @@ async fn ping_remount_and_expiry_follow_client_session_state() {
     assert_eq!(ping.view_version_id, 29);
     assert_eq!(ping.client_status, ClientStatus::NeedRemount);
 
+    for protocol in ["cxl", "nvmeof"] {
+        let mut unsupported = second_wire_segment();
+        unsupported.protocol = protocol.to_owned();
+        assert_eq!(
+            client
+                .mount_segment(unsupported.clone(), client_id.clone())
+                .await
+                .unwrap(),
+            Err(ErrorCode::InvalidParams)
+        );
+        assert_eq!(
+            client
+                .re_mount_segment(vec![wire_segment(), unsupported], client_id.clone())
+                .await
+                .unwrap(),
+            Err(ErrorCode::InvalidParams)
+        );
+        assert!(pool.is_empty());
+        assert_eq!(
+            client
+                .ping(client_id.clone())
+                .await
+                .unwrap()
+                .unwrap()
+                .client_status,
+            ClientStatus::NeedRemount
+        );
+    }
+
     assert_eq!(
         client
             .re_mount_segment(vec![wire_segment()], client_id.clone())

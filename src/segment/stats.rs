@@ -27,8 +27,7 @@ pub struct SegmentSpaceStats {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SegmentUsageStats {
-    /// Allocations, offload permits, or committed offload leases that still
-    /// hold capacity in this segment.
+    /// Reservations that still hold capacity in this segment.
     pub active_allocations: u64,
 }
 
@@ -41,8 +40,7 @@ pub struct SegmentStats {
 
 /// Aggregate physical space for one replica class.
 ///
-/// Shared resources such as a CXL arena are counted once even when they are
-/// exposed through multiple logical segments. Both accepting and quiesced
+/// Both accepting and quiesced
 /// segments are included because quiescing placement does not release the
 /// underlying allocations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

@@ -17,15 +17,14 @@ use std::sync::Arc;
 const OWNER: ClientId = ClientId::new(31, 41);
 const MEMORY_ID: SegmentId = SegmentId::new(10, 1);
 const SECOND_MEMORY_ID: SegmentId = SegmentId::new(10, 2);
-const NOF_ID: SegmentId = SegmentId::new(20, 1);
 const CAPACITY: u64 = 1 << 20;
 
 fn tenant_id(value: &str) -> TenantId {
     TenantId::try_from(value).unwrap()
 }
 
-fn policy(memory_bytes: u64, nof_bytes: u64) -> TenantPolicy {
-    TenantPolicy::new(TenantQuotaLimits::new(memory_bytes, nof_bytes))
+fn policy(memory_bytes: u64) -> TenantPolicy {
+    TenantPolicy::new(TenantQuotaLimits::new(memory_bytes))
 }
 
 fn pool() -> Arc<SegmentPool> {
@@ -43,8 +42,8 @@ fn manager(a_quota: u64, b_quota: u64) -> TenantObjectManager {
     TenantObjectManager::new(
         pool(),
         TenantConfig::multi(vec![
-            (tenant_id("a"), policy(a_quota, 0)),
-            (tenant_id("b"), policy(b_quota, 0)),
+            (tenant_id("a"), policy(a_quota)),
+            (tenant_id("b"), policy(b_quota)),
         ]),
     )
     .unwrap()
@@ -149,7 +148,7 @@ fn pruning_one_replica_releases_only_its_committed_tenant_charge() {
     .unwrap();
     let manager = TenantObjectManager::new(
         pool.clone(),
-        TenantConfig::multi(vec![(tenant_id("a"), policy(8192, 0))]),
+        TenantConfig::multi(vec![(tenant_id("a"), policy(8192))]),
     )
     .unwrap();
     let tenant = manager.resolve_tenant(&tenant_id("a")).unwrap();
@@ -291,7 +290,7 @@ fn pending_timeout_returns_reserved_quota() {
     let manager = TenantObjectManager::with_config(
         pool(),
         ObjectCatalogConfig::default().with_pending_timeout(1),
-        TenantConfig::multi(vec![(tenant_id("a"), policy(4096, 0))]),
+        TenantConfig::multi(vec![(tenant_id("a"), policy(4096))]),
     )
     .unwrap();
     let a = manager.resolve_tenant(&tenant_id("a")).unwrap();
@@ -311,9 +310,7 @@ fn deleted_tenant_handles_stay_stale_after_reregistration() {
     let manager = manager(4096, 4096);
     let old = manager.resolve_tenant(&tenant_id("a")).unwrap();
     manager.delete_tenant(&tenant_id("a")).unwrap();
-    let current = manager
-        .upsert_tenant(tenant_id("a"), policy(4096, 0))
-        .unwrap();
+    let current = manager.upsert_tenant(tenant_id("a"), policy(4096)).unwrap();
 
     assert_eq!(old.namespace(), current.namespace());
     assert_eq!(
@@ -362,7 +359,7 @@ fn retiring_quota_is_released_only_after_the_last_read_handle() {
     let read = manager.get(&a, "held", CatalogTick::ZERO).unwrap();
     let lease_expires_at = read.lease_expires_at();
 
-    manager.upsert_tenant(tenant_id("a"), policy(0, 0)).unwrap();
+    manager.upsert_tenant(tenant_id("a"), policy(0)).unwrap();
     // First chance clears the recent bit; second chance retires the object.
     manager.maintenance(lease_expires_at, CollectBudget::new(8, 8, 8));
     let report = manager.maintenance(lease_expires_at, CollectBudget::new(8, 8, 8));
@@ -407,7 +404,7 @@ fn quota_shrink_reclaims_only_the_target_tenant_and_does_not_cancel_pending_puts
         )
         .unwrap();
 
-    manager.upsert_tenant(tenant_id("a"), policy(0, 0)).unwrap();
+    manager.upsert_tenant(tenant_id("a"), policy(0)).unwrap();
     let report = manager.maintenance(CatalogTick::ZERO, CollectBudget::new(16, 16, 16));
     assert_eq!(report.catalog.scoped_retired_objects, 1);
     assert!(
@@ -552,7 +549,7 @@ fn accepting_capacity_changes_recompute_effective_quota_and_trigger_reclaim() {
     let pool = pool();
     let manager = TenantObjectManager::new(
         pool.clone(),
-        TenantConfig::multi(vec![(tenant_id("a"), policy(CAPACITY, 0))]),
+        TenantConfig::multi(vec![(tenant_id("a"), policy(CAPACITY))]),
     )
     .unwrap();
     let a = manager.resolve_tenant(&tenant_id("a")).unwrap();
@@ -593,7 +590,7 @@ fn best_effort_actual_replica_growth_rechecks_quota_and_rolls_back_placement() {
     .unwrap();
     let manager = TenantObjectManager::new(
         pool.clone(),
-        TenantConfig::multi(vec![(tenant_id("a"), policy(4096, 0))]),
+        TenantConfig::multi(vec![(tenant_id("a"), policy(4096))]),
     )
     .unwrap();
     let a = manager.resolve_tenant(&tenant_id("a")).unwrap();
@@ -627,66 +624,69 @@ fn best_effort_actual_replica_growth_rechecks_quota_and_rolls_back_placement() {
 }
 
 #[test]
-fn memory_and_nof_quotas_are_admitted_and_accounted_independently() {
-    let pool = pool();
-    pool.attach(SegmentSpec::nof(
-        SegmentIdentity::new(NOF_ID, OWNER, "nof"),
-        MemoryRegion::new(0, CAPACITY),
-        "nvme://127.0.0.1/nqn.tenant",
-    ))
-    .unwrap();
-    let manager = TenantObjectManager::new(
-        pool,
-        TenantConfig::multi(vec![(tenant_id("a"), policy(4096, 8192))]),
-    )
-    .unwrap();
+fn batch_admission_handles_empty_invalid_and_overflowing_requests_without_leaking_quota() {
+    let manager = manager(8192, 0);
     let a = manager.resolve_tenant(&tenant_id("a")).unwrap();
+    assert!(
+        manager
+            .start_put_batch(&a, admission(), vec![], CatalogTick::ZERO)
+            .is_empty()
+    );
+    let invalid = Err(TenantObjectError::Object(ObjectManagerError::InvalidPlan));
+    let rejected = manager.start_put_batch(
+        &a,
+        admission(),
+        vec![
+            TenantPutRequest::new("zero", plan(0, 1)),
+            TenantPutRequest::new("overflow-a", plan(u64::MAX, 1)),
+            TenantPutRequest::new("overflow-b", plan(1, 1)),
+        ],
+        CatalogTick::ZERO,
+    );
+    assert!(rejected.iter().all(|result| result == &invalid));
+    assert_eq!(
+        manager
+            .tenant_snapshot(&tenant_id("a"))
+            .unwrap()
+            .memory
+            .reserved_bytes,
+        0
+    );
+
+    let mixed = manager.start_put_batch(
+        &a,
+        admission(),
+        vec![
+            TenantPutRequest::new("zero", plan(0, 1)),
+            TenantPutRequest::new("valid", plan(4096, 1)),
+        ],
+        CatalogTick::ZERO,
+    );
+    assert_eq!(mixed[0], invalid);
+    assert!(mixed[1].is_ok());
+    assert_eq!(
+        manager
+            .tenant_snapshot(&tenant_id("a"))
+            .unwrap()
+            .memory
+            .reserved_bytes,
+        4096
+    );
     manager
-        .start_put(&a, "memory", admission(), plan(4096, 1), CatalogTick::ZERO)
-        .unwrap();
-    manager
-        .finish_put(&a, "memory", owner(), ReplicaSelector::All)
-        .unwrap();
-    manager
-        .start_put(
+        .revoke_put(
             &a,
-            "nof",
-            admission(),
-            plan_for(8192, 1, ReplicaClass::Nof, FulfillmentPolicy::AllOrNothing),
+            "valid",
+            owner(),
+            ReplicaSelector::All,
             CatalogTick::ZERO,
         )
         .unwrap();
-    manager
-        .finish_put(&a, "nof", owner(), ReplicaSelector::All)
-        .unwrap();
-
-    let snapshot = manager.tenant_snapshot(&tenant_id("a")).unwrap();
-    assert_eq!(snapshot.memory.used_bytes, 4096);
-    assert_eq!(snapshot.nof.used_bytes, 8192);
-    assert!(matches!(
-        manager.start_put(
-            &a,
-            "memory-over",
-            admission(),
-            plan(1, 1),
-            CatalogTick::ZERO,
-        ),
-        Err(TenantObjectError::TenantQuotaExceeded {
-            class: cakemaster::object::TenantResourceClass::Memory,
-            ..
-        })
-    ));
-    assert!(matches!(
-        manager.start_put(
-            &a,
-            "nof-over",
-            admission(),
-            plan_for(1, 1, ReplicaClass::Nof, FulfillmentPolicy::AllOrNothing,),
-            CatalogTick::ZERO,
-        ),
-        Err(TenantObjectError::TenantQuotaExceeded {
-            class: cakemaster::object::TenantResourceClass::Nof,
-            ..
-        })
-    ));
+    assert_eq!(
+        manager
+            .tenant_snapshot(&tenant_id("a"))
+            .unwrap()
+            .memory
+            .reserved_bytes,
+        0
+    );
 }

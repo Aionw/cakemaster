@@ -2,12 +2,12 @@
 
 use super::observability::observe_internal_mapping;
 use crate::mooncake::{
-    BufferDescriptor, DescriptorVariant, ErrorCode, MemoryDescriptor, NoFDescriptor,
-    ReplicaDescriptor, ReplicaStatus,
+    BufferDescriptor, DescriptorVariant, ErrorCode, MemoryDescriptor, ReplicaDescriptor,
+    ReplicaStatus,
 };
 use crate::object::error::{LookupError, ObjectManagerError, ObjectRemoveError};
 use crate::object::{AllocatedReplica, ReplicaLease, TenantObjectError};
-use crate::segment::{ReservationDescriptor, ReservationDescriptorRef};
+use crate::segment::ReservationDescriptor;
 
 pub(super) fn started_replica_descriptor(
     replica: &AllocatedReplica,
@@ -23,24 +23,14 @@ pub(super) fn replica_descriptor(
     replica: &ReplicaLease,
     status: ReplicaStatus,
 ) -> Result<ReplicaDescriptor, ErrorCode> {
-    let Some(direct) = replica.direct() else {
-        return Err(ErrorCode::InternalError);
-    };
-    let descriptor = direct.descriptor();
+    let descriptor = replica.descriptor();
     let buffer_descriptor = buffer_descriptor(
         descriptor.region().base(),
         descriptor.region().size(),
         descriptor.transport().protocol().as_str(),
         descriptor.transport().endpoint(),
     );
-    let descriptor_variant = match descriptor {
-        ReservationDescriptorRef::Memory(_) => {
-            DescriptorVariant::Memory(MemoryDescriptor { buffer_descriptor })
-        }
-        ReservationDescriptorRef::Nof(_) => {
-            DescriptorVariant::NofSsd(NoFDescriptor { buffer_descriptor })
-        }
-    };
+    let descriptor_variant = DescriptorVariant::Memory(MemoryDescriptor { buffer_descriptor });
     Ok(ReplicaDescriptor {
         id: u64::from(replica.id().get()),
         descriptor_variant,
@@ -57,14 +47,9 @@ fn owned_descriptor_variant(
         descriptor.transport().protocol().as_str(),
         descriptor.transport().endpoint(),
     );
-    Ok(match descriptor {
-        ReservationDescriptor::Memory(_) => {
-            DescriptorVariant::Memory(MemoryDescriptor { buffer_descriptor })
-        }
-        ReservationDescriptor::Nof(_) => {
-            DescriptorVariant::NofSsd(NoFDescriptor { buffer_descriptor })
-        }
-    })
+    Ok(DescriptorVariant::Memory(MemoryDescriptor {
+        buffer_descriptor,
+    }))
 }
 
 fn buffer_descriptor(

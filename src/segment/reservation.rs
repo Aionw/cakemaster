@@ -47,19 +47,7 @@ impl Reservation {
     }
 
     pub fn descriptor(&self) -> ReservationDescriptorRef<'_> {
-        let descriptor = RangeDescriptorRef::new(
-            self.region,
-            self.segment
-                .transport()
-                .expect("direct reservations retain a transport endpoint"),
-        );
-        match self.segment.replica_class() {
-            ReplicaClass::Memory => ReservationDescriptorRef::Memory(descriptor),
-            ReplicaClass::Nof => ReservationDescriptorRef::Nof(descriptor),
-            ReplicaClass::LocalSsd => {
-                unreachable!("LocalSSD capacity cannot produce direct reservations")
-            }
-        }
+        RangeDescriptorRef::new(self.region, self.segment.transport())
     }
 
     pub fn owned_descriptor(&self) -> ReservationDescriptor {

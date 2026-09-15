@@ -9,8 +9,8 @@ use cakemaster::segment::placement::{
     AllocationSpec, FulfillmentPolicy, PlacementRequest, ReplicaPolicy,
 };
 use cakemaster::segment::{
-    ClientId, CxlArenaId, CxlArenaSpec, MemoryRegion, ReplicaClass, ReservationDescriptor,
-    SegmentId, SegmentIdentity, SegmentPool, SegmentSpec, TransportEndpoint, TransportProtocol,
+    ClientId, MemoryRegion, ReplicaClass, SegmentId, SegmentIdentity, SegmentPool, SegmentSpec,
+    TransportEndpoint, TransportProtocol,
 };
 use std::sync::{Arc, Barrier, mpsc};
 use std::thread;
@@ -20,12 +20,9 @@ const OWNER: ClientId = ClientId::new(7, 11);
 const OTHER_OWNER: ClientId = ClientId::new(7, 12);
 const MEMORY_ID: SegmentId = SegmentId::new(1, 1);
 const SECOND_MEMORY_ID: SegmentId = SegmentId::new(1, 2);
-const FIRST_CXL_ID: SegmentId = SegmentId::new(3, 1);
-const SECOND_CXL_ID: SegmentId = SegmentId::new(3, 2);
-const NOF_ID: SegmentId = SegmentId::new(2, 1);
 const CAPACITY: u64 = 1 << 20;
 
-fn pool(memory: bool, nof: bool) -> Arc<SegmentPool> {
+fn pool(memory: bool) -> Arc<SegmentPool> {
     let pool = Arc::new(SegmentPool::new());
     if memory {
         pool.attach(SegmentSpec::memory(
@@ -35,39 +32,15 @@ fn pool(memory: bool, nof: bool) -> Arc<SegmentPool> {
         ))
         .unwrap();
     }
-    if nof {
-        pool.attach(SegmentSpec::nof(
-            SegmentIdentity::new(NOF_ID, OWNER, "nof-a"),
-            MemoryRegion::new(0, CAPACITY),
-            "nvme://127.0.0.1/nqn.1",
-        ))
-        .unwrap();
-    }
     pool
 }
 
 fn replicated_memory_pool() -> Arc<SegmentPool> {
-    let pool = pool(true, false);
+    let pool = pool(true);
     pool.attach(SegmentSpec::memory(
         SegmentIdentity::new(SECOND_MEMORY_ID, OWNER, "memory-b"),
         MemoryRegion::new(0x2_0000_0000, CAPACITY),
         TransportEndpoint::new(TransportProtocol::Tcp, "127.0.0.1:12001"),
-    ))
-    .unwrap();
-    pool
-}
-
-fn replicated_cxl_pool() -> Arc<SegmentPool> {
-    let pool = Arc::new(SegmentPool::new());
-    let arena = CxlArenaSpec::new(CxlArenaId::new("shared-object-arena"), CAPACITY);
-    pool.attach(SegmentSpec::cxl(
-        SegmentIdentity::new(FIRST_CXL_ID, OWNER, "cxl-a"),
-        arena.clone(),
-    ))
-    .unwrap();
-    pool.attach(SegmentSpec::cxl(
-        SegmentIdentity::new(SECOND_CXL_ID, OWNER, "cxl-b"),
-        arena,
     ))
     .unwrap();
     pool
@@ -124,7 +97,7 @@ fn put_memory(manager: &ObjectManager, object: &ObjectIdentity, writer: ClientId
 
 #[test]
 fn manager_owns_the_complete_pending_to_published_lifecycle() {
-    let pool = pool(true, false);
+    let pool = pool(true);
     let manager =
         ObjectManager::with_config(pool.clone(), ObjectCatalogConfig::new(32).with_lease(10, 5))
             .unwrap();
@@ -141,13 +114,9 @@ fn manager_owns_the_complete_pending_to_published_lifecycle() {
     assert_eq!(started.replica_class(), ReplicaClass::Memory);
     assert_eq!(started.replicas().len(), 1);
     assert_eq!(started.replicas()[0].id().get(), 1);
-    match started.replicas()[0].descriptor() {
-        ReservationDescriptor::Memory(descriptor) => {
-            assert_eq!(descriptor.region(), MemoryRegion::new(0x1_0000_0000, 4096));
-            assert_eq!(descriptor.transport().endpoint(), "127.0.0.1:12000");
-        }
-        descriptor => panic!("unexpected descriptor: {descriptor:?}"),
-    }
+    let descriptor = started.replicas()[0].descriptor();
+    assert_eq!(descriptor.region(), MemoryRegion::new(0x1_0000_0000, 4096));
+    assert_eq!(descriptor.transport().endpoint(), "127.0.0.1:12000");
     assert!(matches!(
         manager.get(object.as_lookup(), CatalogTick::ZERO),
         Err(LookupError::NotReady)
@@ -155,17 +124,6 @@ fn manager_owns_the_complete_pending_to_published_lifecycle() {
     assert_eq!(
         manager.finish_put(&object, owner(OTHER_OWNER), ReplicaSelector::All),
         Err(ObjectManagerError::IllegalOwner)
-    );
-    assert_eq!(
-        manager.finish_put(
-            &object,
-            owner(OWNER),
-            ReplicaSelector::Class(ReplicaClass::Nof),
-        ),
-        Err(ObjectManagerError::ReplicaClassMismatch {
-            requested: ReplicaClass::Nof,
-            actual: ReplicaClass::Memory,
-        })
     );
 
     manager
@@ -199,7 +157,7 @@ fn manager_owns_the_complete_pending_to_published_lifecycle() {
 
 #[test]
 fn same_size_upsert_uses_a_fresh_version_and_keeps_the_old_version_readable() {
-    let pool = pool(true, false);
+    let pool = pool(true);
     let manager = ObjectManager::new(pool.clone());
     let object = identity("in-place-upsert");
     let original = manager
@@ -351,7 +309,7 @@ fn upsert_revoke_and_failed_reallocation_restore_the_published_version() {
 
 #[test]
 fn size_changing_upsert_commits_new_generation_and_reclaims_old_allocation() {
-    let pool = pool(true, false);
+    let pool = pool(true);
     let manager =
         ObjectManager::with_config(pool.clone(), ObjectCatalogConfig::new(32).with_lease(10, 5))
             .unwrap();
@@ -396,7 +354,7 @@ fn size_changing_upsert_commits_new_generation_and_reclaims_old_allocation() {
 
 #[test]
 fn get_racing_upsert_observes_complete_versions() {
-    let manager = Arc::new(ObjectManager::new(pool(true, false)));
+    let manager = Arc::new(ObjectManager::new(pool(true)));
     let object = identity("concurrent-upsert");
     put_memory(&manager, &object, OWNER, 4096);
     let old_version = manager
@@ -455,7 +413,7 @@ fn get_racing_upsert_observes_complete_versions() {
 
 #[test]
 fn remove_honors_lease_unless_forced() {
-    let pool = pool(true, false);
+    let pool = pool(true);
     let manager =
         ObjectManager::with_config(pool, ObjectCatalogConfig::new(32).with_lease(10, 5)).unwrap();
     let object = identity("remove-me");
@@ -498,7 +456,7 @@ fn remove_honors_lease_unless_forced() {
 
 #[test]
 fn stale_upsert_timeout_is_fenced_by_transaction_id() {
-    let pool = pool(true, false);
+    let pool = pool(true);
     let manager =
         ObjectManager::with_config(pool, ObjectCatalogConfig::new(32).with_pending_timeout(2))
             .unwrap();
@@ -574,7 +532,7 @@ fn stale_upsert_timeout_is_fenced_by_transaction_id() {
 
 #[test]
 fn published_objects_become_invisible_and_are_retired_after_segment_invalidation() {
-    let pool = pool(true, false);
+    let pool = pool(true);
     let segment = pool.segment(MEMORY_ID).unwrap();
     let manager = ObjectManager::new(pool.clone());
     let object = identity("segment-backed");
@@ -623,7 +581,7 @@ fn published_objects_become_invisible_and_are_retired_after_segment_invalidation
 
 #[test]
 fn dropping_an_upsert_claim_rechecks_an_invalidated_base() {
-    let pool = pool(true, false);
+    let pool = pool(true);
     let manager = ObjectManager::new(pool.clone());
     let object = identity("invalidated-during-claim");
     put_memory(&manager, &object, OWNER, 4096);
@@ -782,50 +740,8 @@ fn pruning_waits_for_live_replica_views_before_releasing_resources() {
 }
 
 #[test]
-fn cxl_segment_invalidation_keeps_the_surviving_replica() {
-    let pool = replicated_cxl_pool();
-    let first_segment = pool.segment(FIRST_CXL_ID).unwrap();
-    let second_segment = pool.segment(SECOND_CXL_ID).unwrap();
-    let manager = ObjectManager::new(pool.clone());
-    let object = identity("cxl-replicated");
-    manager
-        .start_put(
-            object.clone(),
-            admission(OWNER),
-            plan(
-                4096,
-                2,
-                ReplicaClass::Memory,
-                FulfillmentPolicy::AllOrNothing,
-            ),
-            CatalogTick::ZERO,
-        )
-        .unwrap();
-    manager
-        .finish_put(&object, owner(OWNER), ReplicaSelector::All)
-        .unwrap();
-
-    pool.quiesce(OWNER, FIRST_CXL_ID).unwrap();
-    pool.remove(OWNER, FIRST_CXL_ID).unwrap();
-    let read = manager
-        .get(object.as_lookup(), CatalogTick::new(1))
-        .unwrap();
-    assert_eq!(read.object().replicas().len(), 1);
-    assert_eq!(
-        read.object().replicas().first().unwrap().segment_id(),
-        SECOND_CXL_ID
-    );
-
-    let report = manager.maintenance(CatalogTick::new(1), CollectBudget::new(8, 8, 0));
-    assert_eq!(report.catalog.pruned_replicas, 1);
-    assert_eq!(first_segment.stats().usage.active_allocations, 0);
-    assert_eq!(second_segment.stats().usage.active_allocations, 1);
-    assert_eq!(manager.catalog().stats().live_bytes, 4096);
-}
-
-#[test]
 fn bounded_liveness_scan_does_not_skip_objects_promoted_between_generations() {
-    let pool = pool(true, false);
+    let pool = pool(true);
     let manager = ObjectManager::new(pool.clone());
     let first = identity("recent-before-invalidation");
     let second = identity("unscanned-before-invalidation");
@@ -857,7 +773,7 @@ fn bounded_liveness_scan_does_not_skip_objects_promoted_between_generations() {
 
 #[test]
 fn invalidated_pending_put_cannot_publish_but_can_be_revoked() {
-    let pool = pool(true, false);
+    let pool = pool(true);
     let manager = ObjectManager::new(pool.clone());
     let object = identity("pending-on-dead-segment");
 
@@ -894,7 +810,7 @@ fn invalidated_pending_put_cannot_publish_but_can_be_revoked() {
 
 #[test]
 fn invalidated_pending_put_is_retired_before_its_timeout() {
-    let pool = pool(true, false);
+    let pool = pool(true);
     let manager = ObjectManager::with_config(
         pool.clone(),
         ObjectCatalogConfig::new(32).with_pending_timeout(10_000),
@@ -929,7 +845,7 @@ fn segment_invalidation_racing_maintenance_still_retires_published_objects() {
     use std::sync::{Arc, Barrier};
 
     for round in 0..128 {
-        let pool = pool(true, false);
+        let pool = pool(true);
         let manager = Arc::new(ObjectManager::new(pool.clone()));
         let object =
             ObjectIdentity::new(NamespaceId::DEFAULT, format!("invalidation-race-{round}"));
@@ -973,7 +889,7 @@ fn segment_invalidation_racing_maintenance_still_retires_published_objects() {
 
 #[test]
 fn manager_revoke_and_timeout_release_reservations_for_reuse() {
-    let pool = pool(true, false);
+    let pool = pool(true);
     let manager = ObjectManager::with_config(
         pool.clone(),
         ObjectCatalogConfig::new(32)
@@ -1036,7 +952,7 @@ fn manager_revoke_and_timeout_release_reservations_for_reuse() {
 
 #[test]
 fn completed_writes_leave_no_timeout_backlog_after_one_bounded_step() {
-    let pool = pool(true, false);
+    let pool = pool(true);
     let manager = ObjectManager::with_config(
         pool,
         ObjectCatalogConfig::new(32).with_pending_timeout(1_000),
@@ -1066,7 +982,7 @@ fn completed_writes_leave_no_timeout_backlog_after_one_bounded_step() {
 
 #[test]
 fn allocator_policy_is_selected_by_the_normalized_plan() {
-    let memory_pool = pool(true, false);
+    let memory_pool = pool(true);
     let memory_manager = ObjectManager::new(memory_pool);
     let started = memory_manager
         .start_put(
@@ -1078,23 +994,35 @@ fn allocator_policy_is_selected_by_the_normalized_plan() {
         .unwrap();
     assert_eq!(started.replicas().len(), 1);
 
-    let nof_pool = pool(false, true);
-    let nof_manager = ObjectManager::new(nof_pool.clone());
+    let strict_pool = pool(true);
+    let strict_manager = ObjectManager::new(strict_pool.clone());
     assert_eq!(
-        nof_manager.start_put(
+        strict_manager.start_put(
             identity("all-or-nothing"),
             admission(OWNER),
-            plan(4096, 2, ReplicaClass::Nof, FulfillmentPolicy::AllOrNothing,),
+            plan(
+                4096,
+                2,
+                ReplicaClass::Memory,
+                FulfillmentPolicy::AllOrNothing,
+            ),
             CatalogTick::ZERO,
         ),
         Err(ObjectManagerError::NoAvailableReplicas)
     );
-    assert_eq!(nof_pool.stats(NOF_ID).unwrap().usage.active_allocations, 0);
+    assert_eq!(
+        strict_pool
+            .stats(MEMORY_ID)
+            .unwrap()
+            .usage
+            .active_allocations,
+        0
+    );
 }
 
 #[test]
 fn concurrent_start_for_one_key_has_one_winner() {
-    let manager = Arc::new(ObjectManager::new(pool(true, false)));
+    let manager = Arc::new(ObjectManager::new(pool(true)));
     let barrier = Arc::new(Barrier::new(9));
     let mut workers = Vec::new();
     for _ in 0..8 {
@@ -1132,7 +1060,7 @@ fn concurrent_start_for_one_key_has_one_winner() {
 #[test]
 fn pin_requests_validate_and_commit_at_finish_time() {
     let manager = ObjectManager::with_config(
-        pool(true, false),
+        pool(true),
         ObjectCatalogConfig::new(16).with_soft_pin_ttl(50, 100),
     )
     .unwrap();
@@ -1247,7 +1175,7 @@ fn pin_requests_validate_and_commit_at_finish_time() {
 #[test]
 fn upsert_pin_changes_commit_atomically_and_rollback_preserves_metadata() {
     let manager = ObjectManager::with_config(
-        pool(true, false),
+        pool(true),
         ObjectCatalogConfig::new(16)
             .with_lease(1, 0)
             .with_pending_timeout(5)
@@ -1435,7 +1363,7 @@ fn upsert_pin_changes_commit_atomically_and_rollback_preserves_metadata() {
 #[test]
 fn eviction_obeys_hard_and_soft_pin_policy_and_expiry_scan_is_bounded() {
     let protected = ObjectManager::with_config(
-        pool(true, false),
+        pool(true),
         ObjectCatalogConfig::new(16)
             .with_lease(1, 0)
             .with_soft_pin_ttl(100, 100)
@@ -1481,7 +1409,7 @@ fn eviction_obeys_hard_and_soft_pin_policy_and_expiry_scan_is_bounded() {
     assert!(protected.catalog().stats().soft_pin_candidates <= 2);
 
     let permissive = ObjectManager::with_config(
-        pool(true, false),
+        pool(true),
         ObjectCatalogConfig::new(8)
             .with_lease(1, 0)
             .with_soft_pin_ttl(100, 100)
@@ -1514,11 +1442,9 @@ fn eviction_obeys_hard_and_soft_pin_policy_and_expiry_scan_is_bounded() {
     let evicted = permissive.maintenance(CatalogTick::new(10), CollectBudget::new(8, 8, 0));
     assert_eq!(evicted.catalog.retired_objects, 1);
 
-    let hard_manager = ObjectManager::with_config(
-        pool(true, false),
-        ObjectCatalogConfig::new(8).with_lease(1, 0),
-    )
-    .unwrap();
+    let hard_manager =
+        ObjectManager::with_config(pool(true), ObjectCatalogConfig::new(8).with_lease(1, 0))
+            .unwrap();
     let hard = identity("never-evict-hard-pin");
     hard_manager
         .start_put(
